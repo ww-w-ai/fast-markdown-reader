@@ -1,6 +1,6 @@
 import AppKit
 
-final class DocumentWindowController: NSWindowController {
+final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     // Explicit TextKit 1 stack (C2): building the view with init(frame:textContainer:)
     // guarantees the classic NSLayoutManager path instead of silently falling back
     // to TextKit 2 compatibility mode when layoutManager is later accessed.
@@ -37,6 +37,7 @@ final class DocumentWindowController: NSWindowController {
         scrollView.hasHorizontalScroller = false   // viewer never scrolls sideways; text wraps
         scrollView.drawsBackground = true
         window.contentView = scrollView
+        window.delegate = self                     // windowDidResize → recompute the column
         updateTextInset()
 
         // C6: text reflow on window resize restrands copy buttons at stale positions.
@@ -54,6 +55,13 @@ final class DocumentWindowController: NSWindowController {
     }
 
     deinit { NotificationCenter.default.removeObserver(self) }
+
+    // Re-render the centered column and re-place code overlays whenever the window resizes.
+    func windowDidResize(_ notification: Notification) {
+        lastClipWidth = scrollView.contentSize.width
+        updateTextInset()
+        placeCopyButtons()
+    }
 
     override init(window: NSWindow?) {
         let storage = NSTextStorage()
