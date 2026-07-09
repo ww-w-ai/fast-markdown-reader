@@ -51,21 +51,27 @@ right-click any `.md` in Finder → **Get Info** → **Open with** → choose fa
 
 ## Keyboard (reading cursor)
 
-| Key | Action |
+Navigation **selects the unit it moves to**, so ⌘C copies it immediately. No Shift is used
+(Shift stays free for system selection), and the keys avoid conflicts with standard macOS
+shortcuts.
+
+| Key | Action (and what gets selected) |
 |---|---|
-| **⌘← / ⌘→** | Start / end of the current line; again at the edge → the line above / below |
-| **⌘⇧← / ⌘⇧→** | Previous / next sentence start |
-| **⇧← / ⇧→** | Previous / next paragraph start |
-| **⌘↑ / ⌘↓** | Previous / next heading |
+| **⌥← / ⌥→** | Previous / next **sentence** (selects it) |
+| **⌥↑ / ⌥↓** | Previous / next **paragraph** (selects it) |
+| **⌘← / ⌘→** | Start / end of the current **line** (selects the line) |
+| **[ / ]** | Previous / next **heading** (selects the whole subsection) |
+| **click** (no drag) | Selects the **sentence** under the cursor |
 | **number then Enter** | Jump to the Nth heading |
 | **Space / ⇧Space** | Page down / up |
-| **⌥↑ / ⌥↓** | Document start / end |
+| **⌘↑ / ⌘↓** | Document start / end |
 | **⌘F** | Find in document |
 | **⌘+ / ⌘−** | Font size (persists to the next launch) |
 | **↑ / ↓** | Scroll one line |
 
-Keyboard text selection is intentionally omitted (⇧+arrows are navigation); mouse
-selection + copy still work, and code blocks have their own Copy button.
+Page / number-jump / document-ends move without selecting (too-large or jump moves stay
+caret-only). Mouse drag-selection + copy also work. Each code block has **Copy** and a
+**Wrap** toggle (fold long lines vs. no-wrap with its own horizontal scroll).
 
 ## How the lightness holds
 
