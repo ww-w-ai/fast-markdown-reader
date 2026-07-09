@@ -28,7 +28,9 @@ final class ReaderTextView: NSTextView {
     }
 
     func clampCaretToText() {
-        if caret > length { caret = length }
+        // Always re-assign (even if unchanged) so the reading-line highlight is refreshed
+        // against the new text length after a mutation shrank the document.
+        caret = min(caret, length)
     }
 
     override func keyDown(with event: NSEvent) {
@@ -70,7 +72,12 @@ final class ReaderTextView: NSTextView {
     // touches stored .backgroundColor (which would wipe code-card / inline-code shading).
     private func highlightCurrentLine() {
         guard let lm = layoutManager, length > 0 else { return }
-        if let prev = lastLineRange { lm.removeTemporaryAttribute(.backgroundColor, forCharacterRange: prev) }
+        // Remove the previous highlight only if its range is still in bounds — a mutation
+        // (font re-render, mermaid swap) may have shortened the text underneath it.
+        if let prev = lastLineRange, prev.location + prev.length <= length {
+            lm.removeTemporaryAttribute(.backgroundColor, forCharacterRange: prev)
+        }
+        lastLineRange = nil
         let start = nav.lineStart(plain, from: caret), end = nav.lineEnd(plain, from: caret)
         let r = NSRange(location: start, length: max(0, end - start))
         lm.addTemporaryAttribute(.backgroundColor,
@@ -82,8 +89,9 @@ final class ReaderTextView: NSTextView {
         scrollRangeToVisible(NSRange(location: min(caret, length), length: 0))
     }
 
-    /// Reset the caret to the top when a fresh document is displayed.
-    func resetCaret() { caret = 0; lastLineRange = nil }
+    /// Reset the caret to the top when a fresh document is displayed. Clear the stale
+    /// highlight range first so the didSet highlight doesn't touch the old text's range.
+    func resetCaret() { lastLineRange = nil; caret = 0 }
 
     /// Reading caret (UTF-16 offset). Setting it clamps into range and re-highlights —
     /// used to preserve the reading position across a font-size re-render.
