@@ -61,10 +61,12 @@ final class ReaderTextView: NSTextView {
         // document-start/end; ⌥ arrows repurpose word/paragraph moves (a viewer has no
         // editing) and each unit move SELECTS its unit for instant copy.
         switch (event.keyCode, flags) {
-        case (123, [.command]):                                                        // ⌘← line start
-            selectUnit(nav.lineRange(s, from: nav.previousLineBoundary(s, from: caret)))
-        case (124, [.command]):                                                        // ⌘→ line end
-            selectUnit(nav.lineRange(s, from: nav.nextLineBoundary(s, from: caret)))
+        case (123, [.command]):                                                        // ⌘← previous line
+            let ls = nav.lineStart(s, from: caret)
+            selectUnit(nav.lineRange(s, from: ls > 0 ? ls - 1 : 0))
+        case (124, [.command]):                                                        // ⌘→ next line
+            let le = nav.lineEnd(s, from: caret)
+            selectUnit(nav.lineRange(s, from: le < length ? le + 1 : length))
         case (123, [.option]):                                                         // ⌥← sentence prev
             selectUnit(nav.sentenceRange(s, from: nav.sentenceStart(s, from: caret)))
         case (124, [.option]):                                                         // ⌥→ sentence next

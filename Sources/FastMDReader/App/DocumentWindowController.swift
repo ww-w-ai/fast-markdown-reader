@@ -82,23 +82,17 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    // Readability: cap the text column to a ~660pt measure (~66 chars at 15pt) and center
-    // it, growing the side gutters on wide windows instead of the line length (Butterick /
-    // Baymard / WCAG 1.4.12). Centering via textContainerInset also guarantees text wraps to
-    // the column, so the viewer never scrolls sideways.
-    private let maxColumnWidth: CGFloat = 660
-    private let minSideInset: CGFloat = 28
+    // Text fills the window width, with comfortable side margins (per user preference — the
+    // readable ~660pt cap felt too narrow). Wrapping at an explicit container width still
+    // guarantees the viewer never scrolls sideways.
+    private let minSideInset: CGFloat = 32
     private let verticalInset: CGFloat = 28
 
     private func updateTextInset() {
         let clipWidth = scrollView.contentSize.width
         guard clipWidth > 1 else { return }
-        // Column = the readable measure, capped at 660 and never wider than the window minus
-        // margins; centered by the side inset. Text view fills the clip; the container wraps
-        // at `column`, so nothing overflows sideways.
-        let column = min(maxColumnWidth, max(200, clipWidth - 2 * minSideInset))
-        let side = (clipWidth - column) / 2
-        textView.textContainerInset = NSSize(width: side, height: verticalInset)
+        let column = max(200, clipWidth - 2 * minSideInset)   // fill the window minus margins
+        textView.textContainerInset = NSSize(width: minSideInset, height: verticalInset)
         textView.textContainer?.containerSize = NSSize(width: column, height: CGFloat.greatestFiniteMagnitude)
         var f = textView.frame; f.size.width = clipWidth; textView.frame = f
     }
@@ -118,6 +112,33 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
 
     /// The live text storage, so the document layer can swap mermaid placeholders in place.
     var textStorageRef: NSTextStorage? { textView.textStorage }
+
+    // MARK: - Zoom anchor (keep the top visible line stable across a font-size change)
+
+    /// The character index currently at the top of the visible area.
+    func topVisibleCharIndex() -> Int {
+        guard let lm = textView.layoutManager, let tc = textView.textContainer,
+              lm.numberOfGlyphs > 0 else { return 0 }
+        let visible = textView.visibleRect
+        let pt = NSPoint(x: 4, y: visible.minY - textView.textContainerInset.height + 1)
+        let glyph = lm.glyphIndex(for: pt, in: tc)
+        return lm.characterIndexForGlyph(at: min(glyph, lm.numberOfGlyphs - 1))
+    }
+
+    /// Scroll so the given character sits at the top of the viewport (top anchor).
+    func scrollCharToTop(_ charIndex: Int) {
+        guard let lm = textView.layoutManager, let tc = textView.textContainer,
+              let storage = textView.textStorage, lm.numberOfGlyphs > 0 else { return }
+        let idx = min(max(0, charIndex), storage.length)
+        let glyph = lm.glyphIndexForCharacter(at: idx)
+        var rect = lm.lineFragmentRect(forGlyphAt: min(glyph, lm.numberOfGlyphs - 1), effectiveRange: nil)
+        rect.origin.y += textView.textContainerInset.height
+        let clip = scrollView.contentView
+        let maxY = max(0, textView.bounds.height - clip.bounds.height)
+        clip.scroll(to: NSPoint(x: 0, y: min(max(0, rect.origin.y), maxY)))
+        scrollView.reflectScrolledClipView(clip)
+        placeCopyButtons()
+    }
 
     /// Called after the document layer mutates the text (e.g. the mermaid swap), which
     /// shifts character offsets. Recompute heading offsets from the live text, clamp the

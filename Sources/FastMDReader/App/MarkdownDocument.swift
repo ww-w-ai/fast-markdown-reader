@@ -25,12 +25,15 @@ final class MarkdownDocument: NSDocument {
 
     @objc func increaseReaderFontSize(_ sender: Any?) { FontSizeStore.increase(); reRenderPreservingCaret() }
     @objc func decreaseReaderFontSize(_ sender: Any?) { FontSizeStore.decrease(); reRenderPreservingCaret() }
+    @objc func resetReaderFontSize(_ sender: Any?) { FontSizeStore.reset(); reRenderPreservingCaret() }
 
     private func reRenderPreservingCaret() {
         guard let wc = windowControllers.first as? DocumentWindowController else { return }
-        let saved = wc.textView.readingCaret
-        render(into: wc)                    // resets caret to 0 and re-lays out at the new size
-        wc.textView.readingCaret = saved    // restore reading position (clamped internally)
+        let anchor = wc.topVisibleCharIndex()      // keep the top visible line stable across zoom
+        let savedCaret = wc.textView.readingCaret
+        render(into: wc)                            // resets caret to 0 and re-lays out at the new size
+        wc.textView.readingCaret = savedCaret       // restore reading position (clamped internally)
+        wc.scrollCharToTop(anchor)                  // top anchor wins over the caret scroll
     }
 
     private func render(into wc: DocumentWindowController) {

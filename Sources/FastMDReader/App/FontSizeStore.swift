@@ -12,6 +12,8 @@ enum FontSizeStore {
         }
         set { UserDefaults.standard.set(Double(min(36, max(10, newValue))), forKey: key) }
     }
+    static let defaultSize: CGFloat = 15
     static func increase() { size = size + 1 }
     static func decrease() { size = size - 1 }
+    static func reset() { size = defaultSize }
 }
