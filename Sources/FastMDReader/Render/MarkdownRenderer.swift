@@ -117,7 +117,15 @@ private struct AttributedBuilder: MarkupWalker {
 
     mutating func visitCodeBlock(_ codeBlock: CodeBlock) {
         // mermaid handled in Task 5; here treat everything else as a highlighted block.
-        if (codeBlock.language ?? "").lowercased() == "mermaid" { return } // placeholder filled in Task 5
+        if (codeBlock.language ?? "").lowercased() == "mermaid" {
+            // Placeholder line the document layer replaces with a rendered PDF attachment.
+            let ph = NSMutableAttributedString(string: "⧗ rendering diagram…",
+                attributes: [.font: theme.codeFont, .foregroundColor: theme.secondaryColor])
+            ph.addAttribute(MDAttr.mermaid, value: codeBlock.code,
+                            range: NSRange(location: 0, length: ph.length))
+            result.append(ph); newline(2)
+            return
+        }
         // Card look: padding inside (head/tail indent) and gaps outside (paragraph spacing).
         // No flat .backgroundColor — CodeCardLayoutManager draws the rounded card backdrop.
         let ps = NSMutableParagraphStyle()

@@ -68,6 +68,16 @@ final class DocumentWindowController: NSWindowController {
         DispatchQueue.main.async { [weak self] in self?.placeCopyButtons() }
     }
 
+    /// The live text storage, so the document layer can swap mermaid placeholders in place.
+    var textStorageRef: NSTextStorage? { textView.textStorage }
+
+    /// Called after the document layer mutates the text (e.g. the mermaid swap), which
+    /// shifts character offsets. Re-place copy buttons; Task 6 extends this to also
+    /// recompute heading offsets and clamp the reading caret.
+    func refreshAfterMutation() {
+        placeCopyButtons()
+    }
+
     // MARK: - Copy-button overlay
 
     private var copyButtons: [NSButton] = []
