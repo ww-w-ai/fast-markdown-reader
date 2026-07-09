@@ -3,6 +3,10 @@ import AppKit
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
+    // Opt out of state restoration entirely: no previously-open documents are reopened on launch,
+    // so the app always starts clean (closing / quitting never leaves old tabs behind).
+    func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool { false }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildMenu()
     }
@@ -37,8 +41,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let fileItem = NSMenuItem(); mainMenu.addItem(fileItem)
         let fileMenu = NSMenu(title: "File"); fileItem.submenu = fileMenu
         fileMenu.addItem(withTitle: "Open…", action: #selector(NSDocumentController.openDocument(_:)), keyEquivalent: "o")
+        // Open Recent — AppKit auto-populates any submenu that contains a "Clear Menu" item
+        // wired to clearRecentDocuments:. NSDocumentController records opened docs automatically.
+        let recentItem = fileMenu.addItem(withTitle: "Open Recent", action: nil, keyEquivalent: "")
+        let recentMenu = NSMenu(title: "Open Recent")
+        recentItem.submenu = recentMenu
+        recentMenu.addItem(.separator())
+        recentMenu.addItem(withTitle: "Clear Menu", action: #selector(NSDocumentController.clearRecentDocuments(_:)), keyEquivalent: "")
         let close = fileMenu.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
         close.keyEquivalentModifierMask = [.command]
+        fileMenu.addItem(.separator())
+        fileMenu.addItem(withTitle: "Print…", action: Selector(("printDocument:")), keyEquivalent: "p")
 
         // Edit menu (copy / select-all / find)
         let editItem = NSMenuItem(); mainMenu.addItem(editItem)
@@ -55,6 +68,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         viewMenu.addItem(withTitle: "Increase Font Size", action: Selector(("increaseReaderFontSize:")), keyEquivalent: "+")
         viewMenu.addItem(withTitle: "Decrease Font Size", action: Selector(("decreaseReaderFontSize:")), keyEquivalent: "-")
         viewMenu.addItem(withTitle: "Actual Size", action: Selector(("resetReaderFontSize:")), keyEquivalent: "0")
+        viewMenu.addItem(.separator())
+        viewMenu.addItem(withTitle: "Reload", action: Selector(("reloadDocument:")), keyEquivalent: "r")
 
         // Window menu (minimize, zoom, native tabs)
         let windowItem = NSMenuItem(); mainMenu.addItem(windowItem)
@@ -62,6 +77,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         windowMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
         windowMenu.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
         NSApp.windowsMenu = windowMenu
+
+        // Help menu — Keyboard Shortcuts guide (also opens with the "?" key in the reader).
+        let helpItem = NSMenuItem(); mainMenu.addItem(helpItem)
+        let helpMenu = NSMenu(title: "Help"); helpItem.submenu = helpMenu
+        helpMenu.addItem(withTitle: "Keyboard Shortcuts", action: Selector(("showShortcutGuide:")), keyEquivalent: "?")
+        NSApp.helpMenu = helpMenu
 
         NSApp.mainMenu = mainMenu
     }

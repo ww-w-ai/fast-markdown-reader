@@ -5,12 +5,12 @@ final class FontSizeStoreTests: XCTestCase {
     override func setUp() { UserDefaults.standard.removeObject(forKey: "baseFontSize") }
     override func tearDown() { UserDefaults.standard.removeObject(forKey: "baseFontSize") }
 
-    func testDefaultIs15() { XCTAssertEqual(FontSizeStore.size, 15) }
+    func testDefaultIs16() { XCTAssertEqual(FontSizeStore.size, 16) }   // Notion base size
 
     func testIncreaseAndPersist() {
         FontSizeStore.increase()
-        XCTAssertEqual(FontSizeStore.size, 16)
-        XCTAssertEqual(UserDefaults.standard.double(forKey: "baseFontSize"), 16)
+        XCTAssertEqual(FontSizeStore.size, 17)
+        XCTAssertEqual(UserDefaults.standard.double(forKey: "baseFontSize"), 17)
     }
 
     func testClampUpper() {

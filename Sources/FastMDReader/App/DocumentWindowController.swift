@@ -1,6 +1,6 @@
 import AppKit
 
-final class DocumentWindowController: NSWindowController, NSWindowDelegate {
+final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTextViewDelegate {
     // Explicit TextKit 1 stack (C2): building the view with init(frame:textContainer:)
     // guarantees the classic NSLayoutManager path instead of silently falling back
     // to TextKit 2 compatibility mode when layoutManager is later accessed.
@@ -13,14 +13,30 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered, defer: false)
         window.tabbingMode = .preferred   // native tabs
+        // Don't let macOS restore previously-open documents on relaunch — every launch starts
+        // clean, so closing the window / quitting doesn't leave old docs (tabs) behind next time.
+        window.isRestorable = false
         self.init(window: window)
         window.center()
 
-        textView.isEditable = false
-        textView.isSelectable = true          // mouse selection allowed
+        // Editable so a real blinking insertion point (caret) is shown and arrow-key caret
+        // navigation works — you can see where a selection will start, and future editing is a
+        // one-line change. Actual mutations are rejected in shouldChangeTextIn (read-only by
+        // policy). Substitutions/spell-check are off so nothing tries to change the text.
+        textView.isEditable = true
+        textView.isSelectable = true
         textView.isRichText = true
+        textView.isAutomaticQuoteSubstitutionEnabled = false
+        textView.isAutomaticDashSubstitutionEnabled = false
+        textView.isAutomaticTextReplacementEnabled = false
+        textView.isAutomaticSpellingCorrectionEnabled = false
+        textView.isContinuousSpellCheckingEnabled = false
+        textView.isGrammarCheckingEnabled = false
+        textView.smartInsertDeleteEnabled = false
         textView.usesFindBar = true           // ⌘F find bar (free for NSTextView)
         textView.isIncrementalSearchingEnabled = true
+        textView.delegate = self              // intercept link/path clicks
+        textView.displaysLinkToolTips = true
         // Standard NSScrollView + NSTextView sizing: without a non-zero frame and a huge
         // maxSize, a manually-created text view can't grow past its initial frame, so the
         // document is clipped to the visible area and won't scroll.
@@ -36,6 +52,10 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = false   // viewer never scrolls sideways; text wraps
         scrollView.drawsBackground = true
+        // Keep copy-on-scroll ON: during a scroll AppKit blits old pixels and only repaints the
+        // newly-exposed strip — cheap. Custom card/quote backgrounds can tear briefly mid-scroll,
+        // which is fine; viewportChanged repaints the whole visible area ONCE when scrolling settles.
+        scrollView.contentView.copiesOnScroll = true
         window.contentView = scrollView
         window.delegate = self                     // windowDidResize → recompute the column
         updateTextInset()
@@ -58,9 +78,10 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
 
     // Re-render the centered column and re-place code overlays whenever the window resizes.
     func windowDidResize(_ notification: Notification) {
+        // Reflow immediately for a responsive resize; the overlay re-placement rides the debounced
+        // viewportChanged (frame/bounds change) — no need to also rebuild overlays on every step.
         lastClipWidth = scrollView.contentSize.width
         updateTextInset()
-        placeCopyButtons()
     }
 
     override init(window: NSWindow?) {
@@ -125,17 +146,19 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         return lm.characterIndexForGlyph(at: min(glyph, lm.numberOfGlyphs - 1))
     }
 
-    /// Scroll so the given character sits at the top of the viewport (top anchor).
-    func scrollCharToTop(_ charIndex: Int) {
+    /// Scroll so the given character sits at the top of the viewport. `lineOffset` pushes it down
+    /// by N lines (used when selecting downward so the already-selected line above stays visible).
+    func scrollCharToTop(_ charIndex: Int, lineOffset: Int = 0) {
         guard let lm = textView.layoutManager, let tc = textView.textContainer,
               let storage = textView.textStorage, lm.numberOfGlyphs > 0 else { return }
         let idx = min(max(0, charIndex), storage.length)
         let glyph = lm.glyphIndexForCharacter(at: idx)
         var rect = lm.lineFragmentRect(forGlyphAt: min(glyph, lm.numberOfGlyphs - 1), effectiveRange: nil)
         rect.origin.y += textView.textContainerInset.height
+        let targetY = rect.origin.y - CGFloat(lineOffset) * rect.height
         let clip = scrollView.contentView
         let maxY = max(0, textView.bounds.height - clip.bounds.height)
-        clip.scroll(to: NSPoint(x: 0, y: min(max(0, rect.origin.y), maxY)))
+        clip.scroll(to: NSPoint(x: 0, y: min(max(0, targetY), maxY)))
         scrollView.reflectScrolledClipView(clip)
         placeCopyButtons()
     }
@@ -149,9 +172,21 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         placeCopyButtons()
     }
 
+    /// Lightweight refresh for image fills: an attachment's size changed (editedAttributes,
+    /// changeInLength 0) so CHARACTER OFFSETS are unchanged — heading offsets don't need
+    /// recomputing. Coalesce the button re-placement so N images cost ONE placement, not N
+    /// full-document passes (was O(N²) via refreshAfterMutation per image).
+    func refreshAfterImageFill() {
+        pendingPlace?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.placeCopyButtons() }
+        pendingPlace = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: work)
+    }
+
     // MARK: - Code-block overlays (Copy + Wrap toggle + optional no-wrap scroll view)
 
     private var codeOverlays: [NSView] = []
+    private var lastPlacementSig = ""            // skip overlay rebuild when nothing relevant changed
     private var noWrapCodes: Set<String> = []   // code blocks toggled to no-wrap (per session)
     private var pendingPlace: DispatchWorkItem?
     private var lastClipWidth: CGFloat = 0
@@ -162,7 +197,13 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         let w = scrollView.contentSize.width
         if abs(w - lastClipWidth) > 0.5 { lastClipWidth = w; updateTextInset() }
         pendingPlace?.cancel()
-        let work = DispatchWorkItem { [weak self] in self?.placeCopyButtons() }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.placeCopyButtons()
+            // Scroll has settled: repaint the whole visible area once so any card/quote background
+            // torn by copy-on-scroll blitting is drawn clean (mid-scroll tearing is acceptable).
+            self.textView.setNeedsDisplay(self.textView.visibleRect)
+        }
         pendingPlace = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: work)
     }
@@ -171,46 +212,106 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     /// overlay) for every code block currently on screen. Rebuilt on scroll/resize so only
     /// visible blocks cost anything; the no-wrap overlay exists only for toggled blocks, so a
     /// normal document loads with zero extra views.
-    func placeCopyButtons() {
+    private func teardownOverlays() {
         codeOverlays.forEach { $0.removeFromSuperview() }
         codeOverlays.removeAll()
+    }
+
+    func placeCopyButtons() {
         guard let storage = textView.textStorage,
               let lm = textView.layoutManager,
-              let container = textView.textContainer, storage.length > 0 else { return }
+              let container = textView.textContainer, storage.length > 0 else {
+            teardownOverlays(); lastPlacementSig = ""; return
+        }
         let visibleRect = textView.visibleRect
         let visibleGlyphs = lm.glyphRange(forBoundingRect: visibleRect, in: container)
         let visibleChars = lm.characterRange(forGlyphRange: visibleGlyphs, actualGlyphRange: nil)
-        guard visibleChars.length > 0 else { return }
+        guard visibleChars.length > 0 else { teardownOverlays(); lastPlacementSig = ""; return }
+        let whole = NSRange(location: 0, length: storage.length)
+        // Signature of everything that determines overlay layout: visible code blocks (full range
+        // + wrap state + vertical position) plus column width and font size. If unchanged since the
+        // last placement, existing overlays are still correct — skip the teardown + rebuild.
+        var sig = "\(Int(container.size.width))|\(FontSizeStore.size)"
+        storage.enumerateAttribute(MDAttr.codeBlock, in: visibleChars) { value, visRange, _ in
+            guard let code = value as? String else { return }
+            var range = visRange
+            _ = storage.attribute(MDAttr.codeBlock, at: visRange.location, longestEffectiveRange: &range, in: whole)
+            let g = lm.glyphRange(forCharacterRange: NSRange(location: range.location, length: 1), actualCharacterRange: nil).location
+            let y = Int(lm.lineFragmentRect(forGlyphAt: g, effectiveRange: nil).minY)
+            sig += "#\(range.location):\(range.length):\(self.noWrapCodes.contains(code) ? 1 : 0):\(y)"
+        }
+        if sig == lastPlacementSig { return }
+        lastPlacementSig = sig
+        teardownOverlays()
         let inset = textView.textContainerInset
         let cardRight = inset.width + container.size.width - CodeCardMetrics.horizontalMargin
         let cardLeft = inset.width + CodeCardMetrics.horizontalMargin
 
-        storage.enumerateAttribute(MDAttr.codeBlock, in: visibleChars) { value, range, _ in
+        storage.enumerateAttribute(MDAttr.codeBlock, in: visibleChars) { value, visRange, _ in
             guard let code = value as? String else { return }
+            // The enumeration range is CLIPPED to the visible portion; anchoring to it pins the
+            // header to the viewport top as you scroll. Recover the block's FULL range so the
+            // header sits at the block's real top and scrolls away with it.
+            var range = visRange
+            _ = storage.attribute(MDAttr.codeBlock, at: visRange.location, longestEffectiveRange: &range, in: whole)
             let lang = (storage.attribute(MDAttr.codeLang, at: range.location, effectiveRange: nil) as? String) ?? ""
             let glyphRange = lm.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
             var rect = lm.boundingRect(forGlyphRange: glyphRange, in: container)
             rect.origin.x += inset.width; rect.origin.y += inset.height
             let headerY = rect.minY + 2   // the blank header line reserved by the renderer
+            // Nested-in-quote code shifts its card (and chrome) right to align with the quote.
+            let qInset = CGFloat((storage.attribute(MDAttr.codeInset, at: range.location, effectiveRange: nil) as? NSNumber)?.doubleValue ?? 0)
+            let blockLeft = cardLeft + qInset
 
-            // No-wrap overlay covers the code area (below the header line) with its own scroller.
-            if self.noWrapCodes.contains(code), range.length > 2 {
+            // Where the code text starts (after the 2-char blank header line) — used to
+            // position the header divider precisely and to frame the no-wrap overlay.
+            var codeTop = headerY + 20
+            if range.length > 2 {
                 let codeChars = NSRange(location: range.location + 2, length: range.length - 2)
                 let codeGlyphs = lm.glyphRange(forCharacterRange: codeChars, actualCharacterRange: nil)
                 var codeRect = lm.boundingRect(forGlyphRange: codeGlyphs, in: container)
                 codeRect.origin.x += inset.width; codeRect.origin.y += inset.height
-                let frame = NSRect(x: cardLeft, y: codeRect.minY,
-                                   width: cardRight - cardLeft, height: codeRect.height)
-                let sv = self.makeNoWrapCodeView(code: code, lang: lang, frame: frame)
-                self.textView.addSubview(sv)
-                self.codeOverlays.append(sv)
+                codeTop = codeRect.minY
+
+                // No-wrap overlay covers the code area (below the header) with its own scroller.
+                if self.noWrapCodes.contains(code) {
+                    let frame = NSRect(x: blockLeft, y: codeRect.minY,
+                                       width: cardRight - blockLeft, height: codeRect.height)
+                    let sv = self.makeNoWrapCodeView(code: code, lang: lang, frame: frame)
+                    self.textView.addSubview(sv)
+                    self.codeOverlays.append(sv)
+                }
             }
 
-            let copy = self.makeButton("Copy", action: #selector(self.copyCode(_:)), code: code)
-            let wrapTitle = self.noWrapCodes.contains(code) ? "Wrap" : "No-wrap"
-            let wrap = self.makeButton(wrapTitle, action: #selector(self.toggleWrap(_:)), code: code)
+            // Header divider — separates the header row (lang label + buttons) from the code,
+            // making each block read as a real code card.
+            let divider = NSView(frame: NSRect(x: blockLeft, y: headerY + 18,
+                                               width: cardRight - blockLeft, height: 1))
+            divider.wantsLayer = true
+            divider.layer?.backgroundColor = Palette.hairline.cgColor
+            self.textView.addSubview(divider)
+            self.codeOverlays.append(divider)
+
+            // Language label on the left of the header (e.g. "SWIFT", "PYTHON").
+            if !lang.isEmpty {
+                let label = self.makeLangLabel(lang)
+                label.setFrameOrigin(NSPoint(x: blockLeft + CodeCardMetrics.textInset, y: headerY + 1))
+                self.textView.addSubview(label)
+                self.codeOverlays.append(label)
+            }
+
+            let copy = self.makeChipButton("Copy", textColor: .secondaryLabelColor,
+                bg: NSColor.textColor.withAlphaComponent(0.06), weight: .medium,
+                action: #selector(self.copyCode(_:)), code: code)
+            // Wrap toggle: accent fill + accent text when wrapping is ON; grey text, no fill when OFF.
+            let wrapping = !self.noWrapCodes.contains(code)
+            let wrap = self.makeChipButton("Wrap",
+                textColor: wrapping ? Palette.link : .tertiaryLabelColor,
+                bg: wrapping ? Palette.link.withAlphaComponent(0.16) : .clear,
+                weight: wrapping ? .semibold : .regular,
+                action: #selector(self.toggleWrap(_:)), code: code)
             copy.setFrameOrigin(NSPoint(x: cardRight - copy.frame.width - 6, y: headerY))
-            wrap.setFrameOrigin(NSPoint(x: copy.frame.minX - wrap.frame.width - 6, y: headerY))
+            wrap.setFrameOrigin(NSPoint(x: copy.frame.minX - wrap.frame.width - 4, y: headerY))
             self.textView.addSubview(copy)   // buttons on top of any overlay
             self.textView.addSubview(wrap)
             self.codeOverlays.append(copy); self.codeOverlays.append(wrap)
@@ -226,17 +327,43 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         return b
     }
 
+    /// A uniform header chip (Copy / Wrap) — same size and shape so they line up; only the
+    /// colors differ (Wrap uses an accent fill when wrapping is on, grey when off).
+    private func makeChipButton(_ title: String, textColor: NSColor, bg: NSColor,
+                                weight: NSFont.Weight, action: Selector, code: String) -> NSButton {
+        let b = NSButton(title: title, target: self, action: action)
+        b.isBordered = false
+        b.attributedTitle = NSAttributedString(string: title, attributes: [
+            .font: NSFont.systemFont(ofSize: 10, weight: weight), .foregroundColor: textColor])
+        b.sizeToFit()
+        var f = b.frame; f.size.width += 14; f.size.height = 17; b.frame = f
+        b.wantsLayer = true
+        b.layer?.cornerRadius = 4
+        b.layer?.backgroundColor = bg.cgColor
+        b.identifier = NSUserInterfaceItemIdentifier(code)
+        return b
+    }
+
+    /// A small uppercase language tag ("SWIFT", "PYTHON") for the code-card header.
+    private func makeLangLabel(_ lang: String) -> NSTextField {
+        let f = NSTextField(labelWithString: lang.uppercased())
+        f.font = .monospacedSystemFont(ofSize: 9, weight: .semibold)
+        f.textColor = .tertiaryLabelColor
+        f.sizeToFit()
+        return f
+    }
+
     private func makeNoWrapCodeView(code: String, lang: String, frame: NSRect) -> NSScrollView {
         let sv = NSScrollView(frame: frame)
         sv.hasHorizontalScroller = true
         sv.hasVerticalScroller = false
         sv.autohidesScrollers = true
         sv.drawsBackground = true
-        sv.backgroundColor = .textBackgroundColor   // opaque, hides the folded code underneath
+        sv.backgroundColor = Palette.codeCardBg      // opaque, matches the card, hides folded code
         sv.wantsLayer = true
         sv.layer?.cornerRadius = CodeCardMetrics.cornerRadius
         sv.layer?.borderWidth = 1
-        sv.layer?.borderColor = NSColor.textColor.withAlphaComponent(0.11).cgColor
+        sv.layer?.borderColor = Palette.codeCardBorder.cgColor
         let tv = NSTextView(frame: NSRect(origin: .zero, size: frame.size))
         tv.isEditable = false; tv.isSelectable = true
         tv.drawsBackground = false
@@ -246,10 +373,45 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         tv.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         tv.textContainer?.widthTracksTextView = false
         tv.textContainer?.containerSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-        let hl = CodeHighlighter.highlight(code, language: lang.isEmpty ? nil : lang,
-                                           theme: .current(size: FontSizeStore.size))
+        let overlayTheme = RenderTheme.current(size: FontSizeStore.size)
+        let hl = NSMutableAttributedString(attributedString:
+            CodeHighlighter.highlight(code, language: lang.isEmpty ? nil : lang, theme: overlayTheme))
+        // Match the wrapped card's line leading so no-wrap lines aren't tighter than wrap mode.
+        let codeLH = (overlayTheme.codeFont.pointSize * 1.4).rounded()
+        let ps = NSMutableParagraphStyle()
+        ps.minimumLineHeight = codeLH; ps.maximumLineHeight = codeLH
+        hl.addAttribute(.paragraphStyle, value: ps, range: NSRange(location: 0, length: hl.length))
         tv.textStorage?.setAttributedString(hl)
         sv.documentView = tv
+
+        // Force layout of this (visible, user-toggled) block to measure its real extent —
+        // deterministic, and only paid for a block on screen.
+        if let tc = tv.textContainer, let tlm = tv.layoutManager {
+            tlm.ensureLayout(for: tc)
+            let usedRect = tlm.usedRect(for: tc)
+            // Does the code overflow horizontally? If so a scroller appears along the bottom and
+            // would sit ON TOP of the last code line — reserve extra height for it.
+            let used = usedRect.width + 2 * CodeCardMetrics.textInset
+            let hasHScroll = used > frame.width + 1
+            let scrollerPad: CGFloat = hasHScroll ? 16 : 0
+            // Fit the overlay to its ACTUAL content (+ top/bottom inset + scroller room) so the
+            // last code line is never clipped.
+            let contentH = ceil(usedRect.height + 2 * 4 + scrollerPad)
+            if contentH > sv.frame.height {
+                sv.setFrameSize(NSSize(width: sv.frame.width, height: contentH))
+                tv.setFrameSize(NSSize(width: sv.frame.width, height: contentH))
+            }
+            // Resizing the document view can leave the clip view scrolled off the top line;
+            // pin it back to the origin so the first code line is never clipped.
+            sv.contentView.scroll(to: .zero)
+            sv.reflectScrolledClipView(sv.contentView)
+            // Scroll affordance: fade the right edge so it reads as "there's more →".
+            if hasHScroll {
+                let fade = EdgeFadeView(frame: NSRect(x: sv.frame.width - 26, y: 0, width: 26, height: sv.frame.height))
+                fade.autoresizingMask = [.minXMargin, .height]
+                sv.addSubview(fade)
+            }
+        }
         return sv
     }
 
@@ -262,8 +424,261 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     }
 
     @objc private func toggleWrap(_ sender: NSButton) {
-        guard let code = sender.identifier?.rawValue else { return }
-        if noWrapCodes.contains(code) { noWrapCodes.remove(code) } else { noWrapCodes.insert(code) }
+        guard let code = sender.identifier?.rawValue, let storage = textView.textStorage else { return }
+        let noWrap = !noWrapCodes.contains(code)
+        if noWrap { noWrapCodes.insert(code) } else { noWrapCodes.remove(code) }
+        // Change the underlying code paragraphs' wrapping so the BLOCK HEIGHT actually reflows:
+        // wrap = fold long lines (tall); no-wrap = one clipped line per source line (short), with
+        // the scroll overlay providing horizontal scrolling on top.
+        let whole = NSRange(location: 0, length: storage.length)
+        storage.beginEditing()
+        storage.enumerateAttribute(MDAttr.codeBlock, in: whole) { v, r, _ in
+            guard (v as? String) == code else { return }
+            storage.enumerateAttribute(.paragraphStyle, in: r, options: []) { ps, sub, _ in
+                guard let ps = ps as? NSParagraphStyle, let mps = ps.mutableCopy() as? NSMutableParagraphStyle else { return }
+                // no-wrap: the OVERLAY shows the scrollable code; the underlying copy just needs to
+                // keep the block's height. Use truncatingTail (not clipping) so a long line stops at
+                // the card's right edge instead of overflowing past the overlay and peeking out.
+                mps.lineBreakMode = noWrap ? .byTruncatingTail : .byCharWrapping
+                storage.addAttribute(.paragraphStyle, value: mps, range: sub)
+            }
+        }
+        storage.endEditing()
         placeCopyButtons()
+    }
+
+    /// Read-only by policy: the view is editable (for a visible caret + future editing) but we
+    /// reject every mutation. Flip this to allow editing later.
+    func textView(_ textView: NSTextView, shouldChangeTextIn affectedCharRange: NSRange,
+                  replacementString: String?) -> Bool { false }
+
+    // MARK: - Link / file-path clicks
+
+    /// Open clicked links: web URLs in the browser, `.md` files as a tab (focusing an already-
+    /// open one), other files in their associated app, and folders in Finder.
+    func textView(_ tv: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
+        // In-document anchor (a TOC entry) → scroll to the matching heading.
+        if let slug = tv.textStorage?.attribute(MDAttr.anchor, at: charIndex, effectiveRange: nil) as? String {
+            jumpToHeading(slug: slug); return true
+        }
+        // A detected file path (stored raw so it can be resolved against the document's folder).
+        if let raw = tv.textStorage?.attribute(MDAttr.filePath, at: charIndex, effectiveRange: nil) as? String {
+            openFile(resolvePath(raw)); return true
+        }
+        let url: URL? = (link as? URL) ?? (link as? String).flatMap { URL(string: $0) }
+        guard let url else { return false }
+        if url.isFileURL { openFile(url) } else { NSWorkspace.shared.open(url) }   // http(s) → browser
+        return true
+    }
+
+    /// Resolve a GFM anchor slug to its heading and scroll there (top-anchored). Slugs are matched
+    /// by the GitHub rule: lowercase, drop punctuation, spaces→hyphens (Hangul/CJK preserved).
+    private func jumpToHeading(slug: String) {
+        guard let storage = textView.textStorage else { return }
+        let target = Self.slugify(slug)
+        var found: Int?
+        storage.enumerateAttribute(MDAttr.heading, in: NSRange(location: 0, length: storage.length)) { v, r, stop in
+            guard v != nil else { return }
+            if Self.slugify((storage.string as NSString).substring(with: r)) == target {
+                found = r.location; stop.pointee = true
+            }
+        }
+        if let f = found {
+            textView.setSelectedRange(NSRange(location: f, length: 0))
+            scrollCharToTop(f)
+        } else {
+            NSSound.beep()
+        }
+    }
+
+    private static func slugify(_ s: String) -> String {
+        var out = ""
+        for ch in s.lowercased() {
+            if ch == " " || ch == "\t" { out.append("-") }
+            else if ch == "-" || ch == "_" || ch.isLetter || ch.isNumber { out.append(ch) }
+        }
+        return out
+    }
+
+    /// ⌘-click on a selection: open whatever was highlighted, even without an http prefix.
+    /// Tries, in order: an explicit URL scheme → a resolvable file path → a bare web domain.
+    /// Right-click → Edit: open the markdown SOURCE of the block(s) the selection touches in a
+    /// popup; on save, replace just that source span and re-render (Notion-style block editing).
+    func editSelectedSource(atChar: Int? = nil) {
+        guard let storage = textView.textStorage, let doc = document as? MarkdownDocument, storage.length > 0 else { return }
+        let sel = textView.selectedRange()
+        // Use the selection if there is one; otherwise the block under the right-click (or caret).
+        let anchor = (atChar ?? sel.location)
+        let scan = sel.length > 0 ? sel
+                                  : NSRange(location: min(max(0, anchor), storage.length - 1), length: 1)
+        var lo = Int.max, hi = Int.min
+        storage.enumerateAttribute(MDAttr.srcRange, in: scan) { v, _, _ in
+            guard let r = (v as? NSValue)?.rangeValue else { return }
+            lo = min(lo, r.location); hi = max(hi, r.location + r.length)
+        }
+        guard lo != Int.max, hi > lo else { NSSound.beep(); return }
+        let srcRange = NSRange(location: lo, length: hi - lo)
+        SourceEditPanel.show(markdown: doc.sourceSubstring(srcRange)) { [weak doc] edited in
+            doc?.applySourceEdit(srcRange, with: edited)
+        }
+    }
+
+    func openSelectionText(_ raw: String) {
+        let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !s.isEmpty else { NSSound.beep(); return }
+        if s.contains("://"), let url = URL(string: s) { NSWorkspace.shared.open(url); return }
+        let fileURL = resolvePath(s)
+        if FileManager.default.fileExists(atPath: fileURL.path) { openFile(fileURL); return }
+        // Schemeless web address ("ww-w.ai", "example.com/x") → assume https.
+        if s.contains("."), !s.contains(" "), let url = URL(string: "https://\(s)") {
+            NSWorkspace.shared.open(url); return
+        }
+        NSSound.beep()
+    }
+
+    /// Resolve a raw path: expand `~`, take absolute paths as-is, resolve relatives against
+    /// the current document's directory.
+    private func resolvePath(_ raw: String) -> URL {
+        if raw.hasPrefix("~") { return URL(fileURLWithPath: (raw as NSString).expandingTildeInPath) }
+        if raw.hasPrefix("/") { return URL(fileURLWithPath: raw) }
+        if let dir = (document as? NSDocument)?.fileURL?.deletingLastPathComponent() {
+            return dir.appendingPathComponent(raw).standardizedFileURL
+        }
+        return URL(fileURLWithPath: raw)
+    }
+
+    private func openFile(_ url: URL) {
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        let exists = fm.fileExists(atPath: url.path, isDirectory: &isDir)
+        let ext = url.pathExtension.lowercased()
+        if exists, isDir.boolValue {
+            NSWorkspace.shared.open(url)                    // folder → Finder
+        } else if ext == "md" || ext == "markdown" {
+            // Open (or focus) as a tab. NSDocumentController returns the already-open document
+            // and fronts its window; tabbingMode = .preferred makes new windows join as tabs.
+            NSDocumentController.shared.openDocument(withContentsOf: url, display: true) { _, _, _ in }
+        } else if exists {
+            NSWorkspace.shared.open(url)                    // other file → associated app
+        } else {
+            NSSound.beep()                                  // dangling path
+        }
+    }
+
+    // MARK: - Print (⌘P)
+
+    private var printRestore: [(NSView, Bool)] = []
+
+    @objc func printDocument(_ sender: Any?) {
+        guard let window = window else { return }
+        // Code-block overlays (Copy/Wrap buttons, no-wrap scrollers, dividers) are live subviews;
+        // hide them so the printout shows clean code cards, then restore after the panel closes.
+        printRestore = codeOverlays.map { ($0, $0.isHidden) }
+        codeOverlays.forEach { $0.isHidden = true }
+        let info = NSPrintInfo.shared
+        info.horizontalPagination = .fit
+        info.verticalPagination = .automatic
+        let op = NSPrintOperation(view: textView, printInfo: info)
+        op.jobTitle = (document as? NSDocument)?.fileURL?.lastPathComponent ?? "Document"
+        op.runModal(for: window, delegate: self,
+                    didRun: #selector(printDidRun(_:success:contextInfo:)), contextInfo: nil)
+    }
+
+    @objc private func printDidRun(_ op: NSPrintOperation, success: Bool, contextInfo: UnsafeMutableRawPointer?) {
+        printRestore.forEach { $0.0.isHidden = $0.1 }
+        printRestore = []
+    }
+
+    // MARK: - Shortcut guide (?, Help menu)
+
+    private static var guidePanel: NSPanel?
+
+    @objc func showShortcutGuide(_ sender: Any?) {
+        if let p = Self.guidePanel { p.makeKeyAndOrderFront(nil); return }
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 500, height: 640),
+                            styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        panel.title = "Keyboard Shortcuts"
+        panel.isFloatingPanel = true
+        panel.isReleasedWhenClosed = false
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 500, height: 640))
+        scroll.hasVerticalScroller = true
+        scroll.drawsBackground = false
+        let tv = NSTextView(frame: scroll.bounds)
+        tv.isEditable = false; tv.isSelectable = true
+        tv.drawsBackground = false
+        tv.textContainerInset = NSSize(width: 24, height: 22)
+        tv.textStorage?.setAttributedString(Self.guideText())
+        tv.isVerticallyResizable = true
+        tv.autoresizingMask = [.width]
+        scroll.documentView = tv
+        panel.contentView = scroll
+        panel.center()
+        panel.makeKeyAndOrderFront(nil)
+        Self.guidePanel = panel
+    }
+
+    private static func guideText() -> NSAttributedString {
+        let out = NSMutableAttributedString()
+        let head = NSFont.boldSystemFont(ofSize: 12)
+        let body = NSFont.systemFont(ofSize: 13)
+        let key  = NSFont.monospacedSystemFont(ofSize: 12, weight: .medium)
+        let para = NSMutableParagraphStyle()
+        para.tabStops = [NSTextTab(textAlignment: .left, location: 160)]
+        para.defaultTabInterval = 160
+        para.lineSpacing = 4
+        para.paragraphSpacing = 2
+        func section(_ title: String) {
+            out.append(NSAttributedString(string: "\n\(title)\n",
+                attributes: [.font: head, .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: para]))
+        }
+        func row(_ k: String, _ desc: String) {
+            out.append(NSAttributedString(string: k + "\t",
+                attributes: [.font: key, .foregroundColor: NSColor.labelColor, .paragraphStyle: para]))
+            out.append(NSAttributedString(string: desc + "\n",
+                attributes: [.font: body, .foregroundColor: NSColor.labelColor, .paragraphStyle: para]))
+        }
+        func note(_ text: String) {
+            out.append(NSAttributedString(string: text + "\n",
+                attributes: [.font: NSFont.systemFont(ofSize: 11),
+                             .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: para]))
+        }
+        section("Navigation")
+        note("Modifier position = jump size — farther left jumps bigger  (fn › ⌥ › ⌘)")
+        row("⌘↑ / ⌘↓", "Previous / next paragraph  (a whole table is one stop)")
+        row("⌥↑ / ⌥↓", "Page up / down  (same as Space / ⇧Space)")
+        row("fn↑ / fn↓", "Document start / end")
+        row("Space / ⇧Space", "Page down / up")
+        row("↑ ↓ ← →", "Move the reading cursor one line/char")
+        section("File")
+        row("⌘O", "Open");  row("⌘W", "Close tab");  row("⌘R", "Reload from disk");  row("⌘P", "Print")
+        section("Find & copy")
+        row("⌘F", "Find in document");  row("⌘C", "Copy selection");  row("⌘A", "Select all")
+        section("Zoom (text)")
+        row("⌘+ / ⌘−", "Increase / decrease font size");  row("⌘0", "Actual size")
+        section("Window")
+        row("⌘M", "Minimize");  row("⌃⇥ / ⌃⇧⇥", "Next / previous tab")
+        section("Mouse")
+        row("Click link / path", "Open a URL, file, or folder")
+        row("⌘-Click selection", "Open the selected text as a link / path / file")
+        row("Click left margin", "Copy that whole block (or section, beside a heading)")
+        row("Right-click selection", "Copy · Open · Edit… (edit that block's markdown source)")
+        row("Click a diagram / image", "Open it enlarged in a zoomable window")
+        row("Wrap / Copy button", "Toggle a code block's wrapping / copy its code")
+        section("Diagram window")
+        row("Pinch  or  + / −", "Zoom in / out");  row("0", "Fit to window");  row("Drag", "Move around (pan)")
+        section("Help")
+        row("?", "Show this guide")
+        return out
+    }
+}
+
+/// A non-interactive right-edge fade (clear → card background) that signals horizontal
+/// overflow in a no-wrap code block. Overrides hitTest so it never intercepts scrolling.
+final class EdgeFadeView: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    override func draw(_ dirtyRect: NSRect) {
+        let bg = Palette.codeCardBg
+        let gradient = NSGradient(colors: [bg.withAlphaComponent(0), bg])!
+        gradient.draw(in: bounds, angle: 0)   // 0° = clear on the left, solid at the right edge
     }
 }

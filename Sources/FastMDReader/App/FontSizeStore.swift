@@ -7,12 +7,12 @@ enum FontSizeStore {
     private static let key = "baseFontSize"
     static var size: CGFloat {
         get {
-            let v = UserDefaults.standard.object(forKey: key) as? Double ?? 15
+            let v = UserDefaults.standard.object(forKey: key) as? Double ?? 16
             return CGFloat(min(36, max(10, v)))
         }
         set { UserDefaults.standard.set(Double(min(36, max(10, newValue))), forKey: key) }
     }
-    static let defaultSize: CGFloat = 15
+    static let defaultSize: CGFloat = 16
     static func increase() { size = size + 1 }
     static func decrease() { size = size - 1 }
     static func reset() { size = defaultSize }

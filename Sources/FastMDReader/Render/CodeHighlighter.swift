@@ -32,32 +32,41 @@ enum CodeHighlighter {
         }
     }
 
+    // Regexes are compiled ONCE (not per code block per render). Per-language keywords collapse
+    // into a single `\b(a|b|c)\b` alternation instead of one regex per keyword.
+    private static let numberRE = try! NSRegularExpression(pattern: "\\b[0-9]+(?:\\.[0-9]+)?\\b")
+    private static let dqStringRE = try! NSRegularExpression(pattern: "\"(?:[^\"\\\\]|\\\\.)*\"")
+    private static let sqStringRE = try! NSRegularExpression(pattern: "'(?:[^'\\\\]|\\\\.)*'")
+    private static let slashCommentRE = try! NSRegularExpression(pattern: "//[^\\n]*")
+    private static let hashCommentRE = try! NSRegularExpression(pattern: "#[^\\n]*")
+    private static let keywordRE: [String: NSRegularExpression] = {
+        var d: [String: NSRegularExpression] = [:]
+        for (lang, kws) in keywords where !kws.isEmpty {
+            let alt = kws.map { NSRegularExpression.escapedPattern(for: $0) }.joined(separator: "|")
+            if let re = try? NSRegularExpression(pattern: "\\b(?:\(alt))\\b") { d[lang] = re }
+        }
+        return d
+    }()
+
     static func highlight(_ code: String, language: String?, theme: RenderTheme) -> NSAttributedString {
         let base: [NSAttributedString.Key: Any] = [.font: theme.codeFont, .foregroundColor: theme.textColor]
         let result = NSMutableAttributedString(string: code, attributes: base)
         guard let lang = canonical(language) else { return result } // plain fallback
         let p = Palette()
-        let ns = code as NSString
+        let full = NSRange(location: 0, length: (code as NSString).length)
 
-        func color(_ pattern: String, _ c: NSColor, options: NSRegularExpression.Options = []) {
-            guard let re = try? NSRegularExpression(pattern: pattern, options: options) else { return }
-            for m in re.matches(in: code, range: NSRange(location: 0, length: ns.length)) {
+        func apply(_ re: NSRegularExpression, _ c: NSColor) {
+            for m in re.matches(in: code, range: full) {
                 result.addAttribute(.foregroundColor, value: c, range: m.range)
             }
         }
 
         // keywords first, then literals/comments override where they overlap
-        for kw in keywords[lang] ?? [] {
-            color("\\b\(NSRegularExpression.escapedPattern(for: kw))\\b", p.keyword)
-        }
-        color("\\b[0-9]+(?:\\.[0-9]+)?\\b", p.number)
-        color("\"(?:[^\"\\\\]|\\\\.)*\"", p.string)
-        color("'(?:[^'\\\\]|\\\\.)*'", p.string)
-        if lang == "python" || lang == "bash" {
-            color("#[^\\n]*", p.comment)
-        } else {
-            color("//[^\\n]*", p.comment)
-        }
+        if let kwRE = keywordRE[lang] { apply(kwRE, p.keyword) }
+        apply(numberRE, p.number)
+        apply(dqStringRE, p.string)
+        apply(sqStringRE, p.string)
+        apply((lang == "python" || lang == "bash") ? hashCommentRE : slashCommentRE, p.comment)
         return result
     }
 }

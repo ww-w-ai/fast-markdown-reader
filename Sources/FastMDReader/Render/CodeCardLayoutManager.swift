@@ -6,34 +6,122 @@ import AppKit
 /// copy-button overlay via `CodeCardMetrics` so the button lands on the card's edge.
 enum CodeCardMetrics {
     static let horizontalMargin: CGFloat = 4   // gap from the text-area edges
-    static let verticalPadding: CGFloat = 7    // extra height above/below the code text
+    static let verticalPadding: CGFloat = 11   // extra height above/below the code text
     static let cornerRadius: CGFloat = 7
     static let textInset: CGFloat = 14         // left/right padding of code inside the card
 }
 
-final class CodeCardLayoutManager: NSLayoutManager {
-    override func drawBackground(forGlyphRange glyphsToShow: NSRange, at origin: NSPoint) {
-        super.drawBackground(forGlyphRange: glyphsToShow, at: origin)
-        guard let storage = textStorage, let container = textContainers.first else { return }
+/// Non-contiguous-layout NSLayoutManager. Decoration drawing (code cards, inline-code chips,
+/// rules, quote bars) is intentionally NOT here — it lives in ReaderTextView.drawBackground(in:)
+/// (the view's background pass) so it sits UNDER the selection highlight and text, instead of
+/// painting over the selection like a layout-manager background would.
+final class CodeCardLayoutManager: NSLayoutManager {}
 
-        let m = CodeCardMetrics.self
-        let charRange = characterRange(forGlyphRange: glyphsToShow, actualGlyphRange: nil)
-        let fill = NSColor.textColor.withAlphaComponent(0.045)
-        let border = NSColor.textColor.withAlphaComponent(0.11)
+/// Draw all block decorations behind the text for the glyphs in `glyphsToShow`. Called from the
+/// text view's background pass, so everything drawn here is beneath selection + glyphs.
+func drawMDDecorations(_ lm: NSLayoutManager, _ storage: NSTextStorage,
+                       _ container: NSTextContainer, glyphsToShow: NSRange, at origin: NSPoint) {
+    let m = CodeCardMetrics.self
+    let charRange = lm.characterRange(forGlyphRange: glyphsToShow, actualGlyphRange: nil)
 
-        storage.enumerateAttribute(MDAttr.codeBlock, in: charRange) { value, range, _ in
-            guard value != nil else { return }
-            let gr = self.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
-            var rect = self.boundingRect(forGlyphRange: gr, in: container)
-            rect = rect.offsetBy(dx: origin.x, dy: origin.y)
-            var card = rect
-            card.origin.x = origin.x + m.horizontalMargin
-            card.size.width = container.size.width - m.horizontalMargin * 2
-            card.origin.y -= m.verticalPadding
-            card.size.height += m.verticalPadding * 2
-            let path = NSBezierPath(roundedRect: card, xRadius: m.cornerRadius, yRadius: m.cornerRadius)
-            fill.setFill(); path.fill()
-            border.setStroke(); path.lineWidth = 1; path.stroke()
+    // Code blocks → warm rounded card (Notion off-white / dark panel).
+    let whole = NSRange(location: 0, length: storage.length)
+    storage.enumerateAttribute(MDAttr.codeBlock, in: charRange) { value, range, _ in
+        guard value != nil else { return }
+        // Recover the block's FULL range (the visible slice is clipped to charRange). Drawing the
+        // card from the full extent keeps it a single stable rect while scrolling, instead of a
+        // per-strip sliver that tears into bands. The context clips it to the dirty area for us.
+        var full = range
+        _ = storage.attribute(MDAttr.codeBlock, at: range.location, longestEffectiveRange: &full, in: whole)
+        let range = full
+        let inset = CGFloat((storage.attribute(MDAttr.codeInset, at: range.location, effectiveRange: nil) as? NSNumber)?.doubleValue ?? 0)
+        let gr = lm.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+        let rect = lm.boundingRect(forGlyphRange: gr, in: container).offsetBy(dx: origin.x, dy: origin.y)
+        // The card bottom must hug the LAST code line's text, not boundingRect's bottom — the
+        // latter includes the paragraph's OUTER spacing (the gap to the next block), which made
+        // the card bottom padding much larger than the top. usedRect excludes that spacing, so
+        // top and bottom padding come out symmetric (both = verticalPadding).
+        let lastGlyph = max(gr.location, NSMaxRange(gr) - 1)
+        let lastBottom = lm.lineFragmentUsedRect(forGlyphAt: lastGlyph, effectiveRange: nil)
+            .offsetBy(dx: origin.x, dy: origin.y).maxY
+        var card = rect
+        card.origin.x = origin.x + m.horizontalMargin + inset
+        card.size.width = container.size.width - m.horizontalMargin * 2 - inset
+        card.origin.y = rect.minY - m.verticalPadding
+        card.size.height = (lastBottom + m.verticalPadding) - card.origin.y
+        let path = NSBezierPath(roundedRect: card, xRadius: m.cornerRadius, yRadius: m.cornerRadius)
+        Palette.codeCardBg.setFill(); path.fill()
+        Palette.codeCardBorder.setStroke(); path.lineWidth = 1; path.stroke()
+    }
+
+    // Inline code → a rounded chip hugging the glyphs (baseline-anchored, per line fragment).
+    storage.enumerateAttribute(MDAttr.inlineCode, in: charRange) { value, range, _ in
+        guard value != nil else { return }
+        let font = (storage.attribute(.font, at: range.location, effectiveRange: nil) as? NSFont)
+            ?? .monospacedSystemFont(ofSize: 12, weight: .regular)
+        let ascent = font.ascender, descent = font.descender   // descent is negative
+        let gr = lm.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+        var idx = gr.location
+        while idx < NSMaxRange(gr) {
+            var eff = NSRange()
+            let frag = lm.lineFragmentRect(forGlyphAt: idx, effectiveRange: &eff)
+            let lineRange = NSIntersectionRange(gr, eff)
+            guard lineRange.length > 0 else { break }
+            let baselineY = frag.minY + lm.location(forGlyphAt: lineRange.location).y
+            let hx = lm.boundingRect(forGlyphRange: lineRange, in: container)   // x + width only
+            let chip = NSRect(x: hx.minX - 2, y: baselineY - ascent - 1,
+                              width: hx.width + 4, height: ascent - descent + 2)
+                .offsetBy(dx: origin.x, dy: origin.y)
+            Palette.inlineCodeBg.setFill()
+            NSBezierPath(roundedRect: chip, xRadius: 3, yRadius: 3).fill()
+            idx = NSMaxRange(eff)
         }
+    }
+
+    // Thematic breaks → a full-width hairline centered on the marker line.
+    storage.enumerateAttribute(MDAttr.rule, in: charRange) { value, range, _ in
+        guard value != nil else { return }
+        let gr = lm.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+        let rect = lm.boundingRect(forGlyphRange: gr, in: container).offsetBy(dx: origin.x, dy: origin.y)
+        let line = NSRect(x: origin.x + m.horizontalMargin, y: rect.midY.rounded(),
+                          width: container.size.width - m.horizontalMargin * 2, height: 1)
+        Palette.hairline.setFill(); NSBezierPath(rect: line).fill()
+    }
+
+    // Blockquotes → a 3pt accent bar down the left edge, hugging the ACTUAL text (glyph top of
+    // the first line to glyph bottom of the last line). With a padded line height the glyphs sit
+    // low in each line box, so a line-box-centered bar floats above the text — anchor to the
+    // baselines instead (same fix as the inline-code chip).
+    storage.enumerateAttribute(MDAttr.blockQuote, in: charRange) { value, r0, _ in
+        guard value != nil else { return }
+        // Recover the quote's FULL range (the visible slice is clipped) so the bar spans it all.
+        var range = r0
+        _ = storage.attribute(MDAttr.blockQuote, at: r0.location, longestEffectiveRange: &range, in: whole)
+        guard range.length > 0 else { return }
+        // TOP = first glyph's top.
+        let firstFont = (storage.attribute(.font, at: range.location, effectiveRange: nil) as? NSFont) ?? .systemFont(ofSize: 16)
+        let firstGlyph = lm.glyphRange(forCharacterRange: NSRange(location: range.location, length: 1), actualCharacterRange: nil).location
+        let firstFrag = lm.lineFragmentRect(forGlyphAt: firstGlyph, effectiveRange: nil)
+        var topY = firstFrag.minY + lm.location(forGlyphAt: firstGlyph).y - firstFont.ascender
+        // BOTTOM = last CONTENT glyph's bottom (skip trailing newlines).
+        let str = storage.string as NSString
+        var lastChar = NSMaxRange(range) - 1
+        while lastChar > range.location, str.character(at: lastChar) == 0x0A { lastChar -= 1 }
+        let lastFont = (storage.attribute(.font, at: lastChar, effectiveRange: nil) as? NSFont) ?? firstFont
+        let lastGlyph = lm.glyphRange(forCharacterRange: NSRange(location: lastChar, length: 1), actualCharacterRange: nil).location
+        let lastFrag = lm.lineFragmentRect(forGlyphAt: lastGlyph, effectiveRange: nil)
+        var botY = lastFrag.minY + lm.location(forGlyphAt: lastGlyph).y - lastFont.descender  // descender < 0
+        // If the quote STARTS or ENDS with a code CARD, extend the bar to the card's padded edge —
+        // otherwise it stops at the code's text, leaving the bar short of the card's rounded box.
+        if storage.attribute(MDAttr.codeBlock, at: range.location, effectiveRange: nil) != nil {
+            topY -= m.verticalPadding
+        }
+        if storage.attribute(MDAttr.codeBlock, at: lastChar, effectiveRange: nil) != nil {
+            botY += m.verticalPadding
+        }
+        let bar = NSRect(x: origin.x + m.horizontalMargin, y: topY + origin.y,
+                         width: 3, height: max(0, botY - topY))
+        Palette.quoteBar.setFill()
+        NSBezierPath(roundedRect: bar, xRadius: 1.5, yRadius: 1.5).fill()
     }
 }
