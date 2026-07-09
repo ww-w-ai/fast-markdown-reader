@@ -4,7 +4,7 @@ final class DocumentWindowController: NSWindowController {
     // Explicit TextKit 1 stack (C2): building the view with init(frame:textContainer:)
     // guarantees the classic NSLayoutManager path instead of silently falling back
     // to TextKit 2 compatibility mode when layoutManager is later accessed.
-    let textView: NSTextView
+    let textView: ReaderTextView
     private let scrollView = NSScrollView()
 
     convenience init() {
@@ -56,7 +56,7 @@ final class DocumentWindowController: NSWindowController {
         let container = NSTextContainer(size: NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude))
         container.widthTracksTextView = true
         layout.addTextContainer(container)
-        textView = NSTextView(frame: .zero, textContainer: container)
+        textView = ReaderTextView(frame: .zero, textContainer: container)
         super.init(window: window)
     }
 
@@ -64,6 +64,9 @@ final class DocumentWindowController: NSWindowController {
 
     func display(_ attributed: NSAttributedString) {
         textView.textStorage?.setAttributedString(attributed)
+        textView.recomputeHeadingOffsets()
+        textView.resetCaret()
+        window?.makeFirstResponder(textView)
         // Place buttons after layout has a chance to run.
         DispatchQueue.main.async { [weak self] in self?.placeCopyButtons() }
     }
@@ -72,9 +75,11 @@ final class DocumentWindowController: NSWindowController {
     var textStorageRef: NSTextStorage? { textView.textStorage }
 
     /// Called after the document layer mutates the text (e.g. the mermaid swap), which
-    /// shifts character offsets. Re-place copy buttons; Task 6 extends this to also
-    /// recompute heading offsets and clamp the reading caret.
+    /// shifts character offsets. Recompute heading offsets from the live text, clamp the
+    /// caret to the new length, and re-place copy buttons.
     func refreshAfterMutation() {
+        textView.recomputeHeadingOffsets()
+        textView.clampCaretToText()
         placeCopyButtons()
     }
 
