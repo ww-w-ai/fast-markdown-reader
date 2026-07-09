@@ -54,11 +54,14 @@ final class MarkdownDocument: NSDocument {
         guard !jobs.isEmpty else { return }
         let maxWidth = wc.textView.textContainer?.size.width ?? 800
         let renderer = MermaidRenderer()
-        Task { @MainActor in
+        // Weak captures so closing a document mid-render never keeps the document, its
+        // window controller, or its text storage alive until the render finishes.
+        Task { @MainActor [weak self, weak wc] in
             for (range, src) in jobs.reversed() { // reversed so earlier ranges stay valid
-                guard generation == self.renderGeneration else { return }   // C3: stale render aborts
+                guard let self, generation == self.renderGeneration else { return }  // C3: stale/closed aborts
+                guard let storage = wc?.textStorageRef else { return }
                 guard let image = await renderer.renderImage(source: src) else { continue }
-                guard generation == self.renderGeneration else { return }   // re-check after await
+                guard generation == self.renderGeneration else { return }            // re-check after await
                 // Scale to fit the text width, preserving aspect (avoids horizontal scroll).
                 var size = image.size
                 if size.width > maxWidth, size.width > 0 {
@@ -72,8 +75,8 @@ final class MarkdownDocument: NSDocument {
                 guard range.location + range.length <= storage.length else { continue }
                 storage.replaceCharacters(in: range, with: NSAttributedString(attachment: att))
             }
-            guard generation == self.renderGeneration else { return }
-            wc.refreshAfterMutation()
+            guard let self, generation == self.renderGeneration else { return }
+            wc?.refreshAfterMutation()
         }
     }
 }
