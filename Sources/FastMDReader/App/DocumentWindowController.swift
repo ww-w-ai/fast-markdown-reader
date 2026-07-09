@@ -22,9 +22,16 @@ final class DocumentWindowController: NSWindowController {
         textView.usesFindBar = true           // ⌘F find bar (free for NSTextView)
         textView.isIncrementalSearchingEnabled = true
         textView.textContainerInset = NSSize(width: 24, height: 20)
-        textView.autoresizingMask = [.width]
+        // Standard NSScrollView + NSTextView sizing: without a non-zero frame and a huge
+        // maxSize, a manually-created text view can't grow past its initial frame, so the
+        // document is clipped to the visible area and won't scroll.
+        let content = window.contentLayoutRect.size
+        textView.frame = NSRect(origin: .zero, size: content)
+        textView.minSize = NSSize(width: 0, height: 0)
+        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
 
         scrollView.documentView = textView
         scrollView.hasVerticalScroller = true
