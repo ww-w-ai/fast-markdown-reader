@@ -21,7 +21,6 @@ final class DocumentWindowController: NSWindowController {
         textView.isRichText = true
         textView.usesFindBar = true           // ⌘F find bar (free for NSTextView)
         textView.isIncrementalSearchingEnabled = true
-        textView.textContainerInset = NSSize(width: 24, height: 20)
         // Standard NSScrollView + NSTextView sizing: without a non-zero frame and a huge
         // maxSize, a manually-created text view can't grow past its initial frame, so the
         // document is clipped to the visible area and won't scroll.
@@ -35,8 +34,10 @@ final class DocumentWindowController: NSWindowController {
 
         scrollView.documentView = textView
         scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false   // viewer never scrolls sideways; text wraps
         scrollView.drawsBackground = true
         window.contentView = scrollView
+        updateTextInset()
 
         // C6: text reflow on window resize restrands copy buttons at stale positions.
         // Observe frame changes and re-place them (debounced).
@@ -62,8 +63,10 @@ final class DocumentWindowController: NSWindowController {
         // instead of the whole document up front — the key lever for opening and scrolling
         // long documents fast with low memory.
         layout.allowsNonContiguousLayout = true
-        let container = NSTextContainer(size: NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude))
-        container.widthTracksTextView = true
+        let container = NSTextContainer(size: NSSize(width: 600, height: CGFloat.greatestFiniteMagnitude))
+        // Wrap at an EXPLICIT container width (set in updateTextInset) rather than tracking
+        // the text view — tracking left the view too wide, so text overflowed the window.
+        container.widthTracksTextView = false
         layout.addTextContainer(container)
         textView = ReaderTextView(frame: .zero, textContainer: container)
         super.init(window: window)
@@ -71,13 +74,38 @@ final class DocumentWindowController: NSWindowController {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
+    // Readability: cap the text column to a ~660pt measure (~66 chars at 15pt) and center
+    // it, growing the side gutters on wide windows instead of the line length (Butterick /
+    // Baymard / WCAG 1.4.12). Centering via textContainerInset also guarantees text wraps to
+    // the column, so the viewer never scrolls sideways.
+    private let maxColumnWidth: CGFloat = 660
+    private let minSideInset: CGFloat = 28
+    private let verticalInset: CGFloat = 28
+
+    private func updateTextInset() {
+        let clipWidth = scrollView.contentSize.width
+        guard clipWidth > 1 else { return }
+        // Column = the readable measure, capped at 660 and never wider than the window minus
+        // margins; centered by the side inset. Text view fills the clip; the container wraps
+        // at `column`, so nothing overflows sideways.
+        let column = min(maxColumnWidth, max(200, clipWidth - 2 * minSideInset))
+        let side = (clipWidth - column) / 2
+        textView.textContainerInset = NSSize(width: side, height: verticalInset)
+        textView.textContainer?.containerSize = NSSize(width: column, height: CGFloat.greatestFiniteMagnitude)
+        var f = textView.frame; f.size.width = clipWidth; textView.frame = f
+    }
+
     func display(_ attributed: NSAttributedString) {
+        updateTextInset()
         textView.textStorage?.setAttributedString(attributed)
         textView.recomputeHeadingOffsets()
         textView.resetCaret()
         window?.makeFirstResponder(textView)
-        // Place buttons after layout has a chance to run.
-        DispatchQueue.main.async { [weak self] in self?.placeCopyButtons() }
+        // Re-apply the column and place buttons after layout has established real sizes.
+        DispatchQueue.main.async { [weak self] in
+            self?.updateTextInset()
+            self?.placeCopyButtons()
+        }
     }
 
     /// The live text storage, so the document layer can swap mermaid placeholders in place.
@@ -97,7 +125,13 @@ final class DocumentWindowController: NSWindowController {
     private var copyButtons: [NSButton] = []
     private var pendingPlace: DispatchWorkItem?
 
+    private var lastClipWidth: CGFloat = 0
+
     @objc private func viewportChanged() {
+        // Recompute the centered column only when the width actually changed (a window
+        // resize), not on every scroll — avoids reflow churn while scrolling.
+        let w = scrollView.contentSize.width
+        if abs(w - lastClipWidth) > 0.5 { lastClipWidth = w; updateTextInset() }
         pendingPlace?.cancel()
         let work = DispatchWorkItem { [weak self] in self?.placeCopyButtons() }
         pendingPlace = work

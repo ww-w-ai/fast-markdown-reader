@@ -46,6 +46,22 @@ final class TextNavigatorTests: XCTestCase {
         XCTAssertEqual(nav.sentenceStart(t, from: 9), 4)        // caret past the emoji lands on a valid boundary
     }
 
+    func testUnitRangesForSelection() {
+        // s = "abc\ndef ghi. jkl mno\n\npqr"
+        XCTAssertEqual(nav.lineRange(s, from: 6), NSRange(location: 4, length: 16))   // "def ghi. jkl mno"
+        XCTAssertEqual(nav.sentenceRange(s, from: 6), NSRange(location: 0, length: 12)) // "abc\ndef ghi." (trailing space trimmed)
+        XCTAssertEqual(nav.paragraphRange(s, from: 10), NSRange(location: 0, length: 20)) // para 1, blank line trimmed
+        XCTAssertEqual(nav.paragraphRange(s, from: 22), NSRange(location: 22, length: 3)) // "pqr"
+    }
+
+    func testUnitRangesNonASCII() {
+        let t = "가나. 다라 😀 마바.\n"   // len 14 (see UTF-16 test above)
+        // sentence containing index 9 (past emoji) = "다라 😀 마바." starting at 4
+        let r = nav.sentenceRange(t, from: 9)
+        XCTAssertEqual(r.location, 4)
+        XCTAssertEqual(r.location + r.length, 13) // ends at the period (before \n), trimmed
+    }
+
     func testClampsOutOfRange() {
         XCTAssertEqual(nav.lineEnd(s, from: 9999), (s as NSString).length)
         XCTAssertEqual(nav.lineStart(s, from: -5), 0)

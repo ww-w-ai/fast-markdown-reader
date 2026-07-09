@@ -95,4 +95,39 @@ struct TextNavigator {
         let f = clamp(from, (s as NSString).length)
         return paragraphStarts(s).first(where: { $0 > f }) ?? (s as NSString).length
     }
+
+    // MARK: - Unit ranges (for select-on-navigate)
+
+    /// The line containing `from` (excludes the trailing newline), as a UTF-16 NSRange.
+    func lineRange(_ s: String, from: Int) -> NSRange {
+        let a = lineStart(s, from: from), b = lineEnd(s, from: from)
+        return NSRange(location: a, length: max(0, b - a))
+    }
+
+    /// The sentence containing `from`, trailing whitespace trimmed.
+    func sentenceRange(_ s: String, from: Int) -> NSRange {
+        let ns = s as NSString
+        return trimTrailing(ns, bracket(sentenceStarts(s), clamp(from, ns.length), ns.length))
+    }
+
+    /// The paragraph containing `from`, trailing blank lines trimmed.
+    func paragraphRange(_ s: String, from: Int) -> NSRange {
+        let ns = s as NSString
+        return trimTrailing(ns, bracket(paragraphStarts(s), clamp(from, ns.length), ns.length))
+    }
+
+    private func bracket(_ starts: [Int], _ from: Int, _ len: Int) -> NSRange {
+        let a = starts.last(where: { $0 <= from }) ?? 0
+        let b = starts.first(where: { $0 > a }) ?? len
+        return NSRange(location: a, length: max(0, b - a))
+    }
+
+    private func trimTrailing(_ ns: NSString, _ r: NSRange) -> NSRange {
+        var b = r.location + r.length
+        while b > r.location {
+            let c = ns.character(at: b - 1)
+            if c == newline || c == space { b -= 1 } else { break }
+        }
+        return NSRange(location: r.location, length: b - r.location)
+    }
 }

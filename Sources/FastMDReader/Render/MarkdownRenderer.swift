@@ -59,6 +59,31 @@ private struct AttributedBuilder: MarkupWalker {
         }
     }
 
+    // Readability (research-backed: Butterick / Baymard / WCAG 1.4.12): line height 1.45×,
+    // paragraph spacing ~12pt. Column width + margins are handled by the window controller
+    // (centered ~660pt measure). Styles are immutable and value-independent of the theme, so
+    // they are built ONCE and reused across every block/render (per-block allocation made a
+    // 4000-paragraph doc render 6× slower — this keeps it fast).
+    private enum PS {
+        static let body = make(spacing: 12)
+        static let headingMajor = make(spacing: 6, before: 22)   // # / ##
+        static let headingMinor = make(spacing: 6, before: 14)   // ### and deeper
+        static let ul = make(spacing: 4, headIndent: 18)
+        static let ol = make(spacing: 4, headIndent: 22)
+        static let quote = make(spacing: 12, headIndent: 16, firstLineIndent: 16)
+
+        static func make(spacing: CGFloat, before: CGFloat = 0,
+                         headIndent: CGFloat = 0, firstLineIndent: CGFloat = 0) -> NSParagraphStyle {
+            let p = NSMutableParagraphStyle()
+            p.lineHeightMultiple = 1.45
+            p.paragraphSpacing = spacing
+            p.paragraphSpacingBefore = before
+            p.headIndent = headIndent
+            p.firstLineHeadIndent = firstLineIndent
+            return p.copy() as! NSParagraphStyle
+        }
+    }
+
     mutating func visitHeading(_ heading: Heading) {
         let size = theme.headingSize(level: heading.level)
         let font = NSFontManager.shared.convert(.systemFont(ofSize: size), toHaveTrait: .boldFontMask)
@@ -68,12 +93,18 @@ private struct AttributedBuilder: MarkupWalker {
         // scanning this attribute on the live text — never a stored offsets array.
         result.addAttribute(MDAttr.heading, value: heading.level,
                             range: NSRange(location: start, length: result.length - start))
-        newline(2)
+        newline(1)
+        result.addAttribute(.paragraphStyle,
+            value: heading.level <= 2 ? PS.headingMajor : PS.headingMinor,
+            range: NSRange(location: start, length: result.length - start))
     }
 
     mutating func visitParagraph(_ paragraph: Paragraph) {
+        let start = result.length
         result.append(inlineString(paragraph, font: theme.bodyFont, color: theme.textColor))
-        newline(2)
+        newline(1)
+        result.addAttribute(.paragraphStyle, value: PS.body,
+                            range: NSRange(location: start, length: result.length - start))
     }
 
     mutating func visitBlockQuote(_ blockQuote: BlockQuote) {
@@ -81,17 +112,17 @@ private struct AttributedBuilder: MarkupWalker {
         descendInto(blockQuote)
         let range = NSRange(location: start, length: result.length - start)
         if range.length > 0 {
-            let ps = NSMutableParagraphStyle()
-            ps.headIndent = 16; ps.firstLineHeadIndent = 16
-            result.addAttributes([.paragraphStyle: ps, .foregroundColor: theme.secondaryColor], range: range)
+            result.addAttributes([.paragraphStyle: PS.quote, .foregroundColor: theme.secondaryColor], range: range)
         }
     }
 
     mutating func visitUnorderedList(_ list: UnorderedList) {
         for item in list.listItems {
+            let start = result.length
             result.append(NSAttributedString(string: "•  ", attributes: [.font: theme.bodyFont, .foregroundColor: theme.secondaryColor]))
             for child in item.children { renderBlockInline(child) }
             newline()
+            result.addAttribute(.paragraphStyle, value: PS.ul, range: NSRange(location: start, length: result.length - start))
         }
         newline()
     }
@@ -99,9 +130,11 @@ private struct AttributedBuilder: MarkupWalker {
     mutating func visitOrderedList(_ list: OrderedList) {
         var i = 1
         for item in list.listItems {
+            let start = result.length
             result.append(NSAttributedString(string: "\(i).  ", attributes: [.font: theme.bodyFont, .foregroundColor: theme.secondaryColor]))
             for child in item.children { renderBlockInline(child) }
             newline(); i += 1
+            result.addAttribute(.paragraphStyle, value: PS.ol, range: NSRange(location: start, length: result.length - start))
         }
         newline()
     }
@@ -135,6 +168,7 @@ private struct AttributedBuilder: MarkupWalker {
         ps.paragraphSpacingBefore = CodeCardMetrics.verticalPadding + 6
         ps.paragraphSpacing = CodeCardMetrics.verticalPadding + 6
         ps.lineSpacing = 2
+        ps.lineBreakMode = .byCharWrapping   // fold long code lines instead of scrolling sideways
         let highlighted = NSMutableAttributedString(attributedString:
             CodeHighlighter.highlight(codeBlock.code, language: codeBlock.language, theme: theme))
         highlighted.addAttributes([.paragraphStyle: ps],
