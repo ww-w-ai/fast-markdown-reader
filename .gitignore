@@ -2,3 +2,4 @@
 *.app
 DerivedData/
 .DS_Store
+.bkit/
