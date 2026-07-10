@@ -49,6 +49,28 @@ Copy `FastMDReader.app` to `/Applications`. To make it your default Markdown vie
 right-click any `.md` in Finder → **Get Info** → **Open with** → choose fast-md-reader →
 **Change All…**.
 
+> **Apple Silicon only.** The build is `arm64`. Intel Macs need a universal build
+> (`swift build --arch arm64 --arch x86_64` before packaging).
+
+## Share it with someone
+
+The app is **ad-hoc signed**, not Apple-notarized. That's fine for sharing with friends —
+each recipient just clears Gatekeeper **once** on first launch.
+
+1. **Zip it** (a single file keeps the signature intact — never send loose bundle files):
+   ```bash
+   ditto -c -k --keepParent FastMDReader.app FastMDReader.zip
+   ```
+2. Send `FastMDReader.zip` (KakaoTalk, Drive, AirDrop…).
+3. The recipient unzips, moves `FastMDReader.app` to `/Applications`, then **once**:
+   - Terminal: `xattr -dr com.apple.quarantine /Applications/FastMDReader.app`, **or**
+   - Launch it → when blocked, **System Settings → Privacy & Security → "Open Anyway"**.
+
+   After that it opens normally with a double-click.
+
+For friction-free public distribution (no Gatekeeper prompt at all), you need a paid Apple
+Developer ID + notarization — see `docs/NOTARIZATION.md`.
+
 ## Keyboard (reading cursor)
 
 Navigation **selects the unit it moves to**, so ⌘C copies it immediately. No Shift is used
