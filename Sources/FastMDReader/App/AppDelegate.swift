@@ -1,7 +1,13 @@
 import AppKit
+import UniformTypeIdentifiers
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    // MUST stay false. The app starts empty (no window) and is driven from the menu bar, so a
+    // windowless app is a normal, intended state — not a reason to quit. Returning true here made
+    // the app terminate the instant Open… was chosen from the empty (zero-window) launch state: the
+    // open panel counts as the "last window", and dismissing it tripped last-window-closed → quit.
+    // With false, closing the last document returns to the empty menu-bar state; quitting is ⌘Q only.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     // Opt out of state restoration entirely: no previously-open documents are reopened on launch,
     // so the app always starts clean (closing / quitting never leaves old tabs behind).
@@ -11,15 +17,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         buildMenu()
     }
 
-    // Use the untitled-file hooks instead of a didFinishLaunching window check:
-    // when the app is launched WITH a document, AppKit opens it and never calls the
-    // untitled path, so no stray Open panel races with document opening.
-    func applicationShouldOpenUntitledFile(_ sender: NSApplication) -> Bool { true }
-
-    func applicationOpenUntitledFile(_ sender: NSApplication) -> Bool {
-        NSDocumentController.shared.openDocument(nil)
-        return true
-    }
+    // Launching WITHOUT a document must NOT auto-pop an Open panel — start empty and let the
+    // user pick via the File menu (Open… / Open Recent). Returning false here suppresses the
+    // untitled-file path entirely; launching WITH a document still opens it normally (AppKit
+    // never calls the untitled hooks in that case).
+    func applicationShouldOpenUntitledFile(_ sender: NSApplication) -> Bool { false }
 
     // A SwiftPM executable has no MainMenu.nib, so build the menu bar in code. Without it,
     // standard shortcuts (⌘Q/⌘O/⌘W/⌘C/⌘F/⌘±) and the native Window/tabs menu don't work.
@@ -40,7 +42,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // File menu
         let fileItem = NSMenuItem(); mainMenu.addItem(fileItem)
         let fileMenu = NSMenu(title: "File"); fileItem.submenu = fileMenu
-        fileMenu.addItem(withTitle: "Open…", action: #selector(NSDocumentController.openDocument(_:)), keyEquivalent: "o")
+        // Open… — do NOT use NSDocumentController.openDocument(_:) (its built-in panel path crashes
+        // immediately in this code-menu / ad-hoc-signed SwiftPM app). Present our OWN NSOpenPanel and
+        // route the result through openDocument(withContentsOf:) — the exact path Open Recent uses,
+        // which is known-good.
+        let openItem = fileMenu.addItem(withTitle: "Open…", action: #selector(openDocumentPanel(_:)), keyEquivalent: "o")
+        openItem.target = self
         // Open Recent — AppKit's automatic population does NOT attach to a code-built menu (no
         // MainMenu.nib), so it stayed empty. Populate it ourselves from recentDocumentURLs via a
         // menu delegate that rebuilds on every open (menuNeedsUpdate).
@@ -85,6 +92,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.helpMenu = helpMenu
 
         NSApp.mainMenu = mainMenu
+    }
+
+    // MARK: - Open… (own panel → known-good open path)
+
+    @objc func openDocumentPanel(_ sender: Any?) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
+        // Markdown + any plain text (be permissive — the reader can render any text file).
+        var types: [UTType] = [.plainText, .text]
+        if let md = UTType("net.daringfireball.markdown") { types.insert(md, at: 0) }
+        if let pub = UTType("public.markdown") { types.insert(pub, at: 0) }
+        panel.allowedContentTypes = types
+        panel.allowsOtherFileTypes = true
+        panel.begin { response in
+            guard response == .OK else { return }
+            for url in panel.urls {
+                NSDocumentController.shared.openDocument(withContentsOf: url, display: true) { _, _, _ in }
+            }
+        }
     }
 
     // MARK: - Open Recent (manual population)
