@@ -22,8 +22,17 @@ cp Resources/Info.plist "$APP/Contents/Info.plist"
 # build inputs that must not ship inside the bundle (Info.plist is placed above; entitlements are a
 # signing input).
 find Resources -type f ! -name 'Info.plist' ! -name '*.entitlements' -exec cp {} "$APP/Contents/Resources/" \;
-# Ad-hoc sign so Gatekeeper allows local launch. Sign WITH the sandbox entitlements even for local
-# builds: the App Store requires the sandbox, and a dev build that skips it would hide exactly the
-# failures (file access, WKWebView) we need to catch before review.
-codesign --force --sign - --entitlements Resources/FastMDReader.entitlements "$APP"
-echo "Built $APP"
+# Ad-hoc sign so Gatekeeper allows local launch. Unsandboxed by default, matching the Developer ID
+# build people actually download (Scripts/notarize.sh).
+#
+# SANDBOX=1 signs with the sandbox to exercise the folder-grant path. It uses
+# FastMDReader.entitlements — the same sandbox as the store, but WITHOUT the App Store identifiers:
+# a build carrying those refuses to launch outside the store ("Launchd job spawn failed"), so the
+# real App Store shape can only be tested by installing from the store.
+if [[ -n "${SANDBOX:-}" ]]; then
+  codesign --force --sign - --entitlements Resources/FastMDReader.entitlements "$APP"
+  echo "Built $APP (SANDBOXED — local sandbox test shape)"
+else
+  codesign --force --sign - "$APP"
+  echo "Built $APP"
+fi

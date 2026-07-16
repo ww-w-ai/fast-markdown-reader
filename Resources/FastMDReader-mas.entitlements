@@ -18,6 +18,14 @@
 	<key>com.apple.security.files.user-selected.read-only</key>
 	<true/>
 
+	<!-- A document's own `![](diagram.png)` sibling is NOT covered by the grant for the document
+	     itself, and macOS never prompts (the sandbox denies before TCC, and no "Documents folder"
+	     entitlement exists). So the app asks the user to grant the enclosing folder once and
+	     remembers it as a security-scoped bookmark — the same approach Marked 2 / iA Writer / MWeb
+	     take. Without this key the bookmark cannot be persisted across launches. -->
+	<key>com.apple.security.files.bookmarks.app-scope</key>
+	<true/>
+
 	<!-- Required for WKWebView even though mermaid loads ONLY a bundled local JS file and the app
 	     makes no network requests: a sandboxed WKWebView runs out-of-process and fails to load
 	     anything at all without this. Not a sign the app talks to the network — it doesn't. -->

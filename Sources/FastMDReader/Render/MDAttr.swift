@@ -33,6 +33,9 @@ enum MDAttr {
     /// placeholder attachment's image in place (like mermaid). MDAttr.imageAlt holds the alt.
     static let image = NSAttributedString.Key("mdImage")
     static let imageAlt = NSAttributedString.Key("mdImageAlt")
+    /// Marks an image the sandbox won't let us read — clicking it asks for the folder (App Store
+    /// build only). Value = the folder to grant.
+    static let needsFolderGrant = NSAttributedString.Key("mdNeedsFolderGrant")
     /// Explicit image width (non-standard extensions): points (NSNumber) or a 0–1 fraction of
     /// the column (imageWidthPct). Parsed from HTML `<img width>`, Pandoc `{width=}`, Obsidian `|N`.
     static let imageWidth = NSAttributedString.Key("mdImageWidth")

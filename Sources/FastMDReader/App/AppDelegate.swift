@@ -14,6 +14,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool { false }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Re-open previously granted folders BEFORE any document loads, so restored access is live
+        // by the time media resolve (sandboxed build only; a no-op otherwise).
+        FolderAccess.restoreGrants()
         buildMenu()
     }
 
@@ -58,6 +61,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let close = fileMenu.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
         close.keyEquivalentModifierMask = [.command]
         fileMenu.addItem(.separator())
+        // Sandboxed build only: the App Store sandbox blocks a document's own sibling images until
+        // the user grants the folder. Clicking a blocked image does the same thing; this is the
+        // discoverable route when none is on screen.
+        if FolderAccess.isNeeded {
+            fileMenu.addItem(withTitle: "Allow Images in This Folder…",
+                             action: #selector(DocumentWindowController.grantFolderAccess(_:)), keyEquivalent: "")
+        }
         fileMenu.addItem(withTitle: "Print…", action: #selector(NSDocument.printDocument(_:)), keyEquivalent: "p")
 
         // Edit menu (copy / select-all / find)

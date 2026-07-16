@@ -2,7 +2,16 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<!-- LOCAL SANDBOX TESTING ONLY (Scripts/make-app.sh SANDBOX=1). The shipped builds use neither
+	     this file nor this shape: the Developer ID build is unsandboxed (notarize.sh) and the store
+	     build adds its identifiers (FastMDReader-mas.entitlements). Those identifiers make a build
+	     unlaunchable outside the store, so this file is how the sandbox behaviour gets exercised on
+	     a dev machine. Keep it in sync with the store entitlements minus the identifiers. -->
 	<key>com.apple.security.app-sandbox</key>
+	<true/>
+
+	<!-- Needed to persist a granted folder across launches; see FolderAccess. -->
+	<key>com.apple.security.files.bookmarks.app-scope</key>
 	<true/>
 
 	<!-- The viewer only ever reads files the user picked (Open panel, Finder, Open Recent). -->

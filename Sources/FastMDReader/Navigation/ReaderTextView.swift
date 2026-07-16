@@ -203,6 +203,13 @@ final class ReaderTextView: NSTextView {
             let cp = NSPoint(x: p.x - textContainerInset.width, y: p.y - textContainerInset.height)
             let gi = lm.glyphIndex(for: cp, in: tc)
             let ci = min(lm.characterIndexForGlyph(at: gi), ts.length - 1)
+            // A sandbox-blocked image: its placeholder is an image too, so this MUST come before the
+            // zoom check — otherwise clicking "Click to allow…" just enlarges that label.
+            if ts.attribute(MDAttr.needsFolderGrant, at: ci, effectiveRange: nil) != nil,
+               lm.boundingRect(forGlyphRange: NSRange(location: gi, length: 1), in: tc).contains(cp) {
+                NSApp.sendAction(#selector(DocumentWindowController.grantFolderAccess(_:)), to: nil, from: self)
+                return
+            }
             let zoomable = ts.attribute(MDAttr.mermaid, at: ci, effectiveRange: nil) != nil
                         || ts.attribute(MDAttr.image, at: ci, effectiveRange: nil) != nil
             if zoomable,

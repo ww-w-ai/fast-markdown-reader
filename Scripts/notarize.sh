@@ -26,13 +26,18 @@ ZIP="FastMDReader.zip"
 echo "==> Building release"
 ./Scripts/make-app.sh release
 
-echo "==> Signing with Developer ID + hardened runtime"
+echo "==> Signing with Developer ID + hardened runtime (NO sandbox — see below)"
 # No --deep: the bundle is a single binary with no embedded frameworks or dylibs,
 # and Apple deprecated --deep for distribution signing.
-# Same sandbox entitlements as the App Store build — the sandbox is optional outside the store, but
-# shipping an unsandboxed build here would mean the widely-tested binary isn't the one under review.
-codesign --force --options runtime --timestamp \
-  --entitlements Resources/FastMDReader.entitlements --sign "$IDENTITY" "$APP"
+#
+# Deliberately NOT sandboxed, unlike the App Store build. The sandbox grants access only to the file
+# the user opened, so a document's own `![](diagram.png)` sibling is unreadable — verified: every
+# local image form fails under the sandbox while remote ones load. macOS never even prompts, because
+# the sandbox denies before TCC is consulted, and there is no "Documents folder" entitlement to ask
+# for. The store forces that trade; direct distribution doesn't, so this build keeps local images
+# working with no permission step. The App Store build pays for it with an explicit folder grant.
+# (Marked 2 ships the same split; Typora/Obsidian/IntelliJ skip the store entirely for this reason.)
+codesign --force --options runtime --timestamp --sign "$IDENTITY" "$APP"
 codesign --verify --strict --verbose=2 "$APP"
 
 echo "==> Submitting to Apple for notarization (takes a few minutes)"

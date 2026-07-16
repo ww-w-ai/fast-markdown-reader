@@ -523,6 +523,22 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         return true
     }
 
+    /// Menu counterpart of clicking a blocked image — the same grant, reachable when a document's
+    /// images are blocked but none is on screen.
+    @objc func grantFolderAccess(_ sender: Any?) {
+        grantFolder()
+    }
+
+    /// Ask for the folder, then re-read the document: placeholders were sized as placeholders, and
+    /// every image can now be measured for real, so a full re-render is both simplest and correct.
+    private func grantFolder() {
+        guard let doc = (document as? NSDocument)?.fileURL else { return }
+        FolderAccess.requestAccess(to: FolderAccess.suggestedFolder(for: doc), in: window) { [weak self] granted in
+            guard granted else { return }
+            (self?.document as? MarkdownDocument)?.reloadDocument(nil)
+        }
+    }
+
     /// Resolve a GFM anchor slug to its heading and scroll there (top-anchored). Slugs are matched
     /// by the GitHub rule: lowercase, drop punctuation, spaces→hyphens (Hangul/CJK preserved).
     private func jumpToHeading(slug: String) {
