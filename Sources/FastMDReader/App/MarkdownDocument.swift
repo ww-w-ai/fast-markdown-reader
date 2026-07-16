@@ -15,6 +15,11 @@ final class MarkdownDocument: NSDocument {
     private var isPrerendering = false
     private var prerenderToken = 0
 
+    // Same idea for remote images: until their header has been fetched their size is a guess, so
+    // reconcileMedia must not fill them mid-pass (the pixels would arrive and resize the layout).
+    private var isMeasuringRemote = false
+    private var measureToken = 0
+
     override class var autosavesInPlace: Bool { false }
     // The text view is editable only to show a caret; edits are rejected, so the document is
     // never dirty and closing a tab must never prompt to save.
@@ -106,6 +111,9 @@ final class MarkdownDocument: NSDocument {
             // size is known — the scrollbar becomes correct and never resizes again as you scroll
             // (the whole point: uncached docs behave like cached ones). Cached docs skip this.
             self.prerenderAllDiagrams(in: wc)
+            // Same for remote images: fetch each header (a few KB, not the image) so its exact size
+            // is known before it lands. Docs with no remote images skip this.
+            self.measureRemoteImages(in: wc)
         }
     }
 
@@ -185,9 +193,9 @@ final class MarkdownDocument: NSDocument {
     }
 
     /// Reserve the exact column-fitted area for media whose size is known WITHOUT rendering: local
-    /// images (ImageIO header) and already-cached diagrams (cached PDF size). Runs once after render,
-    /// before the full layout, so those never resize on load. Uncached diagrams / remote images keep
-    /// their placeholder until first load.
+    /// images (ImageIO header), already-cached diagrams (cached PDF size), and remote images whose
+    /// header has already been fetched. Runs once after render, before the full layout, so those
+    /// never resize on load. Uncached diagrams / unmeasured remote images keep their placeholder.
     private func presizeKnownMedia(in wc: DocumentWindowController) {
         guard let storage = wc.textStorageRef else { return }
         let maxWidth = wc.textView.textContainer?.size.width ?? 800
@@ -196,9 +204,13 @@ final class MarkdownDocument: NSDocument {
         var sets: [(NSSize, NSRange)] = []
         storage.enumerateAttribute(MDAttr.image, in: whole) { v, r, _ in
             guard let src = v as? String, !src.hasPrefix("data:"),
-                  let url = self.resolveImageURL(src, baseDir: baseDir), url.isFileURL,
-                  let px = MarkdownDocument.imagePixelSize(url) else { return }
-            sets.append((px, r))
+                  let url = self.resolveImageURL(src, baseDir: baseDir) else { return }
+            if url.isFileURL {
+                guard let px = MarkdownDocument.imagePixelSize(url) else { return }
+                sets.append((px, r))
+            } else if let px = MarkdownDocument.remoteSizes[url.absoluteString] {
+                sets.append((px, r))
+            }
         }
         storage.enumerateAttribute(MDAttr.mermaid, in: whole) { v, r, _ in
             guard let code = v as? String, let sz = MermaidRenderer.cachedSize(source: code) else { return }
@@ -265,7 +277,15 @@ final class MarkdownDocument: NSDocument {
         var purge: [NSRange] = [], imgLoad: [(String, NSRange)] = [], mmLoad: [(String, NSRange)] = []
         storage.enumerateAttribute(MDAttr.image, in: whole) { v, r, _ in
             guard let src = v as? String, !src.isEmpty, let att = attach(r) else { return }
-            if onScreen(r) { if att.image == nil { imgLoad.append((src, r)) } }
+            if onScreen(r) {
+                guard att.image == nil else { return }
+                // Mid-measure, an unmeasured remote image has no exact size yet — filling it now
+                // would resize under the reader. The measure pass fills it once it's sized.
+                if self.isMeasuringRemote, !src.hasPrefix("data:"),
+                   let u = self.resolveImageURL(src, baseDir: baseDir), !u.isFileURL,
+                   MarkdownDocument.remoteSizes[u.absoluteString] == nil { return }
+                imgLoad.append((src, r))
+            }
             else if att.image != nil { purge.append(r) }
         }
         storage.enumerateAttribute(MDAttr.mermaid, in: whole) { v, r, _ in
@@ -288,6 +308,11 @@ final class MarkdownDocument: NSDocument {
             } else if let url = resolveImageURL(src, baseDir: baseDir) {
                 if let c = MarkdownDocument.imageCache.object(forKey: url.absoluteString as NSString) {
                     load(c, r)
+                } else if FolderAccess.needsGrant(for: url) {
+                    // Sandboxed and unreadable: don't attempt the read (it just fails silently, and
+                    // macOS won't prompt). Offer the grant instead — clicking the range runs it.
+                    storage.addAttribute(MDAttr.needsFolderGrant, value: url.deletingLastPathComponent(), range: r)
+                    load(MarkdownDocument.needsAccessImage(), r)
                 } else {
                     MarkdownDocument.loadImage(url) { [weak wc] img in
                         if let img { MarkdownDocument.imageCache.setObject(img, forKey: url.absoluteString as NSString) }
@@ -313,6 +338,69 @@ final class MarkdownDocument: NSDocument {
         if src.hasPrefix("/") { return URL(fileURLWithPath: src) }
         if let baseDir { return baseDir.appendingPathComponent(src).standardizedFileURL }   // relative to the doc
         return nil
+    }
+
+    /// Measured sizes of remote images, keyed by absolute URL. Process-wide: the same URL keeps its
+    /// size across reloads and documents, so it's measured once.
+    static var remoteSizes: [String: NSSize] = [:]
+
+    /// Pixel dimensions of a REMOTE image without downloading it: ask for the first 64 KB only, which
+    /// carries the header of every format we care about, and let ImageIO read the dimensions out of
+    /// that. Falls back to a full GET if the server ignores Range (some CDNs do).
+    private static func remoteImageSize(_ url: URL) async -> NSSize? {
+        func size(of data: Data) -> NSSize? {
+            let src = CGImageSourceCreateIncremental(nil)
+            CGImageSourceUpdateData(src, data as CFData, false)   // false: more bytes may follow
+            guard let p = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+                  let w = p[kCGImagePropertyPixelWidth] as? Double,
+                  let h = p[kCGImagePropertyPixelHeight] as? Double, w > 0, h > 0 else { return nil }
+            return NSSize(width: w, height: h)
+        }
+        var head = URLRequest(url: url)
+        head.setValue("bytes=0-65535", forHTTPHeaderField: "Range")
+        if let (data, _) = try? await URLSession.shared.data(for: head), let s = size(of: data) { return s }
+        if let (data, _) = try? await URLSession.shared.data(from: url) { return size(of: data) }
+        return nil
+    }
+
+    /// The remote counterpart of prerenderAllDiagrams: measure every not-yet-known remote image, then
+    /// reserve exact areas and lay out ONCE. Without this each image would resize the document as it
+    /// arrived — the reflow this whole design exists to avoid. Only headers are fetched, so it costs
+    /// a few KB per image, not the image.
+    func measureRemoteImages(in wc: DocumentWindowController) {
+        guard let storage = wc.textStorageRef else { return }
+        let baseDir = fileURL?.deletingLastPathComponent()
+        var urls: [URL] = []
+        var seen = Set<String>()
+        storage.enumerateAttribute(MDAttr.image, in: NSRange(location: 0, length: storage.length)) { v, _, _ in
+            guard let src = v as? String, !src.hasPrefix("data:"),
+                  let url = self.resolveImageURL(src, baseDir: baseDir), !url.isFileURL,
+                  MarkdownDocument.remoteSizes[url.absoluteString] == nil,
+                  seen.insert(url.absoluteString).inserted else { return }
+            urls.append(url)
+        }
+        guard !urls.isEmpty else { return }   // all measured (or none) → presize already exact
+        isMeasuringRemote = true
+        measureToken += 1
+        let token = measureToken
+        let gen = renderGeneration
+        Task { @MainActor in
+            await withTaskGroup(of: (String, NSSize?).self) { group in
+                for url in urls {
+                    group.addTask { (url.absoluteString, await MarkdownDocument.remoteImageSize(url)) }
+                }
+                for await (key, size) in group {
+                    if let size { MarkdownDocument.remoteSizes[key] = size }
+                }
+            }
+            guard token == self.measureToken, gen == self.renderGeneration else { return }
+            self.isMeasuringRemote = false
+            let anchor = wc.topVisibleCharIndex()
+            self.presizeKnownMedia(in: wc)
+            wc.precomputeLayout()
+            wc.scrollCharToTop(anchor)
+            self.reconcileMedia(in: wc)
+        }
     }
 
     /// Pixel dimensions of an image WITHOUT decoding it (ImageIO reads only the header) — fast and
@@ -343,6 +431,29 @@ final class MarkdownDocument: NSDocument {
         guard let comma = src.firstIndex(of: ","),
               let data = Data(base64Encoded: String(src[src.index(after: comma)...])) else { return nil }
         return NSImage(data: data)
+    }
+
+    /// Placeholder for an image the sandbox blocks: it says what to do, because a plain broken icon
+    /// would read as "this app can't show images" when one click fixes it. Click → folder grant.
+    static func needsAccessImage() -> NSImage {
+        let text = "Click to allow images in this folder" as NSString
+        let font = NSFont.systemFont(ofSize: 12)
+        let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.secondaryLabelColor]
+        let pad: CGFloat = 10, iconW: CGFloat = 18
+        let textSize = text.size(withAttributes: attrs)
+        let size = NSSize(width: (textSize.width + iconW + pad * 3).rounded(), height: 34)
+        let img = NSImage(size: size)
+        img.lockFocus()
+        let bg = NSBezierPath(roundedRect: NSRect(origin: .zero, size: size).insetBy(dx: 0.5, dy: 0.5),
+                              xRadius: 6, yRadius: 6)
+        NSColor.quaternaryLabelColor.setFill(); bg.fill()
+        NSColor.tertiaryLabelColor.setStroke(); bg.stroke()
+        if let icon = NSImage(systemSymbolName: "lock", accessibilityDescription: nil) {
+            icon.draw(in: NSRect(x: pad, y: (size.height - 14) / 2, width: 12, height: 14))
+        }
+        text.draw(at: NSPoint(x: pad + iconW, y: (size.height - textSize.height) / 2), withAttributes: attrs)
+        img.unlockFocus()
+        return img
     }
 
     /// A broken/missing-image placeholder so a failed load isn't just blank space.
