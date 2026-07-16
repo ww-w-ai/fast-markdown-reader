@@ -69,8 +69,24 @@ final class MarkdownDocument: NSDocument {
     func applySourceEdit(_ r: NSRange, with replacement: String) {
         let ns = text as NSString
         guard r.location >= 0, r.location + r.length <= ns.length else { NSSound.beep(); return }
-        self.text = ns.replacingCharacters(in: r, with: replacement)
-        if let url = fileURL { try? Data(text.utf8).write(to: url) }
+        let updated = ns.replacingCharacters(in: r, with: replacement)
+        if let url = fileURL {
+            do {
+                try Data(updated.utf8).write(to: url)
+            } catch {
+                // NEVER swallow this: the edit only exists on screen until it reaches the file, so a
+                // silent failure looks exactly like a save and the user closes the window trusting it.
+                // (The sandbox denying the write is one way here — hence user-selected.read-WRITE.)
+                let a = NSAlert()
+                a.alertStyle = .warning
+                a.messageText = "Couldn't save the edit"
+                a.informativeText = "\(url.lastPathComponent) was not changed on disk.\n\n\(error.localizedDescription)"
+                a.addButton(withTitle: "OK")
+                if let w = windowControllers.first?.window { a.beginSheetModal(for: w) } else { a.runModal() }
+                return   // keep the document as it is on disk — don't show an edit that didn't persist
+            }
+        }
+        self.text = updated
         guard let wc = windowControllers.first as? DocumentWindowController else { return }
         let anchor = wc.topVisibleCharIndex()
         render(into: wc)

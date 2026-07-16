@@ -14,8 +14,11 @@
 	<key>com.apple.security.files.bookmarks.app-scope</key>
 	<true/>
 
-	<!-- The viewer only ever reads files the user picked (Open panel, Finder, Open Recent). -->
-	<key>com.apple.security.files.user-selected.read-only</key>
+	<!-- read-WRITE, not read-only: the reader is read-only by default, but right-click → Edit
+	     writes the edited block back to the .md the user opened (MarkdownDocument.applySourceEdit).
+	     With read-only that write is denied — and it's a `try?`, so it fails silently and the user
+	     loses the edit believing it saved. -->
+	<key>com.apple.security.files.user-selected.read-write</key>
 	<true/>
 
 	<!-- Required for WKWebView even though mermaid loads ONLY a bundled local JS file and the app
