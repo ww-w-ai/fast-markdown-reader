@@ -8,13 +8,20 @@ set -euo pipefail
 # One-time setup (already done on this machine; see docs/NOTARIZATION.md to redo):
 #   - "Developer ID Application" certificate in the login keychain
 #   - notarytool credentials stored as a keychain profile (App Store Connect API key)
-
-IDENTITY="${IDENTITY:-Developer ID Application: DubDubDub Corp. (GTX7V638TX)}"
-PROFILE="${NOTARY_PROFILE:-ww-w-notary}"
-APP="FastMDReader.app"
-ZIP="FastMDReader.zip"
+#
+# The signing identity is NOT in this repo — it comes from a config file outside it
+# (default: $KEYCHAIN_DIR/signing.env), or from the environment.
 
 cd "$(dirname "$0")/.."
+
+KEYCHAIN_DIR="${KEYCHAIN_DIR:-$HOME/Documents/DEV/ww-w-ai/.keychains}"
+[[ -f "$KEYCHAIN_DIR/signing.env" ]] && source "$KEYCHAIN_DIR/signing.env"
+
+: "${IDENTITY:?set IDENTITY (e.g. 'Developer ID Application: <Team> (<TEAMID>)') — see docs/NOTARIZATION.md}"
+: "${NOTARY_PROFILE:?set NOTARY_PROFILE (notarytool keychain profile name)}"
+PROFILE="$NOTARY_PROFILE"
+APP="FastMDReader.app"
+ZIP="FastMDReader.zip"
 
 echo "==> Building release"
 ./Scripts/make-app.sh release

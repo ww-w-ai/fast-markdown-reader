@@ -12,16 +12,21 @@ set -euo pipefail
 #   ./Scripts/appstore.sh            # build + validate only (safe; does not submit)
 #   ./Scripts/appstore.sh --upload   # build + validate + upload to App Store Connect
 #
-# Signing material lives OUTSIDE this repo, in a dedicated keychain:
-#   ~/Documents/DEV/ww-w-ai/.keychains/   (see docs/NOTARIZATION.md)
+# Signing identity and App Store Connect identifiers are NOT in this repo — they live with the
+# keys, in a config file outside it (default: $KEYCHAIN_DIR/signing.env, chmod 600). Set
+# KEYCHAIN_DIR, or export the variables yourself, to sign as someone else. See docs/APP-STORE.md.
 
 KEYCHAIN_DIR="${KEYCHAIN_DIR:-$HOME/Documents/DEV/ww-w-ai/.keychains}"
-KEYCHAIN="$KEYCHAIN_DIR/ww-w-signing.keychain-db"
-PROFILE="${PROVISION_PROFILE:-$KEYCHAIN_DIR/Fast_Markdown_Reader_MAS.provisionprofile}"
-APP_IDENTITY="${APP_IDENTITY:-Apple Distribution: DubDubDub Corp. (GTX7V638TX)}"
-PKG_IDENTITY="${PKG_IDENTITY:-3rd Party Mac Developer Installer: DubDubDub Corp. (GTX7V638TX)}"
-API_KEY_ID="${API_KEY_ID:-REDACTED-KEY-ID}"
-API_ISSUER="${API_ISSUER:-REDACTED-ISSUER}"
+[[ -f "$KEYCHAIN_DIR/signing.env" ]] && source "$KEYCHAIN_DIR/signing.env"
+
+: "${APP_IDENTITY:?set APP_IDENTITY (e.g. 'Apple Distribution: <Team> (<TEAMID>)') — see docs/APP-STORE.md}"
+: "${PKG_IDENTITY:?set PKG_IDENTITY (e.g. '3rd Party Mac Developer Installer: <Team> (<TEAMID>)')}"
+: "${API_KEY_ID:?set API_KEY_ID (App Store Connect API key id)}"
+: "${API_ISSUER:?set API_ISSUER (App Store Connect issuer uuid)}"
+: "${PROVISION_PROFILE:?set PROVISION_PROFILE (path to the Mac App Store .provisionprofile)}"
+
+KEYCHAIN="${SIGNING_KEYCHAIN:-$KEYCHAIN_DIR/ww-w-signing.keychain-db}"
+PROFILE="$PROVISION_PROFILE"
 APP="FastMDReader.app"
 PKG="FastMDReader.pkg"
 

@@ -5,3 +5,5 @@
 DerivedData/
 .DS_Store
 .bkit/
+# AI collaboration logs: kept locally, not published — they quote internal discussion verbatim.
+docs/commit-log/
