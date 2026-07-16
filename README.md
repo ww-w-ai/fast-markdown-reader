@@ -1,9 +1,13 @@
 # Fast Markdown Reader
 
-**A Markdown reader for macOS with no browser inside it.** Electron viewers start around 300 MB
-and climb the longer you leave them open. This one is pure Swift/AppKit/TextKit: **0% idle CPU**,
-**~127 MB held flat across 9 large documents opened back to back**, and **~52 MB reclaimed** when
-they close. No timers, no polling, no background web process.
+**AI writes it. You're the one reading it.** Plans, specs, summaries, transcripts — it all lands as
+Markdown now, and reading it has quietly become most of the job. Your reader shouldn't be the slow
+part of that.
+
+Most Markdown apps are a web browser wearing a costume, which is why they take a beat to open and
+why memory climbs the longer you leave them running. This one is pure Swift/AppKit/TextKit:
+**0% idle CPU**, **~127 MB held flat across 9 large documents opened back to back**, and **~52 MB
+reclaimed** when they close. No timers, no polling, no background web process.
 
 It is the only native Mac Markdown viewer that renders **mermaid diagrams with the engine bundled
 in the app** — offline, cached once as a vector PDF, and never re-rendered
