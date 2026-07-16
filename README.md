@@ -54,22 +54,22 @@ right-click any `.md` in Finder → **Get Info** → **Open with** → choose fa
 
 ## Share it with someone
 
-The app is **ad-hoc signed**, not Apple-notarized. That's fine for sharing with friends —
-each recipient just clears Gatekeeper **once** on first launch.
+```bash
+./Scripts/notarize.sh
+```
 
-1. **Zip it** (a single file keeps the signature intact — never send loose bundle files):
-   ```bash
-   ditto -c -k --keepParent FastMDReader.app FastMDReader.zip
-   ```
-2. Send `FastMDReader.zip` (KakaoTalk, Drive, AirDrop…).
-3. The recipient unzips, moves `FastMDReader.app` to `/Applications`, then **once**:
-   - Terminal: `xattr -dr com.apple.quarantine /Applications/FastMDReader.app`, **or**
-   - Launch it → when blocked, **System Settings → Privacy & Security → "Open Anyway"**.
+This produces `FastMDReader.zip`: a release build, signed with the Developer ID certificate,
+notarized by Apple, and stapled. Send it (KakaoTalk, Drive, AirDrop…) — the recipient unzips,
+drags the app to `/Applications`, and double-clicks. **No Gatekeeper prompt, no `xattr` step.**
+The stapled ticket means it validates even offline.
 
-   After that it opens normally with a double-click.
-
-For friction-free public distribution (no Gatekeeper prompt at all), you need a paid Apple
-Developer ID + notarization — see `docs/NOTARIZATION.md`.
+Notes:
+- **arm64 only.** Intel Macs need a universal build (`swift build --arch arm64 --arch x86_64`)
+  before packaging.
+- The plain `./Scripts/make-app.sh` build is **ad-hoc signed** — fine on the machine that built
+  it, but other Macs will block it. Only ship the notarized zip.
+- Apple's first submission for a new app can take ~15 minutes; later ones are usually under a
+  minute. Setup and troubleshooting: `docs/NOTARIZATION.md`.
 
 ## Keyboard (reading cursor)
 

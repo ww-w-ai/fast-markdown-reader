@@ -40,5 +40,6 @@ No web runtime for text; mermaid is the only WebKit user and only on a cache mis
 ## Commit / distribution
 
 - **Solo local app → commit directly to `main`** (established pattern: `a80271e`, `57b485b`, `bce0ead`). No dev branch. Stage by filename (exclude `.bkit/`).
-- **Distribution**: ad-hoc signed, **arm64 only**. Friends: zip with `ditto -c -k --keepParent`, recipient clears quarantine once — see README "Share it with someone". Notarized public build → `docs/NOTARIZATION.md`.
+- **Distribution**: `./Scripts/notarize.sh` → release build, Developer ID signature + hardened runtime, Apple notarization, stapled `FastMDReader.zip`. **arm64 only.** Recipients just double-click — no quarantine step. Notarize only when shipping a build to someone, not on every build. Setup, key-sharing policy, and gotchas → `docs/NOTARIZATION.md`.
+- `make-app.sh` alone is ad-hoc signed — runs on the building machine only. Never ship that bundle.
 - Intel support needs a universal build (`swift build --arch arm64 --arch x86_64`) before packaging.

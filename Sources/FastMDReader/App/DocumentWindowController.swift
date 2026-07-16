@@ -52,10 +52,9 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = false   // viewer never scrolls sideways; text wraps
         scrollView.drawsBackground = true
-        // Keep copy-on-scroll ON: during a scroll AppKit blits old pixels and only repaints the
-        // newly-exposed strip — cheap. Custom card/quote backgrounds can tear briefly mid-scroll,
-        // which is fine; viewportChanged repaints the whole visible area ONCE when scrolling settles.
-        scrollView.contentView.copiesOnScroll = true
+        // NSClipView repaints only the newly-exposed strip while scrolling, so custom card/quote
+        // backgrounds can tear briefly mid-scroll. That's fine: viewportChanged repaints the whole
+        // visible area ONCE when scrolling settles.
         window.contentView = scrollView
         window.delegate = self                     // windowDidResize → recompute the column
         updateTextInset()
@@ -197,7 +196,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
     /// Scroll so the given character sits at the top of the viewport. `lineOffset` pushes it down
     /// by N lines (used when selecting downward so the already-selected line above stays visible).
     func scrollCharToTop(_ charIndex: Int, lineOffset: Int = 0) {
-        guard let lm = textView.layoutManager, let tc = textView.textContainer,
+        guard let lm = textView.layoutManager,
               let storage = textView.textStorage, lm.numberOfGlyphs > 0 else { return }
         let idx = min(max(0, charIndex), storage.length)
         let glyph = lm.glyphIndexForCharacter(at: idx)
@@ -314,15 +313,12 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
             let qInset = CGFloat((storage.attribute(MDAttr.codeInset, at: range.location, effectiveRange: nil) as? NSNumber)?.doubleValue ?? 0)
             let blockLeft = cardLeft + qInset
 
-            // Where the code text starts (after the 2-char blank header line) — used to
-            // position the header divider precisely and to frame the no-wrap overlay.
-            var codeTop = headerY + 20
+            // The code text starts after the 2-char blank header line.
             if range.length > 2 {
                 let codeChars = NSRange(location: range.location + 2, length: range.length - 2)
                 let codeGlyphs = lm.glyphRange(forCharacterRange: codeChars, actualCharacterRange: nil)
                 var codeRect = lm.boundingRect(forGlyphRange: codeGlyphs, in: container)
                 codeRect.origin.x += inset.width; codeRect.origin.y += inset.height
-                codeTop = codeRect.minY
 
                 // No-wrap overlay covers the code area (below the header) with its own scroller.
                 if self.noWrapCodes.contains(code) {

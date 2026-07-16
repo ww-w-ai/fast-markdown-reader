@@ -81,37 +81,46 @@ final class MermaidRenderer {
         </script></body></html>
         """
         return await withCheckedContinuation { (cont: CheckedContinuation<Data?, Never>) in
-            wv.loadHTMLString(html, baseURL: nil)
-            let start = Date()
-            var finished = false
-            // Poll until mermaid has produced an <svg> with non-zero size, THEN snapshot.
-            // Never snapshot on a fixed timer (would cache a blank/partial diagram forever).
-            func poll() {
-                if finished { return }
-                let probe = "(function(){var s=document.querySelector('#host svg');" +
-                            "if(!s)return[0,0];var r=s.getBoundingClientRect();return[r.width,r.height];})()"
-                wv.evaluateJavaScript(probe) { result, _ in
-                    let size = (result as? [CGFloat]) ?? [0, 0]
-                    if size.count == 2, size[0] > 1, size[1] > 1 {
-                        finished = true
-                        let w = size[0] + 16, h = size[1] + 16
-                        wv.frame = NSRect(x: 0, y: 0, width: w, height: h)
-                        let cfg = WKPDFConfiguration()
-                        cfg.rect = CGRect(x: 0, y: 0, width: w, height: h)
-                        wv.createPDF(configuration: cfg) { r in
-                            self.webView = nil   // release the web view immediately
-                            if case .success(let data) = r { cont.resume(returning: data) }
-                            else { cont.resume(returning: nil) }
+            // The continuation closure is nonisolated, but this whole method is @MainActor and every
+            // hop below re-enters on the main queue — so state it explicitly instead of hopping.
+            MainActor.assumeIsolated {
+                wv.loadHTMLString(html, baseURL: nil)
+                let start = Date()
+                var finished = false
+                // Poll until mermaid has produced an <svg> with non-zero size, THEN snapshot.
+                // Never snapshot on a fixed timer (would cache a blank/partial diagram forever).
+                @MainActor func poll() {
+                    if finished { return }
+                    let probe = "(function(){var s=document.querySelector('#host svg');" +
+                                "if(!s)return[0,0];var r=s.getBoundingClientRect();return[r.width,r.height];})()"
+                    wv.evaluateJavaScript(probe) { result, _ in
+                        let size = (result as? [CGFloat]) ?? [0, 0]
+                        if size.count == 2, size[0] > 1, size[1] > 1 {
+                            finished = true
+                            let w = size[0] + 16, h = size[1] + 16
+                            wv.frame = NSRect(x: 0, y: 0, width: w, height: h)
+                            let cfg = WKPDFConfiguration()
+                            cfg.rect = CGRect(x: 0, y: 0, width: w, height: h)
+                            wv.createPDF(configuration: cfg) { r in
+                                self.webView = nil   // release the web view immediately
+                                if case .success(let data) = r { cont.resume(returning: data) }
+                                else { cont.resume(returning: nil) }
+                            }
+                        } else if Date().timeIntervalSince(start) > 5.0 {
+                            finished = true; self.webView = nil
+                            cont.resume(returning: nil) // timeout → return nil so we do NOT cache it
+                        } else {
+                            schedulePoll()
                         }
-                    } else if Date().timeIntervalSince(start) > 5.0 {
-                        finished = true; self.webView = nil
-                        cont.resume(returning: nil) // timeout → return nil so we do NOT cache it
-                    } else {
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { poll() }
                     }
                 }
+                @MainActor func schedulePoll() {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        MainActor.assumeIsolated { poll() }
+                    }
+                }
+                schedulePoll()
             }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { poll() }
         }
     }
 }

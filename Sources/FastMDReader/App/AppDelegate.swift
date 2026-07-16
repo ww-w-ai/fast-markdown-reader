@@ -58,7 +58,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let close = fileMenu.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
         close.keyEquivalentModifierMask = [.command]
         fileMenu.addItem(.separator())
-        fileMenu.addItem(withTitle: "Print…", action: Selector(("printDocument:")), keyEquivalent: "p")
+        fileMenu.addItem(withTitle: "Print…", action: #selector(NSDocument.printDocument(_:)), keyEquivalent: "p")
 
         // Edit menu (copy / select-all / find)
         let editItem = NSMenuItem(); mainMenu.addItem(editItem)
