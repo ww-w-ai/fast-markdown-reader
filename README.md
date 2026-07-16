@@ -1,88 +1,102 @@
-# fast-md-reader
+# Fast Markdown Reader
 
-**A featherweight, native macOS Markdown viewer that never balloons.** Other viewers —
-especially Electron ones — creep from a few hundred megabytes toward a gigabyte the longer
-you leave them open. fast-md-reader is pure Swift/AppKit: it opens, renders, and gets out of
-the way.
+**A Markdown reader for macOS with no browser inside it.** Electron viewers start around 300 MB
+and climb the longer you leave them open. This one is pure Swift/AppKit/TextKit: **0% idle CPU**,
+**~127 MB held flat across 9 large documents opened back to back**, and **~52 MB reclaimed** when
+they close. No timers, no polling, no background web process.
 
-| | fast-md-reader |
+It is the only native Mac Markdown viewer that renders **mermaid diagrams with the engine bundled
+in the app** — offline, cached once as a vector PDF, and never re-rendered
+([`MermaidCache.swift`](Sources/FastMDReader/Cache/MermaidCache.swift)). Images and diagrams
+outside the viewport **release their pixels but keep their exact height**, so memory stays flat and
+the scrollbar never jumps
+([`SizedAttachmentCell.swift`](Sources/FastMDReader/Render/SizedAttachmentCell.swift)).
+
+Read-only, on purpose. It opens, renders, and gets out of the way.
+
+| | Fast Markdown Reader |
 |---|---|
-| Engine | 100% native AppKit + TextKit — **no web runtime** |
-| Idle CPU | **0%** (no timers, no polling, no background web process) |
-| Memory | **flat under use** — held steady at ~127 MB across 9 large docs opened in a row, **reclaimed to ~52 MB** when documents close. No growth over a session. |
-| Long docs | Non-contiguous layout lays out only the viewport → a 4,000-paragraph file opens and scrolls fast |
-| Diagrams | mermaid rendered once to a cached vector PDF; cached/no-diagram docs **never spawn a web view** |
-| Editing | none — read-only viewer, opens files read-only |
+| Engine | 100% native AppKit + TextKit — **no web runtime for text** |
+| Idle CPU | **0%** — no timers, no polling, no background web process |
+| Memory | **flat under use** — ~127 MB across 9 large docs, ~52 MB reclaimed on close |
+| Long docs | Non-contiguous layout renders only the viewport — a **4,000-paragraph** file opens instantly |
+| Diagrams | **mermaid bundled** — renders offline, cached as vector PDF, never re-rendered |
+| Images | Off-screen pixels freed, exact height kept — **no reflow, no scrollbar jitter** |
+| Code | Native syntax highlighting, per-block **Copy** and **Wrap** |
+| Editing | None. Read-only viewer, opens files read-only |
 
-## What it does
+## Diagrams render offline, once
 
-- Renders Markdown (CommonMark + GFM tables) natively to styled text — headings, emphasis,
-  lists, quotes, links, inline code.
-- Fenced code blocks render as distinct **rounded cards** with native syntax highlighting
-  (swift, js/ts, python, bash, json) and a per-block **Copy** button.
-- **mermaid** diagrams render on demand through a transient offscreen WebKit view, snapshotted
-  to a vector PDF and cached (in-RAM + temp dir, content-addressed). Reopen a file and the
-  diagram appears instantly with zero web/JS cost.
-- A **reading cursor** with a full keyboard scheme (below), softly highlighting the current
-  line and keeping it on screen.
-- **⌘F** find bar, **⌘±** font size (persisted across launches), automatic **dark/light**.
-- Opens from Finder (double-click a `.md`), native window **tabs**, recent documents.
+The mermaid engine ships inside the app — no CDN, no network, nothing to load. A diagram is
+rendered a single time to a **vector PDF**, cached by content hash, and reused forever. Open the
+same document again and diagrams appear instantly with zero web or JS cost. A document with no
+diagrams never creates a web view at all.
 
-## Build & run
+![mermaid diagrams rendered natively](assets/screenshots/mermaid.png)
 
-Requires macOS 13+. Build assembles a `.app` bundle with ad-hoc signing:
+## Images stay sharp without staying in memory
 
-```bash
-./Scripts/make-app.sh
-open FastMDReader.app
-```
+Every image and diagram **owns its layout size independently of its pixels**. Scroll away and the
+pixels are released; scroll back and they return — but the reserved height never changes, so the
+document length is stable and the scrollbar never swings. Sizes are measured up front (image
+headers, cached PDFs, and remote images via a range request), so the page is laid out **once**.
 
-> Toolchain note: if a standalone Command Line Tools install has a mismatched SwiftPM
-> ManifestAPI, `make-app.sh` automatically prefers Xcode's toolchain via `DEVELOPER_DIR`.
-> Make it permanent with `sudo xcode-select -s /Applications/Xcode.app` or by updating CLT.
+![images and rich Markdown](assets/screenshots/images.png)
 
-Run the tests with `swift test` (Xcode toolchain: `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test`).
+## Code blocks are real cards
+
+![code cards and tables](assets/screenshots/code.png)
+
+Fenced blocks render as rounded cards with a language label, native highlighting (swift, js/ts,
+python, bash, json), a **Copy** button, and a **Wrap** toggle — no JavaScript involved. Tables,
+task lists, footnotes and strikethrough come from CommonMark + GFM.
 
 ## Install
 
-Copy `FastMDReader.app` to `/Applications`. To make it your default Markdown viewer:
-right-click any `.md` in Finder → **Get Info** → **Open with** → choose fast-md-reader →
-**Change All…**.
+**Apple Silicon (arm64) only.** Requires macOS 13+.
 
-> **Apple Silicon only.** The build is `arm64`. Intel Macs need a universal build
-> (`swift build --arch arm64 --arch x86_64` before packaging).
+Download the notarized zip, unzip it, drag `FastMDReader.app` to `/Applications`, double-click.
+No Gatekeeper prompt and no `xattr` step — the app is signed with a Developer ID and stapled.
 
-## Share it with someone
+To make it your default Markdown viewer: right-click any `.md` in Finder → **Get Info** →
+**Open with** → Fast Markdown Reader → **Change All…**.
+
+## Build from source
 
 ```bash
-./Scripts/notarize.sh
+./Scripts/make-app.sh        # builds FastMDReader.app (ad-hoc signed, unsandboxed)
+open FastMDReader.app
 ```
 
-This produces `FastMDReader.zip`: a release build, signed with the Developer ID certificate,
-notarized by Apple, and stapled. Send it (KakaoTalk, Drive, AirDrop…) — the recipient unzips,
-drags the app to `/Applications`, and double-clicks. **No Gatekeeper prompt, no `xattr` step.**
-The stapled ticket means it validates even offline.
+Tests: `swift test`.
 
-Notes:
-- **arm64 only.** Intel Macs need a universal build (`swift build --arch arm64 --arch x86_64`)
-  before packaging.
-- The plain `./Scripts/make-app.sh` build is **ad-hoc signed** — fine on the machine that built
-  it, but other Macs will block it. Only ship the notarized zip.
-- Apple's first submission for a new app can take ~15 minutes; later ones are usually under a
-  minute.
-- Signing identity and App Store Connect key ids are **not** in this repo. The scripts read them
-  from `$KEYCHAIN_DIR/signing.env` (default `~/Documents/DEV/ww-w-ai/.keychains/`) and say which
-  variable is missing if it isn't there. To sign as yourself, write your own — no code changes:
-  ```bash
-  export IDENTITY="Developer ID Application: <You> (<TEAMID>)"
-  export NOTARY_PROFILE="<your notarytool keychain profile>"
-  ```
+> **Toolchain note:** a standalone Command Line Tools install can ship a mismatched SwiftPM
+> ManifestAPI that breaks `swift build`. `make-app.sh` prefers Xcode's toolchain automatically via
+> `DEVELOPER_DIR`; make it permanent with `sudo xcode-select -s /Applications/Xcode.app`.
+
+Signing identity and App Store Connect key ids are **not** in this repo — the release scripts read
+them from `$KEYCHAIN_DIR/signing.env` (default `~/Documents/DEV/ww-w-ai/.keychains/`) and name the
+missing variable if it isn't there. To sign as yourself, export your own; no code changes:
+
+```bash
+export IDENTITY="Developer ID Application: <You> (<TEAMID>)"
+export NOTARY_PROFILE="<your notarytool keychain profile>"
+./Scripts/notarize.sh        # signed + notarized + stapled zip
+```
+
+### Two builds, one difference
+
+The direct download is **not sandboxed**; the Mac App Store build is (the store requires it).
+Sandboxed, macOS grants an app only the file you opened — a document's own `![](diagram.png)`
+sibling is a different file and is denied, with no prompt, because the sandbox refuses before macOS
+asks and no "Documents folder" entitlement exists. So the store build asks once, per folder, and
+remembers it; the direct build simply reads them. `SANDBOX=1 ./Scripts/make-app.sh` builds the
+sandboxed shape locally.
 
 ## Keyboard (reading cursor)
 
-Navigation **selects the unit it moves to**, so ⌘C copies it immediately. No Shift is used
-(Shift stays free for system selection), and the keys avoid conflicts with standard macOS
-shortcuts.
+Navigation **selects the unit it moves to**, so ⌘C copies it immediately. No Shift is used (Shift
+stays free for system selection), and the keys avoid conflicts with standard macOS shortcuts.
 
 | Key | Action (and what gets selected) |
 |---|---|
@@ -98,19 +112,11 @@ shortcuts.
 | **⌘+ / ⌘−** | Font size (persists to the next launch) |
 | **↑ / ↓** | Scroll one line |
 
-Page / number-jump / document-ends move without selecting (too-large or jump moves stay
-caret-only). Mouse drag-selection + copy also work. Each code block has **Copy** and a
-**Wrap** toggle (fold long lines vs. no-wrap with its own horizontal scroll).
+Page / number-jump / document-ends move without selecting. Mouse drag-selection and copy work as
+usual. Click any diagram or image to open it in a zoomable window (pinch, `+`/`−`, `0` to fit).
 
-## How the lightness holds
+## License
 
-- No web runtime for text — a single native `NSAttributedString` renderer.
-- mermaid is the only WebKit user, and only on a **cache miss**; the web view is released the
-  instant its PDF snapshot completes. No-diagram and fully-cached documents touch no web/JS.
-- Non-contiguous TextKit layout means long documents lay out lazily, per viewport.
-- Overlays (copy buttons) are placed only for the **visible** code blocks, never forcing
-  layout of off-screen content.
+MIT — see [LICENSE](LICENSE). Third-party attributions: [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
-## Third-party
-
-See `THIRD-PARTY-NOTICES.md` — swift-markdown (Apache-2.0), mermaid (MIT).
+Built by [DubDubDub Corp.](https://ww-w.ai)
