@@ -2,49 +2,69 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key><string>Fast Markdown Reader</string>
-  <key>CFBundleDisplayName</key><string>Fast Markdown Reader</string>
-  <!-- Required by the App Store (error 90242 without it). Must match the category picked in
-       App Store Connect. -->
-  <key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
-  <key>CFBundleIdentifier</key><string>ai.ww-w.fast-md-reader</string>
-  <key>CFBundleExecutable</key><string>FastMDReader</string>
-  <key>CFBundleIconFile</key><string>AppIcon</string>
-  <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.0</string>
-  <key>CFBundleVersion</key><string>4</string>
-  <key>LSMinimumSystemVersion</key><string>13.0</string>
-  <key>NSPrincipalClass</key><string>NSApplication</string>
-  <key>NSHighResolutionCapable</key><true/>
-  <key>CFBundleDocumentTypes</key>
-  <array>
-    <dict>
-      <key>CFBundleTypeName</key><string>Markdown Document</string>
-      <key>CFBundleTypeRole</key><string>Viewer</string>
-      <key>LSHandlerRank</key><string>Alternate</string>
-      <!-- NSDocumentClass must be module-qualified for a Swift executable so
-           NSDocumentController can instantiate it (plan omitted this). -->
-      <key>NSDocumentClass</key><string>FastMDReader.MarkdownDocument</string>
-      <key>LSItemContentTypes</key>
-      <array>
-        <string>net.daringfireball.markdown</string>
-        <string>public.markdown</string>
-      </array>
-    </dict>
-  </array>
-  <key>UTImportedTypeDeclarations</key>
-  <array>
-    <dict>
-      <key>UTTypeIdentifier</key><string>net.daringfireball.markdown</string>
-      <key>UTTypeConformsTo</key>
-      <array><string>public.plain-text</string></array>
-      <key>UTTypeDescription</key><string>Markdown Document</string>
-      <key>UTTypeTagSpecification</key>
-      <dict>
-        <key>public.filename-extension</key>
-        <array><string>md</string><string>markdown</string><string>mdown</string></array>
-      </dict>
-    </dict>
-  </array>
+	<key>CFBundleDisplayName</key>
+	<string>Fast Markdown Reader</string>
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Markdown Document</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>net.daringfireball.markdown</string>
+				<string>public.markdown</string>
+			</array>
+			<key>NSDocumentClass</key>
+			<string>FastMDReader.MarkdownDocument</string>
+		</dict>
+	</array>
+	<key>CFBundleExecutable</key>
+	<string>FastMDReader</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>ai.ww-w.fast-md-reader</string>
+	<key>CFBundleName</key>
+	<string>Fast Markdown Reader</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>5</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.productivity</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>UTImportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.plain-text</string>
+			</array>
+			<key>UTTypeDescription</key>
+			<string>Markdown Document</string>
+			<key>UTTypeIdentifier</key>
+			<string>net.daringfireball.markdown</string>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>md</string>
+					<string>markdown</string>
+					<string>mdown</string>
+				</array>
+			</dict>
+		</dict>
+	</array>
 </dict>
 </plist>
