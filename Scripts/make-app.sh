@@ -22,6 +22,10 @@ cp Resources/Info.plist "$APP/Contents/Info.plist"
 # build inputs that must not ship inside the bundle (Info.plist is placed above; entitlements are a
 # signing input).
 find Resources -type f ! -name 'Info.plist' ! -name '*.entitlements' -exec cp {} "$APP/Contents/Resources/" \;
+# The KaTeX fonts ride inside katex-inlined.min.css, and the OFL requires its text to travel WITH
+# the fonts — so the notices ship in the bundle, not just in the repo.
+cp THIRD-PARTY-NOTICES.md "$APP/Contents/Resources/"
+cp -R licenses "$APP/Contents/Resources/"
 # Ad-hoc sign so Gatekeeper allows local launch. Unsandboxed by default, matching the Developer ID
 # build people actually download (Scripts/notarize.sh).
 #
