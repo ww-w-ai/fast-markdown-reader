@@ -66,4 +66,35 @@ final class TextNavigatorTests: XCTestCase {
         XCTAssertEqual(nav.lineEnd(s, from: 9999), (s as NSString).length)
         XCTAssertEqual(nav.lineStart(s, from: -5), 0)
     }
+
+    /// The keys the reader advertises must map onto real navigator moves. These were shipped in the
+    /// README long before they existed in the code — the whole point of pinning them here.
+    func testSentenceAndParagraphStepBothWays() {
+        let n = TextNavigator()
+        let s = "First one. Second one. Third one.\n\nA new paragraph starts here. And runs on.\n\nLast."
+        let ns = s as NSString
+
+        // Forward by sentence, from the very start.
+        let second = n.nextSentenceStart(s, from: 0)
+        XCTAssertEqual(ns.substring(from: second).hasPrefix("Second one."), true)
+        let third = n.nextSentenceStart(s, from: second)
+        XCTAssertEqual(ns.substring(from: third).hasPrefix("Third one."), true)
+        // Back again: standing ON a sentence start must step to the PREVIOUS one, not stay put.
+        XCTAssertEqual(n.sentenceStart(s, from: third), second)
+
+        // Paragraphs are the bigger unit and must not stop at sentences.
+        let p2 = n.nextParagraphStart(s, from: 0)
+        XCTAssertEqual(ns.substring(from: p2).hasPrefix("A new paragraph"), true)
+        let p3 = n.nextParagraphStart(s, from: p2)
+        XCTAssertEqual(ns.substring(from: p3).hasPrefix("Last."), true)
+        XCTAssertEqual(n.paragraphStart(s, from: p3), p2)
+    }
+
+    func testLineStartAndEndBracketTheLine() {
+        let n = TextNavigator()
+        let s = "alpha beta\ngamma delta\n"
+        let mid = 3                                   // inside "alpha"
+        XCTAssertEqual(n.lineStart(s, from: mid), 0)
+        XCTAssertEqual(n.lineEnd(s, from: mid), 10)   // stops before the newline
+    }
 }

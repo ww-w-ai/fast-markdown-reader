@@ -353,7 +353,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
 
             let copy = self.makeChipButton("Copy", textColor: .secondaryLabelColor,
                 bg: NSColor.textColor.withAlphaComponent(0.06), weight: .medium,
-                action: #selector(self.copyCode(_:)), code: code)
+                action: #selector(self.copyCode(_:)), code: code, widest: "Copied")
             // Wrap toggle: accent fill + accent text when wrapping is ON; grey text, no fill when OFF.
             let wrapping = !self.noWrapCodes.contains(code)
             let wrap = self.makeChipButton("Wrap",
@@ -381,14 +381,20 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
 
     /// A uniform header chip (Copy / Wrap) — same size and shape so they line up; only the
     /// colors differ (Wrap uses an accent fill when wrapping is on, grey when off).
+    /// `widest` is the longest label this chip will ever show. The chip is sized for THAT, so
+    /// switching label (Copy → Copied) can't clip the text or shove its neighbour sideways — the
+    /// frame is set once here and never touched again.
     private func makeChipButton(_ title: String, textColor: NSColor, bg: NSColor,
-                                weight: NSFont.Weight, action: Selector, code: String) -> NSButton {
+                                weight: NSFont.Weight, action: Selector, code: String,
+                                widest: String? = nil) -> NSButton {
         let b = NSButton(title: title, target: self, action: action)
         b.isBordered = false
-        b.attributedTitle = NSAttributedString(string: title, attributes: [
-            .font: NSFont.systemFont(ofSize: 10, weight: weight), .foregroundColor: textColor])
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 10, weight: weight), .foregroundColor: textColor]
+        b.attributedTitle = NSAttributedString(string: widest ?? title, attributes: attrs)
         b.sizeToFit()
         var f = b.frame; f.size.width += 14; f.size.height = 17; b.frame = f
+        b.attributedTitle = NSAttributedString(string: title, attributes: attrs)   // frame stays
         b.wantsLayer = true
         b.layer?.cornerRadius = 4
         b.layer?.backgroundColor = bg.cgColor
@@ -471,8 +477,17 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         guard let code = sender.identifier?.rawValue else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(code, forType: .string)
-        sender.title = "Copied"
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { sender.title = "Copy" }
+        setChipTitle(sender, "Copied")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.setChipTitle(sender, "Copy") }
+    }
+
+    /// A chip's whole look (10pt, its colour) lives in its attributedTitle. Assigning `.title`
+    /// silently throws all of that away and the label snaps to the default 13pt system font —
+    /// which is why "Copied" appeared twice the size of "Copy". Re-use the existing attributes.
+    private func setChipTitle(_ b: NSButton, _ title: String) {
+        let attrs = b.attributedTitle.length > 0
+            ? b.attributedTitle.attributes(at: 0, effectiveRange: nil) : [:]
+        b.attributedTitle = NSAttributedString(string: title, attributes: attrs)
     }
 
     @objc private func toggleWrap(_ sender: NSButton) {
@@ -519,7 +534,17 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         }
         let url: URL? = (link as? URL) ?? (link as? String).flatMap { URL(string: $0) }
         guard let url else { return false }
-        if url.isFileURL { openFile(url) } else { NSWorkspace.shared.open(url) }   // http(s) → browser
+        if url.isFileURL {
+            openFile(url)
+        } else if url.scheme == nil {
+            // `[docs](demo/code-blocks.md)` — a relative link, which is how every README on earth
+            // points at its neighbours. It is neither a file: URL nor a web one, so handing it to
+            // NSWorkspace asks macOS to open "demo/code-blocks.md" as a web address and it fails.
+            // Resolve it against the document's own folder, exactly like a bare path in the prose.
+            openFile(resolvePath(url.relativePath.removingPercentEncoding ?? url.relativePath))
+        } else {
+            NSWorkspace.shared.open(url)   // http(s), mailto → the system handler
+        }
         return true
     }
 
@@ -596,7 +621,11 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         guard !s.isEmpty else { NSSound.beep(); return }
         if s.contains("://"), let url = URL(string: s) { NSWorkspace.shared.open(url); return }
         let fileURL = resolvePath(s)
-        if FileManager.default.fileExists(atPath: fileURL.path) { openFile(fileURL); return }
+        // An explicit path is a path even when it can't be stat'd (sandbox, or simply gone): let
+        // openFile ask for the folder or beep, rather than falling through to a bogus https guess.
+        if s.hasPrefix("/") || s.hasPrefix("~") || FileManager.default.fileExists(atPath: fileURL.path) {
+            openFile(fileURL); return
+        }
         // Schemeless web address ("ww-w.ai", "example.com/x") → assume https.
         if s.contains("."), !s.contains(" "), let url = URL(string: "https://\(s)") {
             NSWorkspace.shared.open(url); return
@@ -615,7 +644,21 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         return URL(fileURLWithPath: raw)
     }
 
-    private func openFile(_ url: URL) {
+    /// Open a local target (folder, `.md` tab, or associated app).
+    ///
+    /// Sandboxed, a linked path outside the granted folders is refused by the system, not by us —
+    /// macOS puts up its own "doesn't have permission to open X" alert and the click dead-ends. So a
+    /// blocked link takes the same route as a blocked image: ask for the folder, then open. Retry
+    /// once only (`afterGrant`), since a grant that doesn't cover the target would otherwise loop.
+    private func openFile(_ url: URL, afterGrant: Bool = false) {
+        if !afterGrant, FolderAccess.needsGrant(for: url) {
+            FolderAccess.requestAccess(to: FolderAccess.suggestedFolder(for: url), in: window,
+                                       what: "linked files") { [weak self] granted in
+                guard granted else { return }               // cancelled: the user already said no
+                self?.openFile(url, afterGrant: true)
+            }
+            return
+        }
         let fm = FileManager.default
         var isDir: ObjCBool = false
         let exists = fm.fileExists(atPath: url.path, isDirectory: &isDir)
@@ -712,9 +755,13 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         }
         section("Navigation")
         note("Modifier position = jump size — farther left jumps bigger  (fn › ⌥ › ⌘)")
-        row("⌘↑ / ⌘↓", "Previous / next paragraph  (a whole table is one stop)")
-        row("⌥↑ / ⌥↓", "Page up / down  (same as Space / ⇧Space)")
+        row("⌘↑ / ⌘↓", "Previous / next heading")
+        row("⌥↑ / ⌥↓", "Page up / down  (a few lines overlap, so you can find your place)")
         row("fn↑ / fn↓", "Document start / end")
+        row("⌘← / ⌘→", "Start / end of the line")
+        row("⌥← / ⌥→", "Previous / next sentence")
+        row("fn← / fn→", "Previous / next paragraph")
+        row("⇧ + any of these", "Same move, selecting what it crosses")
         row("Space / ⇧Space", "Page down / up")
         row("↑ ↓ ← →", "Move the reading cursor one line/char")
         section("File")
@@ -730,7 +777,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         row("⌘-Click selection", "Open the selected text as a link / path / file")
         row("Click left margin", "Copy that whole block (or section, beside a heading)")
         row("Right-click selection", "Copy · Open · Edit… (edit that block's markdown source)")
-        row("Click a diagram / image", "Open it enlarged in a zoomable window")
+        row("Click a diagram / formula / image", "Open it enlarged in a zoomable window")
         row("Wrap / Copy button", "Toggle a code block's wrapping / copy its code")
         section("Diagram window")
         row("Pinch  or  + / −", "Zoom in / out");  row("0", "Fit to window");  row("Drag", "Move around (pan)")

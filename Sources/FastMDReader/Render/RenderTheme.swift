@@ -33,6 +33,10 @@ enum Palette {
     static let quoteBar        = NSColor.dynamic(light: NSColor(rgb: 0x37352F, alpha: 0.30),
                                                  dark:  NSColor(rgb: 0xFFFFFF, alpha: 0.30))
     static let link            = NSColor.dynamic(light: NSColor(rgb: 0x2E7AB8), dark: NSColor(rgb: 0x6CB0F5))
+    // The band under the line the reading cursor sits on. Faint enough to be ambient, not read as a
+    // selection — a touch of the link hue so it reads as "you are here", warm-neutral in both modes.
+    static let readingLine     = NSColor.dynamic(light: NSColor(rgb: 0x2E7AB8, alpha: 0.07),
+                                                 dark:  NSColor(rgb: 0x6CB0F5, alpha: 0.10))
     static let tableBorder     = NSColor.dynamic(light: NSColor(rgb: 0x37352F, alpha: 0.16),
                                                  dark:  NSColor(rgb: 0xFFFFFF, alpha: 0.16))
     static let tableHeaderBg   = NSColor(rgb: 0x878378, alpha: 0.10)   // warm neutral, both modes

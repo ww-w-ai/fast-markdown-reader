@@ -51,4 +51,67 @@ final class MarkdownRendererTests: XCTestCase {
         }
         XCTAssertEqual(found, [1, 2])
     }
+
+    /// A `// comment` inside code matched the file-path pattern (space, slash, slash) and became a
+    /// folder shortcut that opened Finder. Code is shown, not offered as navigation.
+    func testCodeBlockSlashesAreNotFilePathLinks() {
+        let md = """
+        Open ./notes/readme.md for context.
+
+        ```go
+        func main() {
+        	u := "https://ww-w.ai" // the // here is a comment
+        }
+        ```
+        """
+        let s = MarkdownRenderer.render(md, theme: RenderTheme.current(size: 14))
+        let text = s.string as NSString
+        var linkedPaths: [String] = []
+        s.enumerateAttribute(MDAttr.filePath, in: NSRange(location: 0, length: s.length)) { v, r, _ in
+            if v != nil { linkedPaths.append(text.substring(with: r)) }
+        }
+        // The prose path still links; nothing from inside the fence does.
+        XCTAssertTrue(linkedPaths.contains("./notes/readme.md"), "prose path stopped linking: \(linkedPaths)")
+        XCTAssertFalse(linkedPaths.contains(where: { $0.hasPrefix("//") }), "code comment linked: \(linkedPaths)")
+    }
+
+    /// A URL in code must keep its syntax colour: link styling is painted after highlighting, so
+    /// linking it would repaint the string blue and underline it mid-code.
+    func testURLsInCodeAreNotLinked() {
+        let md = """
+        Visit https://ww-w.ai for the app.
+
+        ```go
+        u := "https://ww-w.ai/fast-markdown-reader"
+        ```
+
+        Inline `https://ww-w.ai/inline` stays code too.
+        """
+        let s = MarkdownRenderer.render(md, theme: RenderTheme.current(size: 14))
+        let text = s.string as NSString
+        var linked: [String] = []
+        s.enumerateAttribute(.link, in: NSRange(location: 0, length: s.length)) { v, r, _ in
+            if v != nil { linked.append(text.substring(with: r)) }
+        }
+        XCTAssertTrue(linked.contains("https://ww-w.ai"), "prose URL stopped linking: \(linked)")
+        XCTAssertFalse(linked.contains(where: { $0.contains("fast-markdown-reader") }), "code URL linked: \(linked)")
+        XCTAssertFalse(linked.contains(where: { $0.contains("inline") }), "inline-code URL linked: \(linked)")
+    }
+
+    /// Relative markdown links are how every README points at its neighbours. They are neither
+    /// file: nor http: URLs, and handing one to NSWorkspace asks macOS to open "demo/x.md" as a web
+    /// address — which is the error the reader used to show. The renderer must keep them intact for
+    /// the click handler to resolve against the document's folder.
+    func testRelativeLinksSurviveAsSchemelessURLs() {
+        let md = "See [the demo](demo/code-blocks.md) and [the site](https://ww-w.ai)."
+        let s = MarkdownRenderer.render(md, theme: RenderTheme.current(size: 14))
+        let text = s.string as NSString
+        var byLabel: [String: URL] = [:]
+        s.enumerateAttribute(.link, in: NSRange(location: 0, length: s.length)) { v, r, _ in
+            if let u = v as? URL { byLabel[text.substring(with: r)] = u }
+        }
+        XCTAssertEqual(byLabel["the demo"]?.scheme, nil)                       // relative: resolved on click
+        XCTAssertEqual(byLabel["the demo"]?.relativePath, "demo/code-blocks.md")
+        XCTAssertEqual(byLabel["the site"]?.scheme, "https")                   // absolute: still the browser
+    }
 }

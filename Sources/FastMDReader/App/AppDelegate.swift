@@ -73,6 +73,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Edit menu (copy / select-all / find)
         let editItem = NSMenuItem(); mainMenu.addItem(editItem)
         let editMenu = NSMenu(title: "Edit"); editItem.submenu = editMenu
+        editMenu.addItem(withTitle: "Undo", action: #selector(MarkdownDocument.undoSourceEdit(_:)),
+                         keyEquivalent: "z")
+        let redo = editMenu.addItem(withTitle: "Redo", action: #selector(MarkdownDocument.redoSourceEdit(_:)),
+                                    keyEquivalent: "z")
+        redo.keyEquivalentModifierMask = [.command, .shift]
+        editMenu.addItem(.separator())
         editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
         editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         editMenu.addItem(.separator())

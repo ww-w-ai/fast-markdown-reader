@@ -11,6 +11,7 @@ import AppKit
 ///   • beside a code block               → the raw code
 /// Heading levels are scanned live from MDAttr.heading (C1: UTF-16) for the section range.
 final class ReaderTextView: NSTextView {
+    private let nav = TextNavigator()
     private var headingRuns: [(offset: Int, level: Int)] = []
     var headingOffsets: [Int] { headingRuns.map { $0.offset } }
 
@@ -27,8 +28,28 @@ final class ReaderTextView: NSTextView {
         // live selection drag AppKit only invalidates a thin strip; keying off that strip drew
         // partial cards (super erased the strip, we redrew only a sliver). Drawing all visible
         // decorations — clipped to the dirty rect by the graphics context — keeps them whole.
+        drawReadingLine(lm, tc)   // under the decorations and glyphs — it's ambient, not a highlight
         let glyphRange = lm.glyphRange(forBoundingRect: visibleRect, in: tc)
         drawMDDecorations(lm, storage, tc, glyphsToShow: glyphRange, at: textContainerOrigin)
+    }
+
+    /// A faint band across the line the reading cursor sits on, so a glance finds your place after a
+    /// scroll — the "you are here" the app promises. Only when there's no selection: an active
+    /// selection is its own, stronger highlight, and painting a band under it would muddy it.
+    private func drawReadingLine(_ lm: NSLayoutManager, _ tc: NSTextContainer) {
+        guard selectedRange().length == 0, length > 0 else { return }
+        let caret = min(selectedRange().location, length)
+        // A caret at the very end has no glyph of its own; anchor on the last one.
+        let glyph = min(lm.glyphIndexForCharacter(at: caret), max(0, lm.numberOfGlyphs - 1))
+        var line = lm.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil)
+        guard line.intersects(visibleRect) else { return }
+        let o = textContainerOrigin
+        // Span the full text column, not just the glyphs, so the band is a clean stripe.
+        line.origin.x = o.x
+        line.origin.y += o.y
+        line.size.width = tc.size.width
+        Palette.readingLine.setFill()
+        NSBezierPath(rect: line).fill()
     }
 
     private var length: Int { textStorage?.length ?? 0 }
@@ -42,6 +63,16 @@ final class ReaderTextView: NSTextView {
             if let level = v as? Int { runs.append((r.location, level)) }
         }
         headingRuns = runs.sorted { $0.0 < $1.0 }.map { (offset: $0.0, level: $0.1) }
+    }
+
+    /// The reading-line band lives on the OLD caret's line until something redraws; a bare
+    /// setSelectedRange only invalidates the thin caret sliver, so the band would smear (old line
+    /// stays lit, new line stays dark). Repaint the whole visible area on every selection change —
+    /// it's one fill, cheap, and correctness beats a partial invalidate here.
+    override func setSelectedRange(_ charRange: NSRange, affinity: NSSelectionAffinity,
+                                   stillSelecting: Bool) {
+        super.setSelectedRange(charRange, affinity: affinity, stillSelecting: stillSelecting)
+        setNeedsDisplay(visibleRect)
     }
 
     func clampCaretToText() {
@@ -62,8 +93,11 @@ final class ReaderTextView: NSTextView {
 
     // Keep Space / ⇧Space page scrolling (a plain text view lacks it); all caret movement and
     // selection is native.
-    // Directional reading navigation. The modifier's position on the keyboard sets the JUMP SIZE:
-    // farther left = bigger jump  →  fn (document) > ⌥ (page) > ⌘ (paragraph/block).
+    // Directional reading navigation. The modifier's position on the keyboard sets the JUMP SIZE —
+    // farther left = bigger jump — and it reads the same on both axes:
+    //   down the document:  fn (whole document) › ⌥ (page)      › ⌘ (heading)
+    //   across the line:    fn (paragraph)      › ⌥ (sentence)  › ⌘ (line)
+    // Shift keeps the movement identical and selects what it crosses.
     // (⌃↑/↓ is deliberately NOT used — it collides with macOS Mission Control / App Exposé.)
     // Arrow keys always carry .function, so we compare against only the "real" modifiers.
     override func keyDown(with event: NSEvent) {
@@ -78,15 +112,72 @@ final class ReaderTextView: NSTextView {
         if event.keyCode == 49, mods == [.shift] { page(down: false, extend: false); return }
         // For the modifier navigation, Shift ADDS selection while keeping the same movement.
         let extend = mods.contains(.shift)
-        switch (event.keyCode, mods.subtracting(.shift)) {
+        let s = textStorage?.string ?? ""
+        let sel = selectedRange()
+        // Move the LEADING edge: going forward continues from the selection's end, back from its start.
+        let ahead = sel.location + sel.length, behind = sel.location
+        let realMods = mods.subtracting(.shift)
+        switch (event.keyCode, realMods) {
+        // Across the line — the modifier says how far, same as the vertical keys (fn › ⌥ › ⌘).
+        case (123, [.command]):   applyNav(to: nav.lineStart(s, from: behind), down: false, extend: extend)   // ⌘←
+        case (124, [.command]):   applyNav(to: nav.lineEnd(s, from: ahead), down: true, extend: extend)       // ⌘→
+        case (123, [.option]):    applyNav(to: prevSentence(behind), down: false, extend: extend)     // ⌥←
+        case (124, [.option]):    applyNav(to: nextSentence(ahead), down: true, extend: extend)       // ⌥→
+        // fn+arrow arrives as Home / End (keyCodes 115 / 119) — NOT as a bare arrow. Matching a bare
+        // arrow here was the bug that made plain ← / → jump a paragraph instead of moving one char.
+        case (115, _):  applyNav(to: prevBlock(behind), down: false, extend: extend)   // fn← (Home)  paragraph
+        case (119, _):  applyNav(to: nextBlock(ahead), down: true, extend: extend)     // fn→ (End)   paragraph
+        // Down the document.
+        case (126, [.command]):   headingNav(down: false, extend: extend)             // ⌘↑  heading
+        case (125, [.command]):   headingNav(down: true, extend: extend)              // ⌘↓
         case (126, [.option]):    page(down: false, extend: extend)                   // ⌥↑  page (⇧ selects)
         case (125, [.option]):    page(down: true, extend: extend)                    // ⌥↓  page
-        case (126, [.command]):   blockNav(down: false, extend: extend)               // ⌘↑  paragraph/block
-        case (125, [.command]):   blockNav(down: true, extend: extend)                // ⌘↓
-        case (116, _):            applyNav(to: 0, down: false, extend: extend, scroll: true)       // fn↑ doc start
-        case (121, _):            applyNav(to: length, down: true, extend: extend, scroll: true)   // fn↓ doc end
+        case (116, _):            applyNav(to: 0, down: false, extend: extend)        // fn↑ doc start
+        case (121, _):            applyNav(to: length, down: true, extend: extend)    // fn↓ doc end
         default:                  super.keyDown(with: event)
         }
+    }
+
+    // MARK: - Reading units
+
+    /// Block starts in document order — one per paragraph, heading, list, quote, code card or table
+    /// (a whole table is a SINGLE stop). This is the RENDERED text's real structure via MDAttr.blockId,
+    /// not a guess at where blank lines fell, so it stays right as diagrams and formulas shift offsets.
+    private func blockStarts() -> [Int] {
+        guard let ts = textStorage else { return [0] }
+        var starts: Set<Int> = [0]
+        ts.enumerateAttribute(MDAttr.blockId, in: NSRange(location: 0, length: ts.length)) { v, r, _ in
+            if v != nil { starts.insert(r.location) }
+        }
+        return starts.sorted()
+    }
+    private func prevBlock(_ caret: Int) -> Int { blockStarts().last { $0 < caret } ?? 0 }
+    private func nextBlock(_ caret: Int) -> Int { blockStarts().first { $0 > caret } ?? length }
+
+    /// Sentence navigation stops at every sentence AND every block start, so a heading or list item
+    /// with no period in it is still a stop — without this, ⌥→ leaps over headings (they carry no
+    /// sentence boundary) and the reader skips a line.
+    private func nextSentence(_ caret: Int) -> Int {
+        let s = textStorage?.string ?? ""
+        return min(nav.nextSentenceStart(s, from: caret), nextBlock(caret))
+    }
+    private func prevSentence(_ caret: Int) -> Int {
+        let s = textStorage?.string ?? ""
+        // The nearer of "start of my sentence" and "start of the previous block" — whichever we
+        // reach first going back. Landing on a block start means a heading is never skipped.
+        return max(nav.sentenceStart(s, from: caret), prevBlock(caret))
+    }
+
+    /// Previous / next heading of any level — `#` through `######`, so ⌘↑↓ walks the document's
+    /// own outline.
+    private func headingNav(down: Bool, extend: Bool) {
+        recomputeHeadingOffsets()   // offsets move as diagrams and formulas land; never cache them
+        let sel = selectedRange()
+        let from = down ? sel.location + sel.length : sel.location
+        let offsets = headingOffsets
+        let target = down ? (offsets.first { $0 > from } ?? length)
+                          : (offsets.last { $0 < from } ?? 0)
+        applyNav(to: target, down: down, extend: extend)
     }
 
     private func topVisibleChar() -> Int {
@@ -98,20 +189,17 @@ final class ReaderTextView: NSTextView {
     /// grows to that point.
     private func page(down: Bool, extend: Bool) {
         if down { scrollPageDown(nil) } else { scrollPageUp(nil) }
-        applyNav(to: topVisibleChar(), down: down, extend: extend, scroll: true)
-    }
-
-    /// Jump to the previous/next block start (a whole table is one stop).
-    private func blockNav(down: Bool, extend: Bool) {
-        let sel = selectedRange()
-        let from = down ? sel.location + sel.length : sel.location   // move the LEADING edge
-        let target = down ? nextBlockStart(from) : prevBlockStart(from)
-        applyNav(to: target, down: down, extend: extend, scroll: true)
+        // Snap the caret to the START of the top line, always — the top character can fall mid-line,
+        // which left the caret sometimes at a line's front and sometimes deep inside it. Front every
+        // time. Reveal then nudges the scroll back a couple of lines: that's both the 2–3 line
+        // overlap and what lifts the caret off the clipped top edge so it stays visible.
+        let top = nav.lineStart(textStorage?.string ?? "", from: topVisibleChar())
+        applyNav(to: top, down: down, extend: extend)
     }
 
     /// Move the reading cursor to `t`. With `extend`, keep the trailing edge fixed and stretch the
-    /// selection to `t` (down keeps the start; up keeps the end). Top-anchors the scroll if asked.
-    private func applyNav(to t: Int, down: Bool, extend: Bool, scroll: Bool) {
+    /// selection to `t` (down keeps the start; up keeps the end).
+    private func applyNav(to t: Int, down: Bool, extend: Bool, reveal: Bool = true) {
         let tt = max(0, min(t, length))
         let sel = selectedRange()
         let newSel: NSRange
@@ -122,27 +210,25 @@ final class ReaderTextView: NSTextView {
             newSel = NSRange(location: tt, length: 0)
         }
         setSelectedRange(newSel)
-        // When selecting DOWNWARD, keep the cursor on the 2nd line so the first selected line stays
-        // visible above it (otherwise the whole selection scrolls off the top and looks like nothing).
-        if scroll {
-            (window?.windowController as? DocumentWindowController)?
-                .scrollCharToTop(tt, lineOffset: (down && extend) ? 1 : 0)
-        }
+        if reveal { revealCaret(tt) }
     }
 
-    /// Block starts in document order (each paragraph/list/table/code card is one block, so a
-    /// whole table is a SINGLE stop — ⌘↑/↓ jumps over it rather than cell-by-cell).
-    private func blockStarts() -> [Int] {
-        guard let ts = textStorage else { return [0] }
-        var starts: [Int] = [0]
-        ts.enumerateAttribute(MDAttr.blockId, in: NSRange(location: 0, length: ts.length)) { v, r, _ in
-            if v != nil { starts.append(r.location) }
-        }
-        return Array(Set(starts)).sorted()
+    /// The page holds still and the cursor moves inside it; the page follows only when the cursor
+    /// would leave the screen, and then by the least it can.
+    ///
+    /// This used to top-anchor every move, which is backwards: the cursor sat pinned to the first
+    /// line while the document slid past it, so a one-sentence step re-scrolled the whole view.
+    private func revealCaret(_ char: Int) {
+        guard let lm = layoutManager, let tc = textContainer, lm.numberOfGlyphs > 0 else { return }
+        let glyph = lm.glyphIndexForCharacter(at: max(0, min(char, length)))
+        var r = lm.lineFragmentRect(forGlyphAt: min(glyph, lm.numberOfGlyphs - 1), effectiveRange: nil)
+        r.origin.x += textContainerOrigin.x
+        r.origin.y += textContainerOrigin.y
+        _ = tc
+        // Land with a couple of lines of air rather than flush against an edge.
+        scrollToVisible(r.insetBy(dx: 0, dy: -2 * r.height))
+        (window?.windowController as? DocumentWindowController)?.placeCopyButtons()
     }
-
-    private func prevBlockStart(_ caret: Int) -> Int { blockStarts().last(where: { $0 < caret }) ?? 0 }
-    private func nextBlockStart(_ caret: Int) -> Int { blockStarts().first(where: { $0 > caret }) ?? length }
 
     // MARK: - Context menu (viewer-only)
 
@@ -211,6 +297,7 @@ final class ReaderTextView: NSTextView {
                 return
             }
             let zoomable = ts.attribute(MDAttr.mermaid, at: ci, effectiveRange: nil) != nil
+                        || ts.attribute(MDAttr.math, at: ci, effectiveRange: nil) != nil
                         || ts.attribute(MDAttr.image, at: ci, effectiveRange: nil) != nil
             if zoomable,
                let att = ts.attribute(.attachment, at: ci, effectiveRange: nil) as? NSTextAttachment,

@@ -58,19 +58,21 @@ enum FolderAccess {
         isNeeded && url.isFileURL && !canRead(url)
     }
 
-    /// What to pre-select in the panel: the top-level home folder the document lives in (Documents,
-    /// Desktop or Downloads), not the document's own subfolder. A grant covers everything beneath it,
-    /// so picking ~/Documents once answers every document under it — asking per-subfolder would mean
-    /// a prompt for every project. Anything outside those three (say ~/projects/notes) has no natural
-    /// top level, so its own folder is the sensible default.
-    static func suggestedFolder(for document: URL) -> URL {
+    /// What to pre-select in the panel: the top-level home folder the target lives in (Documents,
+    /// Desktop or Downloads), not its own subfolder. A grant covers everything beneath it, so picking
+    /// ~/Documents once answers every document under it — asking per-subfolder would mean a prompt for
+    /// every project. Anything outside those three (say ~/projects/notes) has no natural top level, so
+    /// the enclosing folder is the sensible default — or the target itself when it already is one.
+    static func suggestedFolder(for target: URL) -> URL {
         let home = URL(fileURLWithPath: NSHomeDirectory())
         // Sandboxed: NSHomeDirectory() is the container, so build the real home from the user name.
         let realHome = isNeeded ? URL(fileURLWithPath: "/Users/\(NSUserName())") : home
         let tops = ["Documents", "Desktop", "Downloads"].map { realHome.appendingPathComponent($0) }
-        let docPath = document.standardizedFileURL.path
-        for top in tops where docPath.hasPrefix(top.path + "/") { return top }
-        return document.deletingLastPathComponent()
+        let path = target.standardizedFileURL.path
+        for top in tops where path.hasPrefix(top.path + "/") { return top }
+        var isDir: ObjCBool = false
+        let exists = FileManager.default.fileExists(atPath: target.path, isDirectory: &isDir)
+        return exists && isDir.boolValue ? target : target.deletingLastPathComponent()
     }
 
     // MARK: - Request
@@ -80,13 +82,14 @@ enum FolderAccess {
     ///
     /// Deliberately user-initiated (they click the placeholder or the menu item): a panel that
     /// appears by itself on open reads as a broken app, and Apple's reviewers see it the same way.
-    static func requestAccess(to folder: URL, in window: NSWindow?, completion: @escaping (Bool) -> Void) {
+    static func requestAccess(to folder: URL, in window: NSWindow?, what: String = "images",
+                              completion: @escaping (Bool) -> Void) {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
         panel.directoryURL = folder
-        panel.message = "Allow Fast Markdown Reader to read images in “\(folder.lastPathComponent)”. "
+        panel.message = "Allow Fast Markdown Reader to read \(what) in “\(folder.lastPathComponent)”. "
                       + "This covers everything inside it — pick a narrower folder if you'd rather."
         panel.prompt = "Allow"
         let handle: (NSApplication.ModalResponse) -> Void = { resp in

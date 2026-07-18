@@ -47,6 +47,10 @@ final class MarkdownDocument: NSDocument {
     /// not pick up a new app build (that still needs a relaunch).
     @objc func reloadDocument(_ sender: Any?) {
         if let url = fileURL, let data = try? Data(contentsOf: url) {
+            // The undo stack holds source OFFSETS into the text we're replacing. Re-reading the file
+            // can move every one of them (the file may have changed behind us), so an undo applied
+            // afterwards would overwrite the wrong span. Drop the history rather than corrupt the file.
+            if data != Data(self.text.utf8) { undoManager?.removeAllActions() }
             self.text = String(decoding: data, as: UTF8.self)
         }
         guard let wc = windowControllers.first as? DocumentWindowController else { return }
@@ -66,10 +70,16 @@ final class MarkdownDocument: NSDocument {
 
     /// Replace a source range with edited markdown, persist to the .md file, and re-render
     /// (keeping scroll position). This is the ONLY path that writes the file — an explicit edit.
+    ///
+    /// Undo runs back through here with the inverse edit, so it persists and re-renders exactly like
+    /// a typed one, and redo falls out for free: the undo manager records the inverse this call
+    /// registers while it is undoing. Registration happens only AFTER the write succeeds — offering
+    /// to undo an edit that never reached the file would be a lie.
     func applySourceEdit(_ r: NSRange, with replacement: String) {
         let ns = text as NSString
         guard r.location >= 0, r.location + r.length <= ns.length else { NSSound.beep(); return }
         let updated = ns.replacingCharacters(in: r, with: replacement)
+        let previous = ns.substring(with: r)
         if let url = fileURL {
             do {
                 try Data(updated.utf8).write(to: url)
@@ -87,10 +97,30 @@ final class MarkdownDocument: NSDocument {
             }
         }
         self.text = updated
+        let undoRange = NSRange(location: r.location, length: (replacement as NSString).length)
+        undoManager?.registerUndo(withTarget: self) { $0.applySourceEdit(undoRange, with: previous) }
+        undoManager?.setActionName("Edit")
         guard let wc = windowControllers.first as? DocumentWindowController else { return }
         let anchor = wc.topVisibleCharIndex()
         render(into: wc)
         wc.scrollCharToTop(anchor)
+    }
+
+    // MARK: - Undo / Redo (⌘Z, ⇧⌘Z)
+
+    /// Own selectors rather than the standard `undo:`/`redo:`: the menu bar is built in code, so
+    /// nothing wires those up for us, and this app's responder chain already reaches the document
+    /// this way (see `reloadDocument:`). SourceEditPanel answers the same two selectors for its own
+    /// typing, so one pair of menu items serves both windows.
+    @objc func undoSourceEdit(_ sender: Any?) { undoManager?.undo() }
+    @objc func redoSourceEdit(_ sender: Any?) { undoManager?.redo() }
+
+    override func validateUserInterfaceItem(_ item: NSValidatedUserInterfaceItem) -> Bool {
+        switch item.action {
+        case #selector(undoSourceEdit(_:)): return undoManager?.canUndo ?? false
+        case #selector(redoSourceEdit(_:)): return undoManager?.canRedo ?? false
+        default: return super.validateUserInterfaceItem(item)
+        }
     }
 
     @objc func increaseReaderFontSize(_ sender: Any?) { FontSizeStore.increase(); reRenderPreservingCaret() }
@@ -142,11 +172,11 @@ final class MarkdownDocument: NSDocument {
     /// there's nothing to render and presizeKnownMedia already reserved exact areas.
     func prerenderAllDiagrams(in wc: DocumentWindowController) {
         guard let storage = wc.textStorageRef else { return }
-        var codes: [String] = []
-        var seen = Set<String>()
-        storage.enumerateAttribute(MDAttr.mermaid, in: NSRange(location: 0, length: storage.length)) { v, _, _ in
-            guard let code = v as? String, seen.insert(code).inserted else { return }
-            if MermaidRenderer.cachedSize(source: code) == nil { codes.append(code) }
+        var codes: [WebBlock] = []
+        var seen = Set<WebBlock>()
+        storage.enumerateWebBlocks { block, _ in
+            guard seen.insert(block).inserted else { return }
+            if WebBlockRenderer.cachedSize(block) == nil { codes.append(block) }
         }
         guard !codes.isEmpty else { return }   // all cached → already presized to exact areas
         isPrerendering = true
@@ -154,15 +184,15 @@ final class MarkdownDocument: NSDocument {
         let token = prerenderToken
         let gen = renderGeneration
         Task { @MainActor in
-            // A few diagrams render at once (each on its OWN MermaidRenderer so their web views
+            // A few blocks render at once (each on its OWN WebBlockRenderer so their web views
             // don't collide); a small cap keeps the transient WebKit memory modest.
             let cap = min(3, codes.count)
             var next = 0
             await withTaskGroup(of: Void.self) { group in
                 func pump() {
                     guard next < codes.count else { return }
-                    let code = codes[next]; next += 1
-                    group.addTask { @MainActor in _ = await MermaidRenderer().prerenderToCache(source: code) }
+                    let block = codes[next]; next += 1
+                    group.addTask { @MainActor in _ = await WebBlockRenderer().prerenderToCache(block) }
                 }
                 for _ in 0..<cap { pump() }
                 while await group.next() != nil {
@@ -200,6 +230,15 @@ final class MarkdownDocument: NSDocument {
             targetW = min(CGFloat(pts), colW)
         } else if size.width > colW {
             targetW = colW
+        } else if storage.attribute(MDAttr.mermaid, at: range.location, effectiveRange: nil) != nil,
+                  size.width < colW * 0.5 {
+            // A diagram's natural width is a mermaid layout artefact, not a size anyone chose: a
+            // three-box graph comes out tiny and unreadable beside full-width text. Floor it at half
+            // the column. It's vector art, so enlarging costs no sharpness.
+            //
+            // Diagrams ONLY. An image's size IS authored (a 16px icon must stay a 16px icon), and a
+            // short formula stretched to half the page would look absurd.
+            targetW = colW * 0.5
         }
         if let targetW {
             let s = targetW / size.width
@@ -228,8 +267,8 @@ final class MarkdownDocument: NSDocument {
                 sets.append((px, r))
             }
         }
-        storage.enumerateAttribute(MDAttr.mermaid, in: whole) { v, r, _ in
-            guard let code = v as? String, let sz = MermaidRenderer.cachedSize(source: code) else { return }
+        storage.enumerateWebBlocks(in: whole) { block, r in
+            guard let sz = WebBlockRenderer.cachedSize(block) else { return }
             sets.append((sz, r))
         }
         for (px, r) in sets {
@@ -290,7 +329,7 @@ final class MarkdownDocument: NSDocument {
         }
 
         // Collect first (don't mutate storage while enumerating its attributes).
-        var purge: [NSRange] = [], imgLoad: [(String, NSRange)] = [], mmLoad: [(String, NSRange)] = []
+        var purge: [NSRange] = [], imgLoad: [(String, NSRange)] = [], mmLoad: [(WebBlock, NSRange)] = []
         storage.enumerateAttribute(MDAttr.image, in: whole) { v, r, _ in
             guard let src = v as? String, !src.isEmpty, let att = attach(r) else { return }
             if onScreen(r) {
@@ -304,15 +343,15 @@ final class MarkdownDocument: NSDocument {
             }
             else if att.image != nil { purge.append(r) }
         }
-        storage.enumerateAttribute(MDAttr.mermaid, in: whole) { v, r, _ in
-            guard let code = v as? String, let att = attach(r) else { return }
+        storage.enumerateWebBlocks(in: whole) { block, r in
+            guard let att = attach(r) else { return }
             if onScreen(r) {
                 guard att.image == nil else { return }
-                // During the up-front pass an uncached diagram has no exact size yet — loading it
+                // During the up-front pass an uncached block has no exact size yet — loading it
                 // now would resize the layout under the reader. Wait for the pass to size it; a
                 // cached one is already exact, so it's safe to fill.
-                if self.isPrerendering && MermaidRenderer.cachedSize(source: code) == nil { return }
-                mmLoad.append((code, r))
+                if self.isPrerendering && WebBlockRenderer.cachedSize(block) == nil { return }
+                mmLoad.append((block, r))
             }
             else if att.image != nil { purge.append(r) }
         }
@@ -338,10 +377,10 @@ final class MarkdownDocument: NSDocument {
             } else { load(nil, r) }
         }
         if !mmLoad.isEmpty {
-            let renderer = MermaidRenderer()   // cache-first: reloads hit the disk cache, no WebKit
+            let renderer = WebBlockRenderer()   // cache-first: reloads hit the disk cache, no WebKit
             Task { @MainActor in
-                for (code, r) in mmLoad {
-                    guard let img = await renderer.renderImage(source: code) else { continue }
+                for (block, r) in mmLoad {
+                    guard let img = await renderer.renderImage(block) else { continue }
                     load(img, r)
                 }
             }

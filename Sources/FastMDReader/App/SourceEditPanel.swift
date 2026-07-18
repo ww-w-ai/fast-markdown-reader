@@ -37,6 +37,7 @@ final class SourceEditPanel: NSWindowController, NSWindowDelegate {
         editor.frame = scroll.bounds
         editor.autoresizingMask = [.width]
         editor.isRichText = false
+        editor.allowsUndo = true
         editor.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
         editor.isAutomaticQuoteSubstitutionEnabled = false
         editor.isAutomaticDashSubstitutionEnabled = false
@@ -71,4 +72,23 @@ final class SourceEditPanel: NSWindowController, NSWindowDelegate {
     @objc private func saveTapped() { onSave(editor.string); close() }
     @objc private func cancelTapped() { close() }
     func windowWillClose(_ notification: Notification) { Self.open.removeAll { $0 === self } }
+
+    // MARK: - Undo / Redo while typing here
+
+    /// The Edit menu's ⌘Z is bound to the document's `undoSourceEdit:`, and a menu key equivalent is
+    /// matched before the panel's editor ever sees the keystroke. So the panel answers the same
+    /// selectors and hands them to the editor's own undo manager — ⌘Z means "undo my typing" here and
+    /// "undo my last saved edit" in the document, which is what each window makes the user expect.
+    @objc func undoSourceEdit(_ sender: Any?) { editor.undoManager?.undo() }
+    @objc func redoSourceEdit(_ sender: Any?) { editor.undoManager?.redo() }
+}
+
+extension SourceEditPanel: NSMenuItemValidation {
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        switch item.action {
+        case #selector(undoSourceEdit(_:)): return editor.undoManager?.canUndo ?? false
+        case #selector(redoSourceEdit(_:)): return editor.undoManager?.canRedo ?? false
+        default: return true
+        }
+    }
 }

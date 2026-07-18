@@ -26,6 +26,16 @@ enum MarkdownRenderer {
     private static let linkDetector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
     private static let filePathRE = try? NSRegularExpression(pattern: "(?<=\\s|^)(?:~|\\.{1,2})?/[\\w.\\-/@+]+")
 
+    /// Code is shown, not offered as navigation — nothing inside a fence or a `code span` is
+    /// autolinked. Three reasons, and the first is the one you can see: link styling is painted
+    /// AFTER highlighting, so a URL in a string turns blue-underlined and the syntax colour dies
+    /// right there. Selecting code is also common, and a link answers a click by leaving the app.
+    /// GitHub draws the same line. (Explicit markdown links are untouched — those were asked for.)
+    private static func isCode(_ s: NSAttributedString, _ at: Int) -> Bool {
+        s.attribute(MDAttr.codeBlock, at: at, effectiveRange: nil) != nil ||
+        s.attribute(MDAttr.inlineCode, at: at, effectiveRange: nil) != nil
+    }
+
     private static func autolink(_ s: NSMutableAttributedString) {
         let full = NSRange(location: 0, length: s.length)
         let str = s.string
@@ -34,7 +44,7 @@ enum MarkdownRenderer {
 
         if let det = linkDetector {
             det.enumerateMatches(in: str, range: full) { m, _, _ in
-                guard let m, let url = m.url,
+                guard let m, let url = m.url, !isCode(s, m.range.location),
                       s.attribute(.link, at: m.range.location, effectiveRange: nil) == nil else { return }
                 s.addAttribute(.link, value: url, range: m.range)
                 s.addAttributes(linkAttrs, range: m.range)
@@ -43,10 +53,15 @@ enum MarkdownRenderer {
         // File paths: absolute (/…, ~/…) or explicit relative (./… ../…), only at a word
         // boundary so mid-word slashes ("and/or") are never matched. The raw path is stored;
         // the link handler resolves it against the document's directory.
+        //
+        // In code this pattern is also plain WRONG, not just unwanted: ` // comment` is a space then
+        // slashes, so every C-style comment became a folder shortcut that opened Finder (Dockerfile
+        // `COPY /src /usr/local/bin` too).
         if let re = filePathRE {
             let trailing = CharacterSet(charactersIn: ".,;:!?)")
             re.enumerateMatches(in: str, range: full) { m, _, _ in
-                guard let m, s.attribute(.link, at: m.range.location, effectiveRange: nil) == nil else { return }
+                guard let m, !isCode(s, m.range.location),
+                      s.attribute(.link, at: m.range.location, effectiveRange: nil) == nil else { return }
                 var range = m.range
                 // Drop trailing sentence punctuation the greedy match swallowed ("./x.md." → "./x.md").
                 let ns = str as NSString
@@ -89,6 +104,8 @@ private struct AttributedBuilder: MarkupWalker {
     private let imagePS: NSParagraphStyle   // no max line height, so the line grows to fit an image
     private let source: String              // original markdown, for block→source mapping
     private let lineStarts: [Int]           // UTF-16 offset of each source line start
+    private let mathSpans: [(range: NSRange, tex: String)]
+    private var emittedMath = Set<Int>()    // span starts already turned into a formula
 
     init(theme: RenderTheme, source: String) {
         self.theme = theme
@@ -97,6 +114,7 @@ private struct AttributedBuilder: MarkupWalker {
         let sns = source as NSString
         for i in 0..<sns.length where sns.character(at: i) == 10 { ls.append(i + 1) }
         self.lineStarts = ls
+        self.mathSpans = AttributedBuilder.scanMathSpans(source, lineStarts: ls)
         let b = theme.baseFontSize
         // All spacing is derived from the base font size with ABSOLUTE line heights, so it
         // scales with ⌘+/− and reads consistently. Within-paragraph leading is tight (1.45×);
@@ -125,10 +143,14 @@ private struct AttributedBuilder: MarkupWalker {
     /// gutter click can recover this exact block's range. Headings get their own id, cleanly
     /// separated from the paragraph beneath them.
     private mutating func tagBlock(from start: Int, src srcRange: SourceRange? = nil) {
+        tagBlock(from: start, srcOffsets: sourceOffsets(srcRange))
+    }
+
+    private mutating func tagBlock(from start: Int, srcOffsets: NSRange?) {
         let r = NSRange(location: start, length: result.length - start)
         guard r.length > 0 else { return }
         result.addAttribute(MDAttr.blockId, value: blockSeq, range: r)
-        if let so = sourceOffsets(srcRange) {
+        if let so = srcOffsets {
             result.addAttribute(MDAttr.srcRange, value: NSValue(range: so), range: r)
         }
         blockSeq += 1
@@ -331,6 +353,87 @@ private struct AttributedBuilder: MarkupWalker {
         tagBlock(from: start, src: heading.range)
     }
 
+    /// Find every `$$ … $$` span in the RAW source, before markdown ever sees it.
+    ///
+    /// `$$` is not markdown, so the parser reads a formula's insides as markdown and mangles them:
+    /// a lone `=` line under a matrix makes the line above a setext HEADING, `_` becomes emphasis,
+    /// `*` opens a list. By the time we hold the tree the formula is shredded across several nodes,
+    /// and no node-level test can put it back together — claiming the span from the source first is
+    /// the only order that works. (Measured: `\begin{pmatrix} … \\ = \\ … \end{pmatrix}` arrived as
+    /// a heading plus a paragraph, and rendered as a giant title.)
+    private static func scanMathSpans(_ source: String, lineStarts: [Int]) -> [(range: NSRange, tex: String)] {
+        let ns = source as NSString
+        var out: [(range: NSRange, tex: String)] = []
+        var openLine: Int?
+        for i in 0..<lineStarts.count {
+            let start = lineStarts[i]
+            let end = (i + 1 < lineStarts.count) ? lineStarts[i + 1] - 1 : ns.length
+            guard end >= start else { continue }
+            let line = ns.substring(with: NSRange(location: start, length: end - start))
+                .trimmingCharacters(in: .whitespaces)
+            if let open = openLine {                       // inside a fence: look for its close
+                guard line == "$$" else { continue }
+                let from = lineStarts[open]
+                let texStart = lineStarts[open + 1]
+                let tex = ns.substring(with: NSRange(location: texStart, length: max(0, start - texStart)))
+                out.append((NSRange(location: from, length: end - from),
+                            tex.trimmingCharacters(in: .whitespacesAndNewlines)))
+                openLine = nil
+                continue
+            }
+            if line == "$$" {
+                if i + 1 < lineStarts.count { openLine = i }   // an unterminated `$$` stays plain text
+                continue
+            }
+            // One-liner: `$$ x = 1 $$`. Two formulas on one line are left to the text path rather
+            // than merged into one bogus render.
+            if line.hasPrefix("$$"), line.hasSuffix("$$"), line.count > 4 {
+                let inner = String(line.dropFirst(2).dropLast(2))
+                guard !inner.contains("$$") else { continue }
+                out.append((NSRange(location: start, length: end - start),
+                            inner.trimmingCharacters(in: .whitespacesAndNewlines)))
+            }
+        }
+        return out.filter { !$0.tex.isEmpty }
+    }
+
+    /// The span this block was made from, if the block lies ENTIRELY inside one. Containment, not
+    /// overlap: the Document (and any list/quote wrapping a formula) merely overlaps, so it keeps
+    /// descending until it reaches the nodes the formula itself produced.
+    private func mathSpan(containing r: NSRange) -> (range: NSRange, tex: String)? {
+        mathSpans.first { $0.range.location <= r.location &&
+                          r.location + r.length <= $0.range.location + $0.range.length }
+    }
+
+    /// Every block goes through here, so a formula is caught wherever the parser put its pieces —
+    /// top level, or nested in a list or quote.
+    mutating func visit(_ markup: Markup) {
+        if let so = sourceOffsets(markup.range), let span = mathSpan(containing: so) {
+            // All the nodes of one span collapse into a single formula; emit on the first, drop the
+            // rest, and never descend into them — they're fragments of TeX, not text.
+            if emittedMath.insert(span.range.location).inserted {
+                appendWebBlock(.math, code: span.tex, srcOffsets: span.range, size: NSSize(width: 260, height: 60))
+            }
+            return
+        }
+        markup.accept(&self)
+    }
+
+    /// The placeholder for a block WebKit will draw later (mermaid diagram, TeX formula). A real
+    /// attachment from the start, so the lazy media manager treats it exactly like an image (load
+    /// when on-screen, drop when far) and the size/pixel split holds. The reserved size here is only
+    /// a guess; the up-front measure pass replaces it with the exact one before layout.
+    mutating func appendWebBlock(_ engine: WebBlock.Engine, code: String, srcOffsets: NSRange?, size: NSSize) {
+        let blockStart = result.length
+        let att = NSTextAttachment()
+        att.bounds = NSRect(origin: .zero, size: size)
+        att.attachmentCell = SizedAttachmentCell(reservedSize: size)   // owns size when image==nil
+        let ph = NSMutableAttributedString(attachment: att)
+        ph.addAttribute(engine.attribute, value: code, range: NSRange(location: 0, length: ph.length))
+        result.append(ph); newline(2)
+        tagBlock(from: blockStart, srcOffsets: srcOffsets)
+    }
+
     mutating func visitParagraph(_ paragraph: Paragraph) {
         let start = result.length
         result.append(inlineString(paragraph, font: theme.bodyFont, color: theme.textColor))
@@ -466,21 +569,20 @@ private struct AttributedBuilder: MarkupWalker {
 
     mutating func visitCodeBlock(_ codeBlock: CodeBlock) {
         let blockStart = result.length
-        // mermaid handled in Task 5; here treat everything else as a highlighted block.
-        if (codeBlock.language ?? "").lowercased() == "mermaid" {
-            // Empty attachment holding a PLACEHOLDER area (real size applied on first load, when the
-            // document layer renders it). It's a real attachment from the start so the lazy media
-            // manager treats it exactly like an image (load when on-screen, drop when far).
-            let att = NSTextAttachment()
-            let phSize = NSSize(width: 480, height: 360)   // approx; exact size set at pre-measure
-            att.bounds = NSRect(origin: .zero, size: phSize)
-            att.attachmentCell = SizedAttachmentCell(reservedSize: phSize)   // owns size when image==nil
-            let ph = NSMutableAttributedString(attachment: att)
-            ph.addAttribute(MDAttr.mermaid, value: codeBlock.code,
-                            range: NSRange(location: 0, length: ph.length))
-            result.append(ph); newline(2)
-            tagBlock(from: blockStart, src: codeBlock.range)
+        // Fences WebKit draws instead of highlighting; everything else is a highlighted code card.
+        switch (codeBlock.language ?? "").lowercased() {
+        case "mermaid":
+            appendWebBlock(.mermaid, code: codeBlock.code, srcOffsets: sourceOffsets(codeBlock.range),
+                           size: NSSize(width: 480, height: 360))
             return
+        case "math", "tex", "latex":
+            // GitHub's ```math fence. A fence's content is verbatim, so unlike `$$…$$` there's no
+            // emphasis to dodge — the parser hands over exactly what was typed.
+            appendWebBlock(.math, code: codeBlock.code, srcOffsets: sourceOffsets(codeBlock.range),
+                           size: NSSize(width: 260, height: 60))
+            return
+        default:
+            break
         }
         // Card look: padding inside (head/tail indent) and gaps outside (paragraph spacing).
         // No flat .backgroundColor — CodeCardLayoutManager draws the rounded card backdrop.

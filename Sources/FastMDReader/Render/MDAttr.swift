@@ -12,6 +12,9 @@ enum MDAttr {
     static let codeLang = NSAttributedString.Key("mdCodeLang")
     /// Value = the mermaid diagram source (the document layer swaps it for a PDF attachment).
     static let mermaid = NSAttributedString.Key("mdMermaid")
+    /// Value = the TeX source of a display formula. Same deal as `mermaid`, drawn by a different
+    /// engine — see `WebBlock`, which is what the document layer actually iterates.
+    static let math = NSAttributedString.Key("mdMath")
     /// Value = the heading level (Int); scanned live to recompute heading jump offsets.
     static let heading = NSAttributedString.Key("mdHeading")
     /// Value = a per-block sequence Int. Every top-level block (paragraph, list, quote,
