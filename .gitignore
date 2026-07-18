@@ -5,5 +5,8 @@
 DerivedData/
 .DS_Store
 .bkit/
-# AI collaboration logs: kept locally, not published — they quote internal discussion verbatim.
-docs/commit-log/
+# Local-only, never published: the AI collaboration logs quote internal discussion verbatim, and the
+# distribution playbooks carry release detail we don't hand out. CLAUDE.md has claimed docs/ was
+# ignored since the repo went public, but only commit-log/ ever was — the rest was merely untracked,
+# which is one `git add .` away from being public. Ignore the folder, as documented.
+docs/

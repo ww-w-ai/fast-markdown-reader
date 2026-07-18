@@ -9,8 +9,8 @@ why memory climbs the longer you leave them running. This one is pure Swift/AppK
 **0% idle CPU**, **~127 MB held flat across 9 large documents opened back to back**, and **~52 MB
 reclaimed** when they close. No timers, no polling, no background web process.
 
-It is the only native Mac Markdown viewer that renders **mermaid diagrams with the engine bundled
-in the app** — offline, cached once as a vector PDF, and never re-rendered
+It is the only native Mac Markdown viewer that renders **mermaid diagrams and TeX formulas with both
+engines bundled in the app** — offline, each one cached once as a vector PDF and never re-rendered
 ([`MermaidCache.swift`](Sources/FastMDReader/Cache/MermaidCache.swift)). Images and diagrams
 outside the viewport **release their pixels but keep their exact height**, so memory stays flat and
 the scrollbar never jumps
@@ -27,8 +27,9 @@ the typo, keep reading; no editor, no mode switch.
 | Memory | **flat under use** — ~127 MB across 9 large docs, ~52 MB reclaimed on close |
 | Long docs | Non-contiguous layout renders only the viewport — a **4,000-paragraph** file opens instantly |
 | Diagrams | **mermaid bundled** — renders offline, cached as vector PDF, never re-rendered |
+| Math | **KaTeX bundled** — `$$…$$` and ```` ```math ```` render offline, vector, cached the same way |
 | Images | Off-screen pixels freed, exact height kept — **no reflow, no scrollbar jitter** |
-| Code | Native syntax highlighting, per-block **Copy** and **Wrap** |
+| Code | **34 languages** highlighted natively — one-pass scanner, no JS, per-block **Copy** and **Wrap** |
 | Editing | Reader first — but right-click any block → **Edit** fixes its Markdown source in place |
 
 ## Diagrams render offline, once
@@ -49,13 +50,40 @@ headers, cached PDFs, and remote images via a range request), so the page is lai
 
 ![images and rich Markdown](assets/screenshots/images.png)
 
+## Formulas, drawn once and cached forever
+
+Math ships the same way diagrams do: KaTeX is **inside the app**, fonts and all, so `$$…$$` (and
+GitHub's ```` ```math ```` fence) render with no internet. Each formula is drawn a single time to a
+vector PDF and reused forever — zoom as far as you like, it stays sharp.
+
+Reading the TeX from the source, not the parsed text, is what makes it correct: Markdown claims `_`
+and `^` as emphasis, so `$$a_1^2$$` would otherwise come back as *a12* — wrong maths, which is worse
+than none ([`MarkdownRenderer.swift`](Sources/FastMDReader/Render/MarkdownRenderer.swift)).
+
 ## Code blocks are real cards
 
 ![code cards and tables](assets/screenshots/code.png)
 
-Fenced blocks render as rounded cards with a language label, native highlighting (swift, js/ts,
-python, bash, json), a **Copy** button, and a **Wrap** toggle — no JavaScript involved. Tables,
-task lists, footnotes and strikethrough come from CommonMark + GFM.
+Fenced blocks render as rounded cards with a language label, a **Copy** button and a **Wrap** toggle
+— no JavaScript involved. **34 languages** are highlighted natively, under the names people actually
+type (`yml`, `golang`, `c++`, `c#`, `sh`, `postgres`, `tsx`, `patch`…):
+
+> swift · js · ts · go · rust · java · kotlin · c · c++ · c# · scala · dart · php · objc · python ·
+> ruby · perl · lua · r · elixir · haskell · bash · powershell · dockerfile · makefile · json · yaml ·
+> toml · ini · sql · html · xml · css · diff
+
+The highlighter is a single left-to-right scanner, not a stack of regexes painting over each other
+([`CodeHighlighter.swift`](Sources/FastMDReader/Render/CodeHighlighter.swift)). That's what keeps a
+URL's `//` inside a string from turning the rest of the line into a comment — the bug you've seen in
+every editor that gets it wrong. Tables, task lists, footnotes and strikethrough come from
+CommonMark + GFM.
+
+## Try it on real documents
+
+The [`demo/`](demo/) folder has four documents, each one a case that makes readers stumble:
+[34 languages in code blocks](demo/code-blocks.md), [formulas](demo/math.md), [twelve
+photographs of differing heights](demo/images.md), and [the whole of *Moby-Dick*](demo/moby-dick.md) — 213,000 words in one
+file, which should open the instant you double-click it.
 
 ## Install
 
@@ -99,27 +127,36 @@ asks and no "Documents folder" entitlement exists. So the store build asks once,
 remembers it; the direct build simply reads them. `SANDBOX=1 ./Scripts/make-app.sh` builds the
 sandboxed shape locally.
 
-## Keyboard (reading cursor)
+## Keyboard and mouse
 
-Navigation **selects the unit it moves to**, so ⌘C copies it immediately. No Shift is used (Shift
-stays free for system selection), and the keys avoid conflicts with standard macOS shortcuts.
+The reading cursor moves in whole units — line, sentence, paragraph, heading — and the modifier's
+position sets the jump size: farther left is bigger (**fn › ⌥ › ⌘**). Hold **⇧** and the same move
+becomes a selection, so ⌘C grabs exactly what you just crossed.
 
-| Key | Action (and what gets selected) |
+| Key | Moves the cursor to… |
 |---|---|
-| **⌥← / ⌥→** | Previous / next **sentence** (selects it) |
-| **⌥↑ / ⌥↓** | Previous / next **paragraph** (selects it) |
-| **⌘← / ⌘→** | Start / end of the current **line** (selects the line) |
-| **[ / ]** | Previous / next **heading** (selects the whole subsection) |
-| **click** (no drag) | Selects the **sentence** under the cursor |
-| **number then Enter** | Jump to the Nth heading |
+| **⌘← / ⌘→** | Start / end of the line |
+| **⌥← / ⌥→** | Previous / next sentence |
+| **fn← / fn→** | Previous / next paragraph (a heading, list, code block or table is one stop) |
+| **⌘↑ / ⌘↓** | Previous / next heading |
+| **⌥↑ / ⌥↓** | Page up / down (a few lines overlap so you keep your place) |
+| **fn↑ / fn↓** | Start / end of the document |
+| **⇧ + any of the above** | The same move, selecting everything it crosses |
 | **Space / ⇧Space** | Page down / up |
-| **⌘↑ / ⌘↓** | Document start / end |
 | **⌘F** | Find in document |
-| **⌘+ / ⌘−** | Font size (persists to the next launch) |
-| **↑ / ↓** | Scroll one line |
+| **⌘+ / ⌘− / ⌘0** | Font size (persists to the next launch) / actual size |
 
-Page / number-jump / document-ends move without selecting. Mouse drag-selection and copy work as
-usual. Click any diagram or image to open it in a zoomable window (pinch, `+`/`−`, `0` to fit).
+Mouse:
+
+| Action | What it does |
+|---|---|
+| **Click the left margin** beside a block | Selects that whole block and copies it — a heading takes its entire section, a code block its raw source |
+| **Click a diagram, formula or image** | Opens it enlarged in a zoomable window (pinch, `+`/`−`, `0` to fit) |
+| **Select text, then ⌘-click it** | Opens it — a file path, a URL, or a bare domain |
+| **Drag** | Ordinary text selection, as anywhere on the Mac |
+
+The page holds still and the cursor moves inside it — the view scrolls only when the cursor would
+leave the screen, and then by the least it can.
 
 **Fix a typo without leaving:** right-click a block → **Edit** opens just that block's Markdown
 source; **⌘↵** writes it back to the file, **esc** discards. That is the only action that ever

@@ -1,13 +1,15 @@
 # fast-md-reader — dev notes (read before continuing)
 
-Native macOS Markdown **viewer** (read-only). Pure Swift/AppKit + TextKit, SwiftPM executable.
-No web runtime for text; mermaid is the only WebKit user and only on a cache miss.
+Native macOS Markdown **viewer** (reader-first; the only write path is right-click → Edit a block).
+Pure Swift/AppKit + TextKit, SwiftPM executable. No web runtime for text. WebKit renders only two
+things — mermaid diagrams and TeX/KaTeX formulas — and only on a cache miss; both cache to vector PDF.
+Code highlighting is native (34 languages, single-pass scanner), no JS.
 
 ## Build / test / run
 
 - **Build app**: `./Scripts/make-app.sh [debug|release]` → `FastMDReader.app` in repo root (ad-hoc signed).
 - **Toolchain (MUST)**: standalone Command Line Tools has a mismatched SwiftPM ManifestAPI → `swift build` breaks. Always use Xcode's toolchain. `make-app.sh` auto-sets `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer` if unset.
-- **Tests**: `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` (34 tests, keep green).
+- **Tests**: `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` (48 tests, keep green).
 - **Deploy for local use**: the running app lives at `/Applications/FastMDReader.app`. `make-app.sh` builds in the repo dir → you must `cp -R FastMDReader.app /Applications/` and relaunch.
 - **Quit cleanly, never `pkill`**: `osascript -e 'tell application "FastMDReader" to quit'`. Force-kill loses recent-docs persistence and can leave state inconsistent.
 - **⌘R (Reload)** reloads the *document* content only — it does NOT pick up a new app build. A code change needs rebuild + relaunch.
@@ -16,17 +18,20 @@ No web runtime for text; mermaid is the only WebKit user and only on a cache mis
 
 - `App/AppDelegate.swift` — menu bar built **in code** (no MainMenu.nib). Any standard shortcut or menu must be added here.
 - `App/MarkdownDocument.swift` — `NSDocument`; render pipeline, presize + prerender, lazy media reconcile.
-- `App/DocumentWindowController.swift` — text view, scroll, tabs, find, source-edit panel.
-- `Render/MarkdownRenderer.swift` — CommonMark/GFM → `NSAttributedString`. `Render/MermaidRenderer.swift` — WebKit → cached PDF. `Render/CodeHighlighter.swift`.
-- `Cache/MermaidCache.swift` — content-addressed disk cache.
-- `Resources/Info.plist` — bundle config. `Scripts/make-app.sh` — build+bundle+ad-hoc sign.
+- `App/DocumentWindowController.swift` — text view, scroll, tabs, find, source-edit panel, keyboard nav, reading-line highlight.
+- `Navigation/ReaderTextView.swift` — the reading cursor: key handling, unit navigation, gutter-click block select, reading-line band. `Navigation/TextNavigator.swift` — pure line/sentence/paragraph boundary math (no view).
+- `Render/MarkdownRenderer.swift` — CommonMark/GFM → `NSAttributedString`; also detects mermaid, ```` ```math ```` and `$$…$$` and turns them into web-block placeholders.
+- `Render/WebBlock.swift` — the ONE place that knows there are two WebKit engines (`.mermaid`, `.math`); every measure/presize/reconcile pass iterates `enumerateWebBlocks`. `Render/WebBlockRenderer.swift` — WebKit → cached vector PDF, shared by both.
+- `Render/CodeHighlighter.swift` — single-pass native highlighter, 34 languages + aliases.
+- `Cache/MermaidCache.swift` — content-addressed disk cache, keyed by (source + engine version) so the two engines never collide.
+- `Resources/mermaid.min.js`, `Resources/katex.min.js`, `Resources/katex-inlined.min.css` (KaTeX fonts inlined as data: URIs — regenerate with `Scripts/build-katex-css.sh`). `Resources/Info.plist` — bundle config. `Scripts/make-app.sh` — build+bundle+ad-hoc sign.
 
 ## Hard-won invariants (DON'T regress)
 
 1. **Scrollbar stability = decouple media SIZE from PIXELS.** An `NSTextAttachment` with `image==nil` (not-yet-loaded / purged) collapses to ~0 height → total height and the scrollbar swing on scroll. Fix in place: `SizedAttachmentCell` owns `reservedSize` independent of the image. Loading/purging pixels must **redraw only, never touch layout** (`redrawGlyphs`) — if size is unchanged, do NOT call `storage.edited`/`ensureLayout`. This cost **4 debugging rounds**; keep the size/pixel split intact.
-2. **Uncached docs must behave like cached ones.** On first open, `prerenderAllDiagrams` renders every uncached diagram to the disk cache (bounded concurrency, `cap=min(3,…)`), then `presizeKnownMedia` reserves each exact area and lays out **once**. After that, sizes never change on scroll.
+2. **Uncached docs must behave like cached ones.** On first open, `prerenderAllDiagrams` renders every uncached web block — diagram OR formula — to the disk cache (bounded concurrency, `cap=min(3,…)`), then `presizeKnownMedia` reserves each exact area and lays out **once**. After that, sizes never change on scroll. Both engines ride this one pipeline via `WebBlock`; giving formulas their own path would mean re-earning this property (and getting it wrong = formulas resizing mid-scroll).
 3. **`invalidateDisplay` alone does NOT draw a newly-set attachment image** — you need `storage.edited(.editedAttributes, …)`. (Learned the hard way when diagrams went invisible.)
-4. **Mermaid cache lives in `FileManager.default.temporaryDirectory/fast-md-reader/mermaid`**, NOT `~/Library/Caches`. The app is sandboxed, so that resolves INSIDE the container — `~/Library/Containers/ai.ww-w.fast-md-reader/Data/tmp/fast-md-reader/mermaid`, **not** the `$TMPDIR` your shell sees. When testing "uncached cold start", clear the CONTAINER path; clearing the shell's `$TMPDIR` copy looks like it worked and proves nothing.
+4. **The web-block cache lives in `FileManager.default.temporaryDirectory/fast-md-reader/mermaid`** (the dir name is historical; it holds BOTH mermaid and KaTeX PDFs now, disambiguated by the engine's `cacheVersion` in the key), NOT `~/Library/Caches`. The app is sandboxed, so that resolves INSIDE the container — `~/Library/Containers/ai.ww-w.fast-md-reader/Data/tmp/fast-md-reader/mermaid`, **not** the `$TMPDIR` your shell sees. When testing "uncached cold start", clear the CONTAINER path; clearing the shell's `$TMPDIR` copy looks like it worked and proves nothing. Bump the engine's `cacheVersion` (in `WebBlock`) when its capture changes — a stale PDF outlives the bug that made it.
 5. **Fresh-DB/fresh-open tests are fake-green for the cache/migration class** — they create the target state directly and skip the render path. Cold-start behavior must be tested by actually clearing the mermaid cache dir and relaunching.
 6. **NSDocumentClass in Info.plist must be module-qualified**: `FastMDReader.MarkdownDocument` (a SwiftPM executable, so NSDocumentController can't find a bare class name).
 7. **Open Recent**: AppKit's automatic population does NOT attach to a code-built menu → it's populated manually via a menu delegate in `AppDelegate` reading `recentDocumentURLs`. macOS prunes deleted files from the list (a deleted test file → correctly shows "No Recent Files").
@@ -35,6 +40,10 @@ No web runtime for text; mermaid is the only WebKit user and only on a cache mis
 9. **Sandboxed = a document's sibling images are unreadable, and macOS NEVER prompts.** Measured, not assumed: relative, absolute, and `file://` paths all fail sandboxed while remote URLs load; the same binary unsandboxed loads them all. The sandbox denies before TCC is consulted, so no prompt appears, and there is no "Documents folder" entitlement to request (iMovie's Documents/Desktop/Downloads toggles come from its *media* entitlements — not a route we have). Granting Full Disk Access does nothing: the sandbox still refuses. The only way through is `FolderAccess` — user picks the folder in an open panel, persisted as a security-scoped bookmark (what Marked 2 / iA Writer / MWeb do; Typora / Obsidian / IntelliJ skip the store instead). **Don't re-litigate this; four plausible theories (temp path, ad-hoc signature, TCC identity, launch method) were each disproved.**
 10. **A blocked image's placeholder is itself an image**, so its click check MUST come before the zoom check in `ReaderTextView.mouseDown` — otherwise clicking "Click to allow…" just enlarges that label.
 11. **Remote images are presized by fetching only their header** (`Range: bytes=0-65535` → ImageIO), mirroring `prerenderAllDiagrams`: measure everything, then lay out ONCE. Never "reserve a guess and correct it later" — that reflows under the reader, which invariant 1 exists to prevent.
+12. **Math is read from the SOURCE, never the parsed text.** `MarkdownRenderer.scanMathSpans` finds `$$…$$` in the raw markdown before the parser touches it. Two reasons: (a) markdown claims `_`/`^` as emphasis, so `$$a_1^2$$` parses to *a12* — silently wrong maths; (b) a `\\`-then-`=` line inside a matrix is read as a setext heading, so the parser shreds one formula across several nodes. A block is turned into a formula only if it lies ENTIRELY inside a scanned span. ```` ```math ```` fences are verbatim, so they skip the dance.
+13. **KaTeX fonts are inlined as data: URIs in `katex-inlined.min.css`.** The render page loads with `baseURL: nil`, so a relative `url(fonts/…)` resolves to nothing and every glyph silently falls back to a system font at the wrong metrics. Inlining removes the resolution step. Snapshot only after `document.fonts.ready` — KaTeX lays out synchronously but the fonts arrive async, and snapshotting early bakes fallback metrics into the cached PDF forever. **The fonts are OFL-1.1, separate from KaTeX's MIT code** — `licenses/KaTeX-fonts-OFL-1.1.txt` + notice in `THIRD-PARTY-NOTICES.md` are required, and `make-app.sh` copies both into the bundle (the licence must travel with the fonts).
+14. **The reading-line band repaints the whole visible rect on every selection change** (`setSelectedRange` override → `setNeedsDisplay(visibleRect)`). A bare caret move only invalidates the thin caret sliver, so the band would smear — lit on the old line, dark on the new. Drawn in `drawBackground` beneath glyphs, and only when the selection is empty (an active selection is its own stronger highlight).
+15. **Keyboard nav: fn+arrow arrives as Home/End/PageUp/PageDown (keyCodes 115/119/116/121), NOT as a bare arrow.** Matching a bare arrow (123/124) for the paragraph keys was a real bug — it made plain ←/→ jump a paragraph instead of moving one character. The modifier sets jump size on both axes: down the doc `fn`(whole) › `⌥`(page) › `⌘`(heading); across the line `fn`(paragraph) › `⌥`(sentence) › `⌘`(line). ⇧ extends. Unit boundaries come from `TextNavigator`; paragraph/sentence stops also honour block starts (`MDAttr.blockId`) so a heading is never skipped. The page holds still and the cursor moves inside it — scroll follows only when the caret would leave the screen (`revealCaret`), never top-anchored.
 
 ## Debugging discipline (this app specifically)
 
@@ -45,7 +54,8 @@ No web runtime for text; mermaid is the only WebKit user and only on a cache mis
 ## Commit / distribution
 
 - **Solo local app → commit directly to `main`** (established pattern: `a80271e`, `57b485b`, `bce0ead`). No dev branch. Stage by filename (exclude `.bkit/`).
-- **`docs/` is gitignored — local only, NOT on GitHub** (this repo is public and the AI collaboration logs quote internal discussion verbatim; GitHub can't keep a folder private inside a public repo). The distribution playbooks (`docs/NOTARIZATION.md`, `docs/APP-STORE.md`) live there too, so they exist on this machine only — **don't link to them from README** (public readers would hit a dead path), and don't assume a fresh clone has them.
+- **`docs/` is gitignored — local only, NOT on GitHub** (this repo is public and the AI collaboration logs quote internal discussion verbatim; GitHub can't keep a folder private inside a public repo). The distribution playbooks (`docs/NOTARIZATION.md`, `docs/APP-STORE.md`, `docs/APP-STORE-METADATA.md`) live there too, so they exist on this machine only — **don't link to them from README** (public readers would hit a dead path), and don't assume a fresh clone has them. (The `.gitignore` line is now `docs/`, not just `docs/commit-log/` — for a while only commit-log was ignored and the rest was merely untracked, one `git add .` from being public.)
+- **`demo/` and `licenses/` ARE public** (committed): `demo/` = the four sample docs shipped for users (code-blocks, math, images, moby-dick — Moby-Dick is public-domain, PG boilerplate stripped; demo photos are PD/CC0, credited in `demo/assets/CREDITS.md`). `licenses/` = the OFL text the fonts require.
 - **Two distribution tracks, both arm64-only, both from this SwiftPM build — no Xcode project:**
   - **Direct (`./Scripts/notarize.sh`)** — Developer ID + hardened runtime + Apple notarization → stapled `FastMDReader.zip`. **Unsandboxed.** Recipients double-click; no quarantine step. Run it only when shipping a build to someone, not per build. → `docs/NOTARIZATION.md` (local)
   - **Mac App Store (`./Scripts/appstore.sh`)** — Apple Distribution + embedded profile → signed `.pkg` → `altool`. **Sandboxed** (the store's price). Defaults to validate-only; `--upload` submits. The store notarizes during review, so this track never calls notarytool. → `docs/APP-STORE.md` (local)
