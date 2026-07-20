@@ -938,7 +938,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         row("⌘-Click selection", "Open the selected text as a link / path / file")
         row("Click left margin", "Copy that whole block (or section, beside a heading)")
         row("Right-click selection", "Copy · Open · Edit… (edit that block's markdown source)")
-        row("Right-click a block", "Add Block Below… · Move Block… · Delete Block… (asks first)")
+        row("Right-click a block", "Block ▸ Edit… · Add Below… · Move… · Delete… (asks first)")
         row("While moving a block", "↑ / ↓ move it · ↵ or esc finish · ⌘Z undoes each step")
         row("Click a diagram / formula / image", "Open it enlarged in a zoomable window")
         row("Wrap / Copy button", "Toggle a code block's wrapping / copy its code")

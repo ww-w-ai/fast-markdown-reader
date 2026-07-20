@@ -248,62 +248,74 @@ final class ReaderTextView: NSTextView {
         // Remember which block was right-clicked so Edit works even with NO selection.
         menuClickChar = charIndex(atViewPoint: convert(event.locationInWindow, from: nil))
         let menu = NSMenu()
+        // EVERY item carries an icon. macOS gives some standard actions (Copy, Select All) one
+        // automatically and leaves the rest bare, which reads as a ragged left edge — so the icon
+        // is set explicitly on all of them and the titles line up.
         if selectedRange().length > 0 {
-            menu.addItem(withTitle: "Copy", action: #selector(copy(_:)), keyEquivalent: "")
-            let open = menu.addItem(withTitle: "Open Selection", action: #selector(openSelectionMenu(_:)), keyEquivalent: "")
-            open.target = self
+            // Two groups, each named by what it acts ON, so no item has to repeat the noun:
+            // these two work on the SELECTION, the four below on the block under the pointer.
+            addSectionHeader("Selection", to: menu)
+            add("Copy", symbol: "doc.on.doc", action: #selector(copy(_:)), to: menu)
+            add("Open", symbol: "arrow.up.forward.square", action: #selector(openSelectionMenu(_:)), to: menu)
             menu.addItem(.separator())
         }
         // The block operations are ONE group, in the order a block's life runs: change it, add
-        // after it, move it, remove it. Delete sits with the others (it is a block operation, not a
-        // different kind of thing) and earns its safety from the confirmation, not from isolation.
-        // All four work without a selection — each grabs the block under the pointer.
-        for (title, action) in [("Edit…", #selector(editSelectionMenu(_:))),
-                                ("Add Block Below…", #selector(addBlockMenu(_:))),
-                                ("Move Block…", #selector(moveBlockMenu(_:))),
-                                ("Delete Block…", #selector(deleteBlockMenu(_:)))] {
-            menu.addItem(withTitle: title, action: action, keyEquivalent: "").target = self
-        }
+        // after it, move it, remove it. Delete sits with the others (it IS a block operation) and
+        // earns its safety from the confirmation, not from being set apart. All four work without
+        // a selection — each grabs the block under the pointer.
+        addSectionHeader(unitNoun + " Actions", to: menu)
+        add("Edit…", symbol: "square.and.pencil", action: #selector(editSelectionMenu(_:)), to: menu)
+        add("Add Below…", symbol: "plus.square", action: #selector(addBlockMenu(_:)), to: menu)
+        add("Move…", symbol: "arrow.up.arrow.down", action: #selector(moveBlockMenu(_:)), to: menu)
+        add("Delete…", symbol: "trash", action: #selector(deleteBlockMenu(_:)), to: menu)
         menu.addItem(.separator())
-        menu.addItem(withTitle: "Select All", action: #selector(selectAll(_:)), keyEquivalent: "")
+        addSectionHeader("Document", to: menu)
+        add("Select All", symbol: "square.dashed", action: #selector(selectAll(_:)), to: menu)
         return menu
     }
 
-    /// AppKit appends its own items (AutoFill, Services, …) to whatever `menu(for:)` returns — it
-    /// does that HERE, after we've built the menu, which is why the override above can't just leave
-    /// them out. AutoFill offers to type a saved address or card into the view; this view never
-    /// accepts typing, so the item can only disappoint. Services stays: "search with…" on a
-    /// selection is genuinely useful in a reader.
-    ///
-    /// Matched by SELECTOR NAME first, which is locale-independent; the title check is the fallback
-    /// for when AppKit hands us a submenu it hasn't filled in yet. Deliberately conservative — if
-    /// neither matches, the item simply stays, which is far better than removing the wrong one.
-    override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {
-        super.willOpenMenu(menu, with: event)
-        menu.items.filter(Self.isAutoFill).forEach(menu.removeItem)
-        Self.tidySeparators(menu)
+    /// What one operable unit is CALLED in the document that's open. The unit itself differs by
+    /// file kind — in markdown it's a paragraph, heading, table or code fence (often several lines);
+    /// in a .txt or .csv the renderer makes it exactly one line — so the menu says whichever is
+    /// true here rather than teaching the reader a word for something they aren't looking at.
+    private var unitNoun: String {
+        let doc = (window?.windowController as? DocumentWindowController)?.document as? MarkdownDocument
+        return (doc?.isPlainText ?? false) ? "Line" : "Block"
     }
 
-    /// Close the gap a removed item leaves behind: no leading, trailing or doubled separators.
-    static func tidySeparators(_ menu: NSMenu) {
-        while let first = menu.items.first, first.isSeparatorItem { menu.removeItem(first) }
-        while let last = menu.items.last, last.isSeparatorItem { menu.removeItem(last) }
-        var i = menu.items.count - 1
-        while i > 0 {
-            if menu.items[i].isSeparatorItem, menu.items[i - 1].isSeparatorItem { menu.removeItem(at: i) }
-            i -= 1
-        }
+    /// One menu item with its icon. Every action here — ours and NSTextView's own `copy:` /
+    /// `selectAll:` — is implemented by this view, so `self` is the right target for all of them.
+    private func add(_ title: String, symbol: String, action: Selector, to menu: NSMenu) {
+        let item = menu.addItem(withTitle: title, action: action, keyEquivalent: "")
+        item.target = self
+        // A missing symbol name would silently leave ONE item unaligned — the exact raggedness this
+        // is here to fix — so fall back to a blank image of the same size to hold the column.
+        let config = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
+        item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)?
+            .withSymbolConfiguration(config)
+            ?? NSImage(size: NSSize(width: 16, height: 16))
     }
 
-    static func isAutoFill(_ item: NSMenuItem) -> Bool {
-        func mentionsAutoFill(_ sel: Selector?) -> Bool {
-            guard let sel else { return false }
-            return NSStringFromSelector(sel).lowercased().contains("autofill")
+    // AppKit adds AutoFill and Services to this menu itself, and the menu we return here is NOT the
+    // last word on them: both removing them (willOpenMenu) and labelling them with a trailing
+    // section header were tried on macOS 15 and neither took — whatever AppKit does with those
+    // items happens outside the menu object we hand back. They're inert here anyway (this view
+    // accepts no typing), so they're left as the system puts them rather than chased further.
+
+    /// A small grey heading above a group of menu items. `NSMenuItem.sectionHeader` is macOS 14+,
+    /// and this app ships back to 13 — so on 13 fall back to a disabled item, which is what that
+    /// API renders as anyway. Never a plain enabled item: it would look clickable and do nothing.
+    @discardableResult
+    private func addSectionHeader(_ title: String, to menu: NSMenu) -> NSMenuItem {
+        let header: NSMenuItem
+        if #available(macOS 14.0, *) {
+            header = NSMenuItem.sectionHeader(title: title)
+        } else {
+            header = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            header.isEnabled = false
         }
-        if mentionsAutoFill(item.action) { return true }
-        if let sub = item.submenu, sub.items.contains(where: { mentionsAutoFill($0.action) }) { return true }
-        let title = item.title.replacingOccurrences(of: " ", with: "").lowercased()
-        return ["autofill", "자동완성", "自動入力", "自动填充"].contains(title)
+        menu.addItem(header)
+        return header
     }
 
     private var menuClickChar: Int?
