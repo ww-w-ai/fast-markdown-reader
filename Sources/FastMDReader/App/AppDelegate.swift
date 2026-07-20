@@ -117,11 +117,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = true
-        // Markdown + any plain text (be permissive — the reader can render any text file).
-        var types: [UTType] = [.plainText, .text]
-        if let md = UTType("net.daringfireball.markdown") { types.insert(md, at: 0) }
-        if let pub = UTType("public.markdown") { types.insert(pub, at: 0) }
-        panel.allowedContentTypes = types
+        // Markdown (rendered) + plain text (verbatim) — see DocumentTypes, the single list.
+        panel.allowedContentTypes = DocumentTypes.openPanelTypes
         panel.allowsOtherFileTypes = true
         panel.begin { response in
             guard response == .OK else { return }

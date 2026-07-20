@@ -21,6 +21,23 @@
 			<key>NSDocumentClass</key>
 			<string>FastMDReader.MarkdownDocument</string>
 		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Text Document</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.plain-text</string>
+				<string>public.comma-separated-values-text</string>
+				<string>public.tab-separated-values-text</string>
+				<string>public.log</string>
+			</array>
+			<key>NSDocumentClass</key>
+			<string>FastMDReader.MarkdownDocument</string>
+		</dict>
 	</array>
 	<key>CFBundleExecutable</key>
 	<string>FastMDReader</string>

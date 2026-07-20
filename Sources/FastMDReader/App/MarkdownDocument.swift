@@ -75,7 +75,7 @@ final class MarkdownDocument: NSDocument {
     /// a typed one, and redo falls out for free: the undo manager records the inverse this call
     /// registers while it is undoing. Registration happens only AFTER the write succeeds — offering
     /// to undo an edit that never reached the file would be a lie.
-    func applySourceEdit(_ r: NSRange, with replacement: String) {
+    func applySourceEdit(_ r: NSRange, with replacement: String, actionName: String = "Edit") {
         let ns = text as NSString
         guard r.location >= 0, r.location + r.length <= ns.length else { NSSound.beep(); return }
         let updated = ns.replacingCharacters(in: r, with: replacement)
@@ -98,8 +98,10 @@ final class MarkdownDocument: NSDocument {
         }
         self.text = updated
         let undoRange = NSRange(location: r.location, length: (replacement as NSString).length)
-        undoManager?.registerUndo(withTarget: self) { $0.applySourceEdit(undoRange, with: previous) }
-        undoManager?.setActionName("Edit")
+        undoManager?.registerUndo(withTarget: self) {
+            $0.applySourceEdit(undoRange, with: previous, actionName: actionName)
+        }
+        undoManager?.setActionName(actionName)
         guard let wc = windowControllers.first as? DocumentWindowController else { return }
         let anchor = wc.topVisibleCharIndex()
         render(into: wc)
@@ -136,9 +138,20 @@ final class MarkdownDocument: NSDocument {
         wc.scrollCharToTop(anchor)                  // top anchor wins over the caret scroll
     }
 
+    /// True for a file this app opens as TEXT rather than markdown (.txt, .csv, .log, …). Decided
+    /// by extension, not content: a `.txt` full of `#` and `*` is a text file whose author wanted
+    /// those characters on the page, and guessing otherwise would rewrite what they see.
+    /// Markdown extensions are the allowlist; everything else that reaches us is plain.
+    var isPlainText: Bool {
+        let ext = (fileURL?.pathExtension ?? "md").lowercased()
+        return !["md", "markdown", "mdown", "mkd", "mdtext"].contains(ext) && !ext.isEmpty
+    }
+
     private func render(into wc: DocumentWindowController) {
         // FontSizeStore is the SINGLE owner of font size — never read UserDefaults directly.
-        let attr = MarkdownRenderer.render(text, theme: .current(size: FontSizeStore.size))
+        let theme = RenderTheme.current(size: FontSizeStore.size)
+        let attr = isPlainText ? PlainTextRenderer.render(text, theme: theme)
+                               : MarkdownRenderer.render(text, theme: theme)
         wc.display(attr)
         wc.window?.title = displayName ?? "fast-md-reader"
         renderGeneration += 1

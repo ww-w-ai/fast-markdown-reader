@@ -106,6 +106,15 @@ final class ReaderTextView: NSTextView {
             (window?.windowController as? DocumentWindowController)?.showShortcutGuide(nil)
             return
         }
+        // Move mode owns the arrows while it is on: ↑/↓ move the block, ↵/esc leave.
+        if isMovingBlock, let wc = window?.windowController as? DocumentWindowController {
+            switch event.keyCode {
+            case 126: wc.moveBlock(by: -1); return          // ↑
+            case 125: wc.moveBlock(by: 1);  return          // ↓
+            case 36, 76, 53: wc.endMovingBlock(); return    // ↵ / ⌤ / esc
+            default: break
+            }
+        }
         let mods = event.modifierFlags.intersection([.command, .option, .shift, .control])
         // Space / ⇧Space page WITHOUT selecting (here Shift means "page up", not "extend").
         if event.keyCode == 49, mods == [] { page(down: true, extend: false); return }
@@ -243,13 +252,58 @@ final class ReaderTextView: NSTextView {
             menu.addItem(withTitle: "Copy", action: #selector(copy(_:)), keyEquivalent: "")
             let open = menu.addItem(withTitle: "Open Selection", action: #selector(openSelectionMenu(_:)), keyEquivalent: "")
             open.target = self
+            menu.addItem(.separator())
         }
-        // Edit is available even without a selection — it grabs the block under the cursor.
-        let edit = menu.addItem(withTitle: "Edit…", action: #selector(editSelectionMenu(_:)), keyEquivalent: "")
-        edit.target = self
+        // The block operations are ONE group, in the order a block's life runs: change it, add
+        // after it, move it, remove it. Delete sits with the others (it is a block operation, not a
+        // different kind of thing) and earns its safety from the confirmation, not from isolation.
+        // All four work without a selection — each grabs the block under the pointer.
+        for (title, action) in [("Edit…", #selector(editSelectionMenu(_:))),
+                                ("Add Block Below…", #selector(addBlockMenu(_:))),
+                                ("Move Block…", #selector(moveBlockMenu(_:))),
+                                ("Delete Block…", #selector(deleteBlockMenu(_:)))] {
+            menu.addItem(withTitle: title, action: action, keyEquivalent: "").target = self
+        }
         menu.addItem(.separator())
         menu.addItem(withTitle: "Select All", action: #selector(selectAll(_:)), keyEquivalent: "")
         return menu
+    }
+
+    /// AppKit appends its own items (AutoFill, Services, …) to whatever `menu(for:)` returns — it
+    /// does that HERE, after we've built the menu, which is why the override above can't just leave
+    /// them out. AutoFill offers to type a saved address or card into the view; this view never
+    /// accepts typing, so the item can only disappoint. Services stays: "search with…" on a
+    /// selection is genuinely useful in a reader.
+    ///
+    /// Matched by SELECTOR NAME first, which is locale-independent; the title check is the fallback
+    /// for when AppKit hands us a submenu it hasn't filled in yet. Deliberately conservative — if
+    /// neither matches, the item simply stays, which is far better than removing the wrong one.
+    override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {
+        super.willOpenMenu(menu, with: event)
+        menu.items.filter(Self.isAutoFill).forEach(menu.removeItem)
+        Self.tidySeparators(menu)
+    }
+
+    /// Close the gap a removed item leaves behind: no leading, trailing or doubled separators.
+    static func tidySeparators(_ menu: NSMenu) {
+        while let first = menu.items.first, first.isSeparatorItem { menu.removeItem(first) }
+        while let last = menu.items.last, last.isSeparatorItem { menu.removeItem(last) }
+        var i = menu.items.count - 1
+        while i > 0 {
+            if menu.items[i].isSeparatorItem, menu.items[i - 1].isSeparatorItem { menu.removeItem(at: i) }
+            i -= 1
+        }
+    }
+
+    static func isAutoFill(_ item: NSMenuItem) -> Bool {
+        func mentionsAutoFill(_ sel: Selector?) -> Bool {
+            guard let sel else { return false }
+            return NSStringFromSelector(sel).lowercased().contains("autofill")
+        }
+        if mentionsAutoFill(item.action) { return true }
+        if let sub = item.submenu, sub.items.contains(where: { mentionsAutoFill($0.action) }) { return true }
+        let title = item.title.replacingOccurrences(of: " ", with: "").lowercased()
+        return ["autofill", "자동완성", "自動入力", "自动填充"].contains(title)
     }
 
     private var menuClickChar: Int?
@@ -269,6 +323,23 @@ final class ReaderTextView: NSTextView {
     @objc private func editSelectionMenu(_ sender: Any?) {
         (window?.windowController as? DocumentWindowController)?.editSelectedSource(atChar: menuClickChar)
     }
+
+    @objc private func addBlockMenu(_ sender: Any?) {
+        (window?.windowController as? DocumentWindowController)?.addBlockBelow(atChar: menuClickChar)
+    }
+
+    @objc private func deleteBlockMenu(_ sender: Any?) {
+        (window?.windowController as? DocumentWindowController)?.deleteBlock(atChar: menuClickChar)
+    }
+
+    @objc private func moveBlockMenu(_ sender: Any?) {
+        (window?.windowController as? DocumentWindowController)?.beginMovingBlock(atChar: menuClickChar)
+    }
+
+    /// Set while a block is being moved. The reading cursor's own arrow handling is suspended for
+    /// the duration, so ↑/↓ move the BLOCK — pressing an arrow and having the caret wander off
+    /// instead would silently break the mode the user just entered.
+    var isMovingBlock = false
 
     // MARK: - Left gutter: click a block's left margin to copy the whole unit
 

@@ -8,19 +8,20 @@ final class SourceEditPanel: NSWindowController, NSWindowDelegate {
     private let editor = NSTextView()
     private let onSave: (String) -> Void
 
-    static func show(markdown: String, onSave: @escaping (String) -> Void) {
-        let c = SourceEditPanel(markdown: markdown, onSave: onSave)
+    static func show(title: String = "Edit block source",
+                     markdown: String, onSave: @escaping (String) -> Void) {
+        let c = SourceEditPanel(title: title, markdown: markdown, onSave: onSave)
         open.append(c)
         c.showWindow(nil)
         c.window?.makeKeyAndOrderFront(nil)
         c.window?.makeFirstResponder(c.editor)
     }
 
-    private init(markdown: String, onSave: @escaping (String) -> Void) {
+    private init(title: String, markdown: String, onSave: @escaping (String) -> Void) {
         self.onSave = onSave
         let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 420),
                            styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
-        win.title = "Edit block source  —  ⌘↵ save · esc cancel"
+        win.title = "\(title)  —  ⌘↵ save · esc cancel"
         win.isReleasedWhenClosed = false
         super.init(window: win)
         win.delegate = self

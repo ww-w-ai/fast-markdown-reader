@@ -268,6 +268,9 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
     }
 
     func placeCopyButtons() {
+        // The move bar tracks a block, not a code block, so it must be repositioned even when the
+        // signature check below short-circuits the overlay rebuild.
+        defer { positionMoveBar() }
         guard let storage = textView.textStorage,
               let lm = textView.layoutManager,
               let container = textView.textContainer, storage.length > 0 else {
@@ -611,9 +614,167 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         }
         guard lo != Int.max, hi > lo else { NSSound.beep(); return }
         let srcRange = NSRange(location: lo, length: hi - lo)
-        SourceEditPanel.show(markdown: doc.sourceSubstring(srcRange)) { [weak doc] edited in
+        SourceEditPanel.show(title: "Edit block source", markdown: doc.sourceSubstring(srcRange)) { [weak doc] edited in
             doc?.applySourceEdit(srcRange, with: edited)
         }
+    }
+
+    // MARK: - Block operations (add / delete / move)
+    //
+    // All three resolve the block under the pointer to ONE source span pair and hand it to
+    // `applySourceEdit` — the single write path — so each is persisted, re-rendered and undoable
+    // exactly like a hand edit, and none of them can half-apply.
+
+    /// The block spans of the current document plus the index of the one at `char`.
+    private func blockContext(atChar char: Int?) -> (doc: MarkdownDocument, spans: [NSRange], index: Int)? {
+        guard let storage = textView.textStorage, let doc = document as? MarkdownDocument,
+              storage.length > 0 else { return nil }
+        let anchor = min(max(0, char ?? textView.selectedRange().location), storage.length - 1)
+        guard let value = storage.attribute(MDAttr.srcRange, at: anchor, effectiveRange: nil) as? NSValue
+        else { return nil }
+        let spans = BlockEdit.spans(in: storage)
+        guard let i = BlockEdit.indexOfBlock(containing: value.rangeValue.location, in: spans) else { return nil }
+        return (doc, spans, i)
+    }
+
+    /// Right-click → Add Block Below: an empty edit popup; on save the text is inserted after the
+    /// clicked block, reusing that document's own separator (blank line in markdown, single
+    /// newline in a plain text file).
+    func addBlockBelow(atChar char: Int?) {
+        guard let ctx = blockContext(atChar: char) else { NSSound.beep(); return }
+        let fallback = ctx.doc.isPlainText ? "\n" : "\n\n"
+        SourceEditPanel.show(title: "New block", markdown: "") { [weak self] added in
+            guard let self, !added.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+            // Spans are recomputed at save time: the popup is modeless, so the document may have
+            // changed (another edit, a reload) while it was open.
+            guard let ctx = self.blockContext(atChar: char),
+                  let (r, replacement) = BlockEdit.insertion(after: ctx.index, spans: ctx.spans,
+                                                             text: ctx.doc.text as NSString,
+                                                             newSource: added,
+                                                             fallbackSeparator: fallback)
+            else { NSSound.beep(); return }
+            ctx.doc.applySourceEdit(r, with: replacement, actionName: "Add Block")
+        }
+    }
+
+    /// Right-click → Delete Block: confirm first (this rewrites the file on disk), showing the
+    /// first line of what is about to go so the user can tell they picked the right block.
+    func deleteBlock(atChar char: Int?) {
+        guard let ctx = blockContext(atChar: char),
+              let r = BlockEdit.deletion(of: ctx.index, spans: ctx.spans) else { NSSound.beep(); return }
+        let source = ctx.doc.sourceSubstring(ctx.spans[ctx.index])
+        let firstLine = source.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? source
+        let preview = firstLine.count > 80 ? String(firstLine.prefix(80)) + "…" : firstLine
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Delete this block?"
+        alert.informativeText = "\(preview)\n\nThis rewrites \(ctx.doc.fileURL?.lastPathComponent ?? "the file") on disk. You can undo it with ⌘Z."
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+        // The sheet is asynchronous, so re-resolve the block when the user actually confirms —
+        // an undo or a ⌘R reload while it was up would have moved every offset under it.
+        let apply: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard response == .alertFirstButtonReturn, let self,
+                  let ctx = self.blockContext(atChar: char),
+                  let r = BlockEdit.deletion(of: ctx.index, spans: ctx.spans) else { return }
+            ctx.doc.applySourceEdit(r, with: "", actionName: "Delete Block")
+        }
+        if let w = window { alert.beginSheetModal(for: w, completionHandler: apply) }
+        else { apply(alert.runModal()) }
+    }
+
+    // MARK: Move mode
+
+    private var moveBar: BlockMoveBar?
+    private var moveIndex: Int?
+
+    /// Right-click → Move Block: enter move mode. The block is selected (so it is visibly the one
+    /// travelling) and a small ▲▼ bar appears beside it; ↑/↓ do the same thing from the keyboard,
+    /// ↵/esc leave. Each press is one `applySourceEdit`, so every step is separately undoable.
+    func beginMovingBlock(atChar char: Int?) {
+        guard let ctx = blockContext(atChar: char) else { NSSound.beep(); return }
+        endMovingBlock()
+        moveIndex = ctx.index
+        let bar = BlockMoveBar()
+        bar.onUp = { [weak self] in self?.moveBlock(by: -1) }
+        bar.onDown = { [weak self] in self?.moveBlock(by: 1) }
+        bar.onDone = { [weak self] in self?.endMovingBlock() }
+        moveBar = bar
+        textView.addSubview(bar)
+        textView.isMovingBlock = true
+        selectMovingBlock()
+        positionMoveBar()
+    }
+
+    func endMovingBlock() {
+        moveBar?.removeFromSuperview()
+        moveBar = nil
+        moveIndex = nil
+        textView.isMovingBlock = false
+    }
+
+    var isMovingBlock: Bool { moveIndex != nil }
+
+    /// Move the block one step. Moving up is "swap the block above with me", which is the same
+    /// operation as moving that block down — one primitive covers both directions.
+    func moveBlock(by delta: Int) {
+        guard let i = moveIndex, let storage = textView.textStorage,
+              let doc = document as? MarkdownDocument else { return }
+        let spans = BlockEdit.spans(in: storage)
+        let first = delta < 0 ? i - 1 : i
+        guard let (r, replacement) = BlockEdit.swapWithNext(first, spans: spans, text: doc.text as NSString)
+        else { NSSound.beep(); return }
+        doc.applySourceEdit(r, with: replacement, actionName: "Move Block")
+        moveIndex = i + delta
+        selectMovingBlock()
+        revealMovingBlock()
+        positionMoveBar()
+    }
+
+    /// Highlight the travelling block by selecting its rendered range — no new drawing code, and
+    /// it reads as a selection because that is exactly what it is.
+    private func selectMovingBlock() {
+        guard let r = movingBlockRenderedRange() else { return }
+        textView.setSelectedRange(r)
+    }
+
+    private func revealMovingBlock() {
+        guard let r = movingBlockRenderedRange() else { return }
+        textView.scrollRangeToVisible(r)
+    }
+
+    /// The rendered (on-screen) range of the block currently being moved.
+    private func movingBlockRenderedRange() -> NSRange? {
+        guard let i = moveIndex, let storage = textView.textStorage else { return nil }
+        let spans = BlockEdit.spans(in: storage)
+        guard spans.indices.contains(i) else { return nil }
+        let target = spans[i]
+        var lo = Int.max, hi = Int.min
+        storage.enumerateAttribute(MDAttr.srcRange, in: NSRange(location: 0, length: storage.length)) { v, r, _ in
+            guard let s = (v as? NSValue)?.rangeValue, s.location == target.location else { return }
+            lo = min(lo, r.location); hi = max(hi, r.location + r.length)
+        }
+        guard lo != Int.max, hi > lo else { return nil }
+        return NSRange(location: lo, length: hi - lo)
+    }
+
+    /// Keep the bar glued to the right edge of its block through scrolling, resizing and moves.
+    /// Called from `placeCopyButtons`, which already runs on every scroll/resize/render.
+    func positionMoveBar() {
+        guard let bar = moveBar, let i = moveIndex, let storage = textView.textStorage,
+              let lm = textView.layoutManager, let container = textView.textContainer else { return }
+        guard let rendered = movingBlockRenderedRange() else { endMovingBlock(); return }
+        if bar.superview !== textView { textView.addSubview(bar) }   // survives a re-render
+        let spans = BlockEdit.spans(in: storage)
+        bar.setEnabled(up: i > 0, down: i + 1 < spans.count)
+        let glyphs = lm.glyphRange(forCharacterRange: rendered, actualCharacterRange: nil)
+        var rect = lm.boundingRect(forGlyphRange: glyphs, in: container)
+        rect.origin.x += textView.textContainerInset.width
+        rect.origin.y += textView.textContainerInset.height
+        let size = BlockMoveBar.barSize
+        let x = min(max(4, rect.maxX + 8), textView.bounds.width - size.width - 4)
+        bar.setFrameOrigin(NSPoint(x: x, y: rect.minY))
     }
 
     func openSelectionText(_ raw: String) {
@@ -665,7 +826,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         let ext = url.pathExtension.lowercased()
         if exists, isDir.boolValue {
             NSWorkspace.shared.open(url)                    // folder → Finder
-        } else if ext == "md" || ext == "markdown" {
+        } else if DocumentTypes.opensInApp(ext) {
             // Open (or focus) as a tab. NSDocumentController returns the already-open document
             // and fronts its window; tabbingMode = .preferred makes new windows join as tabs.
             NSDocumentController.shared.openDocument(withContentsOf: url, display: true) { _, _, _ in }
@@ -777,6 +938,8 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         row("⌘-Click selection", "Open the selected text as a link / path / file")
         row("Click left margin", "Copy that whole block (or section, beside a heading)")
         row("Right-click selection", "Copy · Open · Edit… (edit that block's markdown source)")
+        row("Right-click a block", "Add Block Below… · Move Block… · Delete Block… (asks first)")
+        row("While moving a block", "↑ / ↓ move it · ↵ or esc finish · ⌘Z undoes each step")
         row("Click a diagram / formula / image", "Open it enlarged in a zoomable window")
         row("Wrap / Copy button", "Toggle a code block's wrapping / copy its code")
         section("Diagram window")
