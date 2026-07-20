@@ -17,20 +17,30 @@ the scrollbar never jumps
 ([`SizedAttachmentCell.swift`](Sources/FastMDReader/Render/SizedAttachmentCell.swift)).
 
 A reader, on purpose — it opens, renders, and gets out of the way. When something in the text is
-wrong, right-click that block and **Edit** rewrites just its Markdown source back to the file. Fix
-the typo, keep reading; no editor, no mode switch.
+wrong, right-click that block: **Edit** rewrites just its Markdown source, and **Add Below**,
+**Move** and **Delete** restructure the document a block at a time. Changes are yours until you
+press ⌘S, and only the block you touched is redrawn — **9 ms on a 64,000-character file, 29 ms on
+1.2 MB**, so undo stays instant in documents where other apps stall.
+
+It opens **plain text too** — `.txt`, `.csv`, `.log` — shown verbatim in a fixed-width font, one
+block per line, with `#` and `*` left as the characters they are. Files written on Windows or Linux
+arrive intact: CP949, UTF-16, Latin-1 and friends are detected rather than assumed, and a file is
+**saved back in the encoding it came in**, CRLF and all.
 
 | | Fast Markdown Reader |
 |---|---|
 | Engine | 100% native AppKit + TextKit — **no web runtime for text** |
 | Idle CPU | **0%** — no timers, no polling, no background web process |
 | Memory | **flat under use** — ~127 MB across 9 large docs, ~52 MB reclaimed on close |
-| Long docs | Non-contiguous layout renders only the viewport — a **4,000-paragraph** file opens instantly |
+| Long docs | The whole document is laid out up front, so the **scrollbar is honest from the first frame** — a 4,000-paragraph file opens instantly and never resizes under you |
+| Editing long docs | Only the edited block is re-rendered — **9 ms on 64k characters, 29 ms on 1.2 MB** |
+| Plain text | `.txt` · `.csv` · `.log` shown **verbatim**, one block per line — nothing reinterpreted as Markdown |
+| Encodings | CP949 · UTF-16 · Latin-1 detected, not assumed — **saved back in the same encoding**, CRLF kept |
 | Diagrams | **mermaid bundled** — renders offline, cached as vector PDF, never re-rendered |
 | Math | **KaTeX bundled** — `$$…$$` and ```` ```math ```` render offline, vector, cached the same way |
 | Images | Off-screen pixels freed, exact height kept — **no reflow, no scrollbar jitter** |
 | Code | **34 languages** highlighted natively — one-pass scanner, no JS, per-block **Copy** and **Wrap** |
-| Editing | Reader first — but right-click any block → **Edit** fixes its Markdown source in place |
+| Editing | Reader first — right-click a block → **Edit · Add Below · Move · Delete**, saved on ⌘S |
 
 ## Diagrams render offline, once
 
@@ -92,8 +102,9 @@ file, which should open the instant you double-click it.
 Download the notarized zip, unzip it, drag `FastMDReader.app` to `/Applications`, double-click.
 No Gatekeeper prompt and no `xattr` step — the app is signed with a Developer ID and stapled.
 
-To make it your default Markdown viewer: right-click any `.md` in Finder → **Get Info** →
-**Open with** → Fast Markdown Reader → **Change All…**.
+To open Markdown and text files here by default: **fast-md-reader → Open Text Files with
+fast-md-reader…**, which says exactly which kinds it will claim before it changes anything. Per
+file, the Finder route still works: right-click → **Get Info** → **Open with** → **Change All…**.
 
 ## Build from source
 
