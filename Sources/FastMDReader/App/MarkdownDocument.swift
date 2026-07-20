@@ -21,13 +21,35 @@ final class MarkdownDocument: NSDocument {
     private var measureToken = 0
 
     override class var autosavesInPlace: Bool { false }
-    // The text view is editable only to show a caret; edits are rejected, so the document is
-    // never dirty and closing a tab must never prompt to save.
-    override var isDocumentEdited: Bool { false }
     override func canAsynchronouslyWrite(to url: URL, ofType typeName: String, for saveOperation: NSDocument.SaveOperationType) -> Bool { false }
 
+    /// Saving is ⌘S, not every edit. Writing on each keystroke-sized change meant rewriting the
+    /// whole file for one moved line — and, worse, it left no way back: the file on disk had
+    /// already changed before the reader decided they liked it. Edits now live in memory, the
+    /// document goes dirty, and AppKit's own "Save / Don't Save / Cancel" sheet handles closing.
+    /// Change tracking is left to NSDocument, which watches the undo manager — undo back to the
+    /// original state correctly reports the document as clean again.
+    override func data(ofType typeName: String) throws -> Data {
+        guard let bytes = TextEncodingDetector.encode(text, like: file) else {
+            throw NSError(domain: "ai.ww-w.fast-md-reader", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "This file's text encoding can't represent some of the characters in your edits.",
+                NSLocalizedRecoverySuggestionErrorKey:
+                    "\(fileURL?.lastPathComponent ?? "The file") is stored in an older encoding. Remove those characters, or convert the file to UTF-8 in another editor, and save again.",
+            ])
+        }
+        return bytes
+    }
+
+    /// How this file was stored, kept so a save writes it back the same way (see TextFile). Set on
+    /// every read; the default only matters for a document that was never read from disk.
+    private(set) var file = TextFile(text: "", encoding: .utf8, hasBOM: false)
+
     override func read(from data: Data, ofType typeName: String) throws {
-        self.text = String(decoding: data, as: UTF8.self)
+        // NOT `String(decoding:as: UTF8.self)`: that never fails, it just substitutes replacement
+        // characters, so a Windows-made CP949 or UTF-16 file arrives as a wall of "?" and looks
+        // corrupted. The detector reads the bytes for what they are.
+        self.file = TextEncodingDetector.decode(data)
+        self.text = file.text
     }
 
     override func makeWindowControllers() {
@@ -46,12 +68,27 @@ final class MarkdownDocument: NSDocument {
     /// reloads the DOCUMENT's content — it runs the currently-launched app binary, so it does
     /// not pick up a new app build (that still needs a relaunch).
     @objc func reloadDocument(_ sender: Any?) {
+        // Re-reading throws away whatever hasn't been saved, so say so first. Silently discarding
+        // edits because someone reached for Reload would be the worst kind of data loss: invisible.
+        if isDocumentEdited {
+            let a = NSAlert()
+            a.alertStyle = .warning
+            a.messageText = "Reload and lose your unsaved changes?"
+            a.informativeText = "\(fileURL?.lastPathComponent ?? "This document") has edits that haven't been saved. Reloading reads the file from disk again and discards them."
+            a.addButton(withTitle: "Reload")
+            a.addButton(withTitle: "Cancel")
+            guard a.runModal() == .alertFirstButtonReturn else { return }
+        }
         if let url = fileURL, let data = try? Data(contentsOf: url) {
+            let reread = TextEncodingDetector.decode(data)
             // The undo stack holds source OFFSETS into the text we're replacing. Re-reading the file
             // can move every one of them (the file may have changed behind us), so an undo applied
             // afterwards would overwrite the wrong span. Drop the history rather than corrupt the file.
-            if data != Data(self.text.utf8) { undoManager?.removeAllActions() }
-            self.text = String(decoding: data, as: UTF8.self)
+            // Compared as TEXT, not bytes: re-encoding is not a change the user made.
+            if reread.text != self.text { undoManager?.removeAllActions() }
+            self.file = reread
+            self.text = reread.text
+            updateChangeCount(.changeCleared)     // the document now matches the file again
         }
         guard let wc = windowControllers.first as? DocumentWindowController else { return }
         let anchor = wc.topVisibleCharIndex()
@@ -68,44 +105,164 @@ final class MarkdownDocument: NSDocument {
         return ns.substring(with: r)
     }
 
-    /// Replace a source range with edited markdown, persist to the .md file, and re-render
-    /// (keeping scroll position). This is the ONLY path that writes the file — an explicit edit.
+    /// Replace a source range with edited markdown and update the screen. Nothing is written to
+    /// disk — that is ⌘S (see `data(ofType:)`); this marks the document dirty instead.
     ///
-    /// Undo runs back through here with the inverse edit, so it persists and re-renders exactly like
-    /// a typed one, and redo falls out for free: the undo manager records the inverse this call
-    /// registers while it is undoing. Registration happens only AFTER the write succeeds — offering
-    /// to undo an edit that never reached the file would be a lie.
+    /// Undo runs back through here with the inverse edit, so it re-renders exactly like a typed one,
+    /// and redo falls out for free: the undo manager records the inverse this call registers while
+    /// it is undoing.
     func applySourceEdit(_ r: NSRange, with replacement: String, actionName: String = "Edit") {
         let ns = text as NSString
         guard r.location >= 0, r.location + r.length <= ns.length else { NSSound.beep(); return }
         let updated = ns.replacingCharacters(in: r, with: replacement)
         let previous = ns.substring(with: r)
-        if let url = fileURL {
-            do {
-                try Data(updated.utf8).write(to: url)
-            } catch {
-                // NEVER swallow this: the edit only exists on screen until it reaches the file, so a
-                // silent failure looks exactly like a save and the user closes the window trusting it.
-                // (The sandbox denying the write is one way here — hence user-selected.read-WRITE.)
-                let a = NSAlert()
-                a.alertStyle = .warning
-                a.messageText = "Couldn't save the edit"
-                a.informativeText = "\(url.lastPathComponent) was not changed on disk.\n\n\(error.localizedDescription)"
-                a.addButton(withTitle: "OK")
-                if let w = windowControllers.first?.window { a.beginSheetModal(for: w) } else { a.runModal() }
-                return   // keep the document as it is on disk — don't show an edit that didn't persist
-            }
-        }
         self.text = updated
+        self.file.text = updated          // keep the two in step; `file` also carries the encoding
         let undoRange = NSRange(location: r.location, length: (replacement as NSString).length)
         undoManager?.registerUndo(withTarget: self) {
             $0.applySourceEdit(undoRange, with: previous, actionName: actionName)
         }
         undoManager?.setActionName(actionName)
         guard let wc = windowControllers.first as? DocumentWindowController else { return }
+        // Re-rendering the WHOLE document for one changed block is what made long files crawl:
+        // measured at 92ms in `display` alone for a 64k-character file, and it grows with the file,
+        // so undo/redo of a small edit paid the price of the entire document. Splice the changed
+        // blocks in instead, and fall back to the full path only when that can't be trusted.
+        let newSpan = NSRange(location: r.location, length: (replacement as NSString).length)
+        if spliceRender(into: wc, editedSource: r, replacementLength: newSpan.length) {
+            wc.revealEditedSource(newSpan, highlight: newSpan.length > 0)
+            return
+        }
         let anchor = wc.topVisibleCharIndex()
         render(into: wc)
         wc.scrollCharToTop(anchor)
+        wc.revealEditedSource(newSpan, highlight: newSpan.length > 0)
+    }
+
+    // MARK: - Incremental (spliced) re-render
+
+    /// Block ids must stay unique across a splice: two neighbouring blocks that share an id read as
+    /// ONE block to the reading cursor and the gutter. A fresh fragment numbers its blocks from
+    /// zero, so each splice lifts them clear of every id already on screen.
+    private var blockIdBase = 1_000_000
+
+    /// Redraw ONLY the blocks an edit touched.
+    ///
+    /// Safe because a block renders the same alone as it does in context — verified per block kind
+    /// in FragmentRenderTests — with one documented exception: a reference-style link resolves
+    /// against a definition elsewhere in the file, so such documents take the full path.
+    ///
+    /// Returns false when it cannot do the job, and the caller re-renders everything. Refusing is
+    /// always correct here; guessing is not.
+    private func spliceRender(into wc: DocumentWindowController, editedSource r: NSRange,
+                              replacementLength: Int) -> Bool {
+        guard let storage = wc.textStorageRef, storage.length > 0 else { return false }
+        if !isPlainText && hasCrossBlockReferences { return false }
+
+        let spans = BlockEdit.spans(in: storage)          // spans of the text BEFORE this edit
+        guard let first = BlockEdit.indexOfBlock(containing: r.location, in: spans) else { return false }
+        // Grow the run until it covers the whole edited range: a delete reaches past its block into
+        // the separator and on into the next one, and the fragment must span all of it.
+        var last = first
+        let editEnd = r.location + r.length
+        while last + 1 < spans.count, spans[last].location + spans[last].length < editEnd { last += 1 }
+        let oldStart = spans[first].location
+        let oldEnd = spans[last].location + spans[last].length
+        guard oldStart <= r.location, oldEnd >= editEnd else { return false }   // edit spills outside the blocks
+
+        let delta = replacementLength - r.length
+        let ns = text as NSString
+        // Run the fragment up to where the NEXT block starts, not just to the last block's text.
+        // A block's rendered range includes the separator that follows it (in a text file that is
+        // the newline the blank line itself is made of), so a fragment that stopped at the text
+        // would splice that separator away.
+        // (`spans` are offsets into the text BEFORE the edit; `ns` is the text after, so the old
+        // length is recovered from the delta rather than kept around.)
+        let oldTextLength = ns.length - delta
+        let oldFragmentEnd = last + 1 < spans.count ? spans[last + 1].location : oldTextLength
+        let newLength = (oldFragmentEnd - oldStart) + delta
+        guard newLength >= 0, oldStart + newLength <= ns.length else { return false }
+
+        // The rendered range these blocks occupy must be one contiguous run to be replaceable.
+        guard let rendered = renderedRange(ofSourceSpans: spans[first...last], in: storage) else { return false }
+
+        let theme = RenderTheme.current(size: FontSizeStore.size)
+        let fragmentSource = ns.substring(with: NSRange(location: oldStart, length: newLength))
+        let fragment = NSMutableAttributedString(attributedString:
+            isPlainText ? PlainTextRenderer.render(fragmentSource, theme: theme)
+                        : MarkdownRenderer.render(fragmentSource, theme: theme))
+        // A fragment is rendered from position zero, so its source offsets and block ids are local.
+        // Lift both into the document's coordinates before it goes in.
+        rebase(fragment, sourceOffset: oldStart, idBase: blockIdBase)
+        blockIdBase += 100_000
+
+        let tail = NSRange(location: rendered.location + rendered.length,
+                           length: storage.length - (rendered.location + rendered.length))
+        storage.beginEditing()
+        storage.replaceCharacters(in: rendered, with: fragment)
+        // Everything after the splice keeps its rendered text but now sits at a different place in
+        // the FILE, so its recorded source offsets move by the same delta the edit made.
+        if delta != 0, tail.length > 0 {
+            let shifted = NSRange(location: rendered.location + fragment.length,
+                                  length: storage.length - (rendered.location + fragment.length))
+            storage.enumerateAttribute(MDAttr.srcRange, in: shifted) { value, range, _ in
+                guard let s = (value as? NSValue)?.rangeValue else { return }
+                storage.addAttribute(MDAttr.srcRange,
+                                     value: NSValue(range: NSRange(location: s.location + delta, length: s.length)),
+                                     range: range)
+            }
+        }
+        storage.endEditing()
+
+        renderGeneration += 1
+        wc.refreshAfterMutation()
+        // Media inside the new fragment still needs its exact area reserved before it can draw —
+        // same rule as a full render (invariant: size first, pixels later).
+        DispatchQueue.main.async { [weak self, weak wc] in
+            guard let self, let wc else { return }
+            self.presizeKnownMedia(in: wc)
+            self.reconcileMedia(in: wc)
+            self.prerenderAllDiagrams(in: wc)
+            self.measureRemoteImages(in: wc)
+        }
+        return true
+    }
+
+    /// The single contiguous rendered range covering a run of source spans, or nil if the run isn't
+    /// contiguous on screen (which would make a splice cut into something it shouldn't).
+    private func renderedRange(ofSourceSpans wanted: ArraySlice<NSRange>,
+                               in storage: NSTextStorage) -> NSRange? {
+        let targets = Set(wanted.map { NSRange(location: $0.location, length: $0.length) }.map(NSStringFromRange))
+        var lo = Int.max, hi = Int.min
+        storage.enumerateAttribute(MDAttr.srcRange, in: NSRange(location: 0, length: storage.length)) { v, r, _ in
+            guard let s = (v as? NSValue)?.rangeValue, targets.contains(NSStringFromRange(s)) else { return }
+            lo = min(lo, r.location); hi = max(hi, r.location + r.length)
+        }
+        guard lo != Int.max, hi > lo else { return nil }
+        return NSRange(location: lo, length: hi - lo)
+    }
+
+    private func rebase(_ fragment: NSMutableAttributedString, sourceOffset: Int, idBase: Int) {
+        let whole = NSRange(location: 0, length: fragment.length)
+        fragment.enumerateAttribute(MDAttr.srcRange, in: whole) { value, range, _ in
+            guard let s = (value as? NSValue)?.rangeValue else { return }
+            fragment.addAttribute(MDAttr.srcRange,
+                                  value: NSValue(range: NSRange(location: s.location + sourceOffset, length: s.length)),
+                                  range: range)
+        }
+        fragment.enumerateAttribute(MDAttr.blockId, in: whole) { value, range, _ in
+            guard let id = value as? Int else { return }
+            fragment.addAttribute(MDAttr.blockId, value: idBase + id, range: range)
+        }
+    }
+
+    /// True when the document has link/footnote definitions, which a single block can refer to from
+    /// anywhere — the one case where a block does NOT render the same on its own.
+    private var hasCrossBlockReferences: Bool {
+        text.split(separator: "\n", omittingEmptySubsequences: true).contains { line in
+            let t = line.trimmingCharacters(in: .whitespaces)
+            return t.hasPrefix("[") && t.contains("]:")
+        }
     }
 
     // MARK: - Undo / Redo (⌘Z, ⇧⌘Z)
@@ -146,6 +303,11 @@ final class MarkdownDocument: NSDocument {
         let ext = (fileURL?.pathExtension ?? "md").lowercased()
         return !["md", "markdown", "mdown", "mkd", "mdtext"].contains(ext) && !ext.isEmpty
     }
+
+    /// The line ending this file uses, so an inserted line matches the ones around it. A file made
+    /// on Windows stays CRLF — mixing the two inside one file is the kind of thing that shows up
+    /// later as a stray character in someone else's tool.
+    var lineEnding: String { text.contains("\r\n") ? "\r\n" : "\n" }
 
     private func render(into wc: DocumentWindowController) {
         // FontSizeStore is the SINGLE owner of font size — never read UserDefaults directly.

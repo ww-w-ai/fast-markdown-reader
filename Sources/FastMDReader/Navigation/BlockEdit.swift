@@ -52,10 +52,17 @@ enum BlockEdit {
     }
 
     /// Insert a new block immediately AFTER block `i`.
+    ///
+    /// `fixedSeparator` overrides the copy-the-neighbouring-gap rule. A text file wants it: there,
+    /// a block is a LINE, so adding below means adding the next line — copying the gap would
+    /// reproduce a blank line the author happened to leave above, turning their spacing into
+    /// structure. Markdown passes nil and keeps the document's own paragraph spacing.
     static func insertion(after i: Int, spans: [NSRange], text: NSString,
-                          newSource: String, fallbackSeparator: String) -> (NSRange, String)? {
+                          newSource: String, fallbackSeparator: String,
+                          fixedSeparator: String? = nil) -> (NSRange, String)? {
         guard spans.indices.contains(i) else { return nil }
-        let sep = separator(around: i, spans: spans, text: text, fallback: fallbackSeparator)
+        let sep = fixedSeparator
+            ?? separator(around: i, spans: spans, text: text, fallback: fallbackSeparator)
         let at = spans[i].location + spans[i].length
         return (NSRange(location: at, length: 0), sep + newSource)
     }
@@ -64,16 +71,23 @@ enum BlockEdit {
     /// hole behind. The trailing gap goes normally; for the last block the leading one goes
     /// instead, otherwise the file would end in the blank line that used to separate them.
     static func deletion(of i: Int, spans: [NSRange]) -> NSRange? {
-        guard spans.indices.contains(i) else { return nil }
-        let s = spans[i]
-        if i + 1 < spans.count {
-            return NSRange(location: s.location, length: spans[i + 1].location - s.location)
+        deletion(from: i, through: i, spans: spans)
+    }
+
+    /// Delete a RUN of blocks, `first` through `last` inclusive — what a selection spanning several
+    /// blocks means. One range, so it is one undoable step rather than a pile of them, and the same
+    /// separator rule applies at the ends as for a single block.
+    static func deletion(from first: Int, through last: Int, spans: [NSRange]) -> NSRange? {
+        guard spans.indices.contains(first), spans.indices.contains(last), first <= last else { return nil }
+        if last + 1 < spans.count {
+            return NSRange(location: spans[first].location, length: spans[last + 1].location - spans[first].location)
         }
-        if i > 0 {
-            let prevEnd = spans[i - 1].location + spans[i - 1].length
-            return NSRange(location: prevEnd, length: s.location + s.length - prevEnd)
+        let end = spans[last].location + spans[last].length
+        if first > 0 {
+            let prevEnd = spans[first - 1].location + spans[first - 1].length
+            return NSRange(location: prevEnd, length: end - prevEnd)
         }
-        return s
+        return NSRange(location: spans[first].location, length: end - spans[first].location)
     }
 
     /// Swap block `i` with the one after it. The gap between them stays exactly where it is, so

@@ -7,12 +7,20 @@ import AppKit
 /// Monospaced, because the files that land here (csv rows, logs, fixed-width tables) are written
 /// expecting a fixed grid; a proportional font would break the only structure they have.
 ///
-/// Each NON-BLANK source line is tagged as one block, with the same two attributes the markdown
-/// renderer emits — `MDAttr.blockId` (a stop for the reading cursor / gutter click) and
-/// `MDAttr.srcRange` (its exact span in the file). That is the whole integration: block edit,
-/// add, delete and move are written against those attributes, so they work here for free.
-/// A blank line is deliberately left untagged — it is a separator, not something to step onto,
-/// and leaving it out lets a move swap two real lines across it without disturbing the gap.
+/// EVERY source line is one block — blank lines included — tagged with the same two attributes the
+/// markdown renderer emits: `MDAttr.blockId` (a stop for the reading cursor / gutter click) and
+/// `MDAttr.srcRange` (its exact span in the file). That is the whole integration: block edit, add,
+/// delete and move are written against those attributes, so they work here for free.
+///
+/// Counting blank lines as blocks is what makes this a TEXT file rather than a prose document, and
+/// it fixes two things at once: a blank line can be selected and deleted like any other line, and
+/// "add below" inserts exactly one new line instead of copying the gap around the block — in
+/// markdown a blank line separates paragraphs, but here it is simply an empty line the author put
+/// there, and the app has no business preserving or reproducing it as structure.
+///
+/// A block's RENDERED range includes the line's terminator (so a blank line, which has no
+/// characters of its own, still has something to be), while its SOURCE range covers only the line's
+/// text — that keeps a replacement from swallowing the newline that separates it from the next line.
 enum PlainTextRenderer {
     static func render(_ source: String, theme: RenderTheme) -> NSAttributedString {
         let out = NSMutableAttributedString()
@@ -40,11 +48,14 @@ enum PlainTextRenderer {
             out.append(NSAttributedString(string: ns.substring(with: NSRange(location: lineStart, length: end - lineStart)),
                                           attributes: attrs))
             let contentLength = contentsEnd - lineStart
-            if contentLength > 0 {
-                // Tag the CONTENT only; the terminator is a separator, like the blank line between
-                // two markdown blocks, and belongs to no block.
-                let r = NSRange(location: renderStart, length: contentLength)
+            // Tag the whole line INCLUDING its terminator: an empty line has no characters of its
+            // own, and a zero-length attribute range is no range at all — it would vanish, taking
+            // the blank line's existence as a block with it.
+            let r = NSRange(location: renderStart, length: out.length - renderStart)
+            if r.length > 0 {
                 out.addAttribute(MDAttr.blockId, value: blockSeq, range: r)
+                // The SOURCE range stays content-only, so replacing a line can't eat the newline
+                // that separates it from the next one.
                 out.addAttribute(MDAttr.srcRange,
                                  value: NSValue(range: NSRange(location: lineStart, length: contentLength)),
                                  range: r)

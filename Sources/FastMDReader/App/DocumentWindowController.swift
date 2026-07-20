@@ -642,8 +642,10 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
     /// newline in a plain text file).
     func addBlockBelow(atChar char: Int?) {
         guard let ctx = blockContext(atChar: char) else { NSSound.beep(); return }
-        let fallback = ctx.doc.isPlainText ? "\n" : "\n\n"
-        SourceEditPanel.show(title: "New block", markdown: "") { [weak self] added in
+        // A text file gets exactly one new line; a markdown file keeps its own paragraph spacing.
+        let fixed = ctx.doc.isPlainText ? ctx.doc.lineEnding : nil
+        let title = ctx.doc.isPlainText ? "New line" : "New block"
+        SourceEditPanel.show(title: title, markdown: "") { [weak self] added in
             guard let self, !added.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
             // Spans are recomputed at save time: the popup is modeless, so the document may have
             // changed (another edit, a reload) while it was open.
@@ -651,37 +653,104 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
                   let (r, replacement) = BlockEdit.insertion(after: ctx.index, spans: ctx.spans,
                                                              text: ctx.doc.text as NSString,
                                                              newSource: added,
-                                                             fallbackSeparator: fallback)
+                                                             fallbackSeparator: fixed ?? "\n\n",
+                                                             fixedSeparator: fixed)
             else { NSSound.beep(); return }
             ctx.doc.applySourceEdit(r, with: replacement, actionName: "Add Block")
         }
     }
 
-    /// Right-click → Delete Block: confirm first (this rewrites the file on disk), showing the
-    /// first line of what is about to go so the user can tell they picked the right block.
+    /// The run of blocks a delete should take: everything the SELECTION touches, or — with no
+    /// selection — just the block under the pointer. Deleting one block at a time when several are
+    /// highlighted would ignore what the user plainly indicated.
+    private func blockRunToDelete(atChar char: Int?) -> (doc: MarkdownDocument, spans: [NSRange],
+                                                         first: Int, last: Int)? {
+        guard let ctx = blockContext(atChar: char), let storage = textView.textStorage else { return nil }
+        let sel = textView.selectedRange()
+        guard sel.length > 0 else { return (ctx.doc, ctx.spans, ctx.index, ctx.index) }
+        var lo = Int.max, hi = Int.min
+        storage.enumerateAttribute(MDAttr.srcRange, in: sel) { v, _, _ in
+            guard let s = (v as? NSValue)?.rangeValue,
+                  let i = BlockEdit.indexOfBlock(containing: s.location, in: ctx.spans) else { return }
+            lo = min(lo, i); hi = max(hi, i)
+        }
+        guard lo != Int.max else { return (ctx.doc, ctx.spans, ctx.index, ctx.index) }
+        return (ctx.doc, ctx.spans, lo, hi)
+    }
+
+    /// Right-click → Delete: confirm first (this rewrites the file on disk), showing what is about
+    /// to go so the user can tell they picked the right thing.
     func deleteBlock(atChar char: Int?) {
-        guard let ctx = blockContext(atChar: char),
-              let r = BlockEdit.deletion(of: ctx.index, spans: ctx.spans) else { NSSound.beep(); return }
-        let source = ctx.doc.sourceSubstring(ctx.spans[ctx.index])
+        guard let run = blockRunToDelete(atChar: char),
+              BlockEdit.deletion(from: run.first, through: run.last, spans: run.spans) != nil
+        else { NSSound.beep(); return }
+        let count = run.last - run.first + 1
+        let noun = (run.doc.isPlainText ? "line" : "block") + (count == 1 ? "" : "s")
+        let source = run.doc.sourceSubstring(run.spans[run.first])
         let firstLine = source.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? source
-        let preview = firstLine.count > 80 ? String(firstLine.prefix(80)) + "…" : firstLine
+        var preview = firstLine.count > 80 ? String(firstLine.prefix(80)) + "…" : firstLine
+        if count > 1 { preview += "\n… through …\n" + run.doc.sourceSubstring(run.spans[run.last]).prefix(80) }
 
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = "Delete this block?"
-        alert.informativeText = "\(preview)\n\nThis rewrites \(ctx.doc.fileURL?.lastPathComponent ?? "the file") on disk. You can undo it with ⌘Z."
+        alert.messageText = count == 1 ? "Delete this \(noun)?" : "Delete these \(count) \(noun)?"
+        alert.informativeText = "\(preview)\n\nThis rewrites \(run.doc.fileURL?.lastPathComponent ?? "the file") on disk. You can undo it with ⌘Z."
         alert.addButton(withTitle: "Delete")
         alert.addButton(withTitle: "Cancel")
-        // The sheet is asynchronous, so re-resolve the block when the user actually confirms —
-        // an undo or a ⌘R reload while it was up would have moved every offset under it.
+        // The sheet is asynchronous, so re-resolve when the user actually confirms — an undo or a
+        // ⌘R reload while it was up would have moved every offset under it.
         let apply: (NSApplication.ModalResponse) -> Void = { [weak self] response in
             guard response == .alertFirstButtonReturn, let self,
-                  let ctx = self.blockContext(atChar: char),
-                  let r = BlockEdit.deletion(of: ctx.index, spans: ctx.spans) else { return }
-            ctx.doc.applySourceEdit(r, with: "", actionName: "Delete Block")
+                  let run = self.blockRunToDelete(atChar: char),
+                  let r = BlockEdit.deletion(from: run.first, through: run.last, spans: run.spans)
+            else { return }
+            run.doc.applySourceEdit(r, with: "", actionName: "Delete")
         }
         if let w = window { alert.beginSheetModal(for: w, completionHandler: apply) }
         else { apply(alert.runModal()) }
+    }
+
+    /// Put the reading cursor on the block an edit touched, and bring it on screen if it isn't
+    /// already. This matters most for undo/redo: the change can be anywhere in the document, and a
+    /// reader who presses ⌘Z and sees nothing move can't tell whether it did anything.
+    ///
+    /// Only scrolls when the block is NOT fully visible — undoing an edit you're looking at should
+    /// leave the page exactly where it is.
+    func revealEditedSource(_ span: NSRange, highlight: Bool) {
+        guard let storage = textView.textStorage, storage.length > 0,
+              let lm = textView.layoutManager, let container = textView.textContainer else { return }
+        let probe = NSRange(location: span.location, length: max(span.length, 1))
+        var lo = Int.max, hi = Int.min
+        var fallback: Int?
+        storage.enumerateAttribute(MDAttr.srcRange, in: NSRange(location: 0, length: storage.length)) { v, r, _ in
+            guard let s = (v as? NSValue)?.rangeValue else { return }
+            if s.location < probe.location + probe.length, s.location + s.length > probe.location {
+                lo = min(lo, r.location); hi = max(hi, r.location + r.length)
+            } else if fallback == nil, s.location >= probe.location + probe.length {
+                fallback = r.location          // the block that moved up into a deleted one's place
+            }
+        }
+        let target: NSRange
+        if lo != Int.max, hi > lo { target = NSRange(location: lo, length: hi - lo) }
+        else if let f = fallback { target = NSRange(location: f, length: 0) }
+        else { target = NSRange(location: min(span.location, storage.length), length: 0) }
+
+        textView.setSelectedRange(highlight ? target : NSRange(location: target.location, length: 0))
+        let glyphs = lm.glyphRange(forCharacterRange: target, actualCharacterRange: nil)
+        var rect = lm.boundingRect(forGlyphRange: glyphs, in: container)
+        rect.origin.x += textView.textContainerInset.width
+        rect.origin.y += textView.textContainerInset.height
+        if !textView.visibleRect.contains(rect) {
+            // Leave a little air above it rather than pinning it to the very top edge.
+            textView.scrollRangeToVisible(target)
+            let clip = scrollView.contentView
+            let y = max(0, rect.minY - clip.bounds.height / 4)
+            if rect.height < clip.bounds.height {
+                clip.scroll(to: NSPoint(x: 0, y: min(y, max(0, textView.bounds.height - clip.bounds.height))))
+                scrollView.reflectScrolledClipView(clip)
+            }
+        }
+        placeCopyButtons()
     }
 
     // MARK: Move mode
@@ -744,10 +813,12 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         textView.scrollRangeToVisible(r)
     }
 
-    /// The rendered (on-screen) range of the block currently being moved.
-    private func movingBlockRenderedRange() -> NSRange? {
+    /// The rendered (on-screen) range of the block currently being moved. `spans` is passed in when
+    /// the caller already has it — scanning a 1MB document for block spans costs milliseconds, and
+    /// this runs on every scroll event while the move bar is up, so doing it twice is twice too many.
+    private func movingBlockRenderedRange(spans precomputed: [NSRange]? = nil) -> NSRange? {
         guard let i = moveIndex, let storage = textView.textStorage else { return nil }
-        let spans = BlockEdit.spans(in: storage)
+        let spans = precomputed ?? BlockEdit.spans(in: storage)
         guard spans.indices.contains(i) else { return nil }
         let target = spans[i]
         var lo = Int.max, hi = Int.min
@@ -764,9 +835,9 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
     func positionMoveBar() {
         guard let bar = moveBar, let i = moveIndex, let storage = textView.textStorage,
               let lm = textView.layoutManager, let container = textView.textContainer else { return }
-        guard let rendered = movingBlockRenderedRange() else { endMovingBlock(); return }
-        if bar.superview !== textView { textView.addSubview(bar) }   // survives a re-render
         let spans = BlockEdit.spans(in: storage)
+        guard let rendered = movingBlockRenderedRange(spans: spans) else { endMovingBlock(); return }
+        if bar.superview !== textView { textView.addSubview(bar) }   // survives a re-render
         bar.setEnabled(up: i > 0, down: i + 1 < spans.count)
         let glyphs = lm.glyphRange(forCharacterRange: rendered, actualCharacterRange: nil)
         var rect = lm.boundingRect(forGlyphRange: glyphs, in: container)

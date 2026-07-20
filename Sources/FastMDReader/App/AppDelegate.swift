@@ -39,6 +39,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appItem.submenu = appMenu
         appMenu.addItem(withTitle: "About \(appName)", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
         appMenu.addItem(.separator())
+        // Offered, never taken. An app that makes itself the default handler on its own — at first
+        // launch or otherwise — is hijacking a system-wide setting the user didn't touch, which the
+        // App Store rejects and users rightly resent. This does it only when asked, and says
+        // exactly which kinds of file it will claim before doing anything.
+        let defaults = appMenu.addItem(withTitle: "Open Text Files with \(appName)…",
+                                       action: #selector(offerToBecomeDefault(_:)), keyEquivalent: "")
+        defaults.target = self
+        appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Hide \(appName)", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
         appMenu.addItem(withTitle: "Quit \(appName)", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
 
@@ -60,6 +68,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         recentItem.submenu = recentMenu
         let close = fileMenu.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
         close.keyEquivalentModifierMask = [.command]
+        // Edits live in memory until this. Closing with unsaved changes gets AppKit's own
+        // Save / Don't Save / Cancel sheet, because the document now reports itself as dirty.
+        fileMenu.addItem(withTitle: "Save", action: #selector(NSDocument.save(_:)), keyEquivalent: "s")
         fileMenu.addItem(.separator())
         // Sandboxed build only: the App Store sandbox blocks a document's own sibling images until
         // the user grants the folder. Clicking a blocked image does the same thing; this is the
@@ -108,6 +119,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.helpMenu = helpMenu
 
         NSApp.mainMenu = mainMenu
+    }
+
+    // MARK: - Become the default app for text files (user-initiated only)
+
+    /// The kinds this offer covers. Only types macOS actually has a registered identity for —
+    /// .conf/.env/.rst and friends resolve to a throwaway identity that no association can be
+    /// pinned to, so promising them here would be a promise the system can't keep.
+    private static let claimable: [(name: String, id: String)] = [
+        ("Plain text (.txt)", "public.plain-text"),
+        ("Comma-separated values (.csv)", "public.comma-separated-values-text"),
+        ("Tab-separated values (.tsv)", "public.tab-separated-values-text"),
+        ("Log files (.log)", "com.apple.log"),
+        ("Markdown (.md)", "net.daringfireball.markdown"),
+    ]
+
+    @objc func offerToBecomeDefault(_ sender: Any?) {
+        let alert = NSAlert()
+        alert.messageText = "Open these files with fast-md-reader?"
+        alert.informativeText = """
+            Double-clicking these kinds of file in the Finder will open them here:
+
+            \(Self.claimable.map { "•  " + $0.name }.joined(separator: "\n"))
+
+            This changes a system setting. To undo it, select a file in the Finder, press ⌘I, and \
+            pick another app under "Open with".
+            """
+        alert.addButton(withTitle: "Use fast-md-reader")
+        alert.addButton(withTitle: "Not Now")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let appURL = Bundle.main.bundleURL
+        let bundleID = Bundle.main.bundleIdentifier ?? ""
+        // The completion handlers come back on whatever queue AppKit chooses, so the tally is
+        // guarded — several of them landing at once would otherwise corrupt the array.
+        let lock = NSLock()
+        var failures: [String] = []
+        func note(_ name: String) { lock.lock(); failures.append(name); lock.unlock() }
+        let group = DispatchGroup()
+        for kind in Self.claimable {
+            guard let type = UTType(kind.id) else { note(kind.name); continue }
+            group.enter()
+            if #available(macOS 14.0, *) {
+                NSWorkspace.shared.setDefaultApplication(at: appURL, toOpen: type) { error in
+                    if error != nil { note(kind.name) }
+                    group.leave()
+                }
+            } else {
+                let status = LSSetDefaultRoleHandlerForContentType(
+                    kind.id as CFString, .all, bundleID as CFString)
+                if status != noErr { note(kind.name) }
+                group.leave()
+            }
+        }
+        group.notify(queue: .main) {
+            // Report the outcome either way. A settings change with no visible result leaves the
+            // user unsure whether it took — and macOS can refuse one (a managed Mac, say).
+            let done = NSAlert()
+            done.messageText = failures.isEmpty ? "Done" : "Partly done"
+            done.informativeText = failures.isEmpty
+                ? "Those files now open in fast-md-reader."
+                : "macOS declined to change:\n\n\(failures.map { "•  " + $0 }.joined(separator: "\n"))\n\nYou can set these per file with ⌘I in the Finder."
+            done.addButton(withTitle: "OK")
+            done.runModal()
+        }
     }
 
     // MARK: - Open… (own panel → known-good open path)

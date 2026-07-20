@@ -52,6 +52,26 @@ final class BlockEditTests: XCTestCase {
         XCTAssertEqual(apply(one, BlockEdit.deletion(of: 0, spans: spans).map { ($0, "") }), "")
     }
 
+    /// A selection spanning several blocks deletes them as ONE step, not one delete per block.
+    func testDeleteRunOfBlocks() {
+        let r = BlockEdit.deletion(from: 0, through: 1, spans: mdSpans)
+        XCTAssertEqual(apply(md, r.map { ($0, "") }), "C")
+    }
+
+    func testDeleteRunReachingTheEndTrimsThePrecedingSeparator() {
+        let r = BlockEdit.deletion(from: 1, through: 2, spans: mdSpans)
+        XCTAssertEqual(apply(md, r.map { ($0, "") }), "# A")
+    }
+
+    func testDeleteEveryBlockEmptiesTheFile() {
+        let r = BlockEdit.deletion(from: 0, through: 2, spans: mdSpans)
+        XCTAssertEqual(apply(md, r.map { ($0, "") }), "")
+    }
+
+    func testDeleteRunRejectsAnInvertedRange() {
+        XCTAssertNil(BlockEdit.deletion(from: 2, through: 0, spans: mdSpans))
+    }
+
     // MARK: Insert
 
     func testInsertReusesTheDocumentsOwnSeparator() {
@@ -111,19 +131,46 @@ final class BlockEditTests: XCTestCase {
 }
 
 final class PlainTextRendererTests: XCTestCase {
+    private func apply(_ text: String, _ edit: (NSRange, String)?) -> String? {
+        guard let edit else { return nil }
+        return (text as NSString).replacingCharacters(in: edit.0, with: edit.1)
+    }
+
     func testRendersVerbatimWithoutParsingMarkdown() {
         let src = "# not a heading\n*not italic*"
         let out = PlainTextRenderer.render(src, theme: .current(size: 16))
         XCTAssertEqual(out.string, src, "a text file must reach the screen character for character")
     }
 
-    func testEachNonBlankLineIsOneBlock() {
+    /// EVERY line is a block here, blank ones included — otherwise a blank line can't be selected,
+    /// deleted or moved, and "add below" has to guess whether the gap around a line is meaningful.
+    func testEveryLineIsOneBlockIncludingBlankOnes() {
         let src = "a,1\n\nb,2"
         let out = PlainTextRenderer.render(src, theme: .current(size: 16))
         let spans = BlockEdit.spans(in: out)
-        XCTAssertEqual(spans.count, 2, "the blank line is a separator, not a block")
+        XCTAssertEqual(spans.count, 3)
         XCTAssertEqual((src as NSString).substring(with: spans[0]), "a,1")
-        XCTAssertEqual((src as NSString).substring(with: spans[1]), "b,2")
+        XCTAssertEqual((src as NSString).substring(with: spans[1]), "", "the blank line")
+        XCTAssertEqual(spans[1].length, 0)
+        XCTAssertEqual((src as NSString).substring(with: spans[2]), "b,2")
+    }
+
+    /// Deleting a blank line removes the line, not the neighbouring text.
+    func testDeletingABlankLine() {
+        let src = "a,1\n\nb,2"
+        let spans = BlockEdit.spans(in: PlainTextRenderer.render(src, theme: .current(size: 16)))
+        let r = BlockEdit.deletion(of: 1, spans: spans)
+        XCTAssertEqual(apply(src, r.map { ($0, "") }), "a,1\nb,2")
+    }
+
+    /// Adding below a line inserts ONE line, even when the file has blank lines elsewhere — in a
+    /// text file a blank line is spacing the author typed, not a paragraph break to reproduce.
+    func testAddBelowInATextFileAddsExactlyOneLine() {
+        let src = "a,1\n\nb,2"
+        let spans = BlockEdit.spans(in: PlainTextRenderer.render(src, theme: .current(size: 16)))
+        let edit = BlockEdit.insertion(after: 0, spans: spans, text: src as NSString,
+                                       newSource: "NEW", fallbackSeparator: "\n", fixedSeparator: "\n")
+        XCTAssertEqual(apply(src, edit), "a,1\nNEW\n\nb,2")
     }
 
     func testTrailingNewlineDoesNotAddAnEmptyBlock() {
