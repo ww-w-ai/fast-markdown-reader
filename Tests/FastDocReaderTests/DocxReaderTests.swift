@@ -2201,13 +2201,13 @@ final class DocxReaderTests: XCTestCase {
         let styles = "<w:styles><w:docDefaults><w:rPrDefault><w:rPr><w:sz w:val=\"20\"/></w:rPr></w:rPrDefault></w:docDefaults></w:styles>"
         let zip = buildDocx(document: doc("<w:p><w:r><w:t>Body</w:t></w:r></w:p>"), styles: styles)
         let archive = try ZipArchive(data: zip)
-        XCTAssertEqual(DocxReader.documentDefaultFontSize(from: archive), 10)
+        XCTAssertEqual(DocxReader.documentDefaultBodyFontSize(archive), 10)
     }
 
     func testDocumentDefaultFontSizeFallsBackToElevenWhenNotDeclared() throws {
         let zip = buildDocx(document: doc("<w:p><w:r><w:t>Body</w:t></w:r></w:p>"))
         let archive = try ZipArchive(data: zip)
-        XCTAssertEqual(DocxReader.documentDefaultFontSize(from: archive), 11)
+        XCTAssertEqual(DocxReader.documentDefaultBodyFontSize(archive), 11)
     }
 
     // MARK: w:jc — alignment, and winning over the rtl default

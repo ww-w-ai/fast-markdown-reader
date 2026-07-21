@@ -9,7 +9,7 @@ import AppKit
 /// heading) and `word/numbering.xml` (whether a list level is a bullet or a number). Neither
 /// being absent is an error — Word omits `numbering.xml` from documents with no lists at all —
 /// so both fall back to an empty table and the body still parses.
-enum DocxReader {
+enum DocxReader: OfficeDocumentReader {
     enum ReadError: Swift.Error, Equatable, LocalizedError {
         /// `word/document.xml` is missing from the archive. Returning an empty document here
         /// would look like a genuinely blank file — the worst failure mode for a reader — so
@@ -72,13 +72,11 @@ enum DocxReader {
     /// `w:docDefaults/w:rPrDefault/w:rPr/w:sz` (HALF-points), or Word's own fallback of 11pt when
     /// the document declares none at all (no `word/styles.xml`, no `w:docDefaults`, or no `w:sz`
     /// inside it). This is the OTHER half of `OfficeTextBuilder.build`'s font-size model — see its
-    /// `documentDefaultFontSize` parameter's own doc — and today ONLY exposes the real value; wiring
-    /// it into that call is `MarkdownDocument.setOfficeContent`'s/`DocumentTypes.readOffice`'s job,
-    /// both outside this sprint's exclusive file scope (`DocxReader.swift`/`DocxReaderTests.swift`
-    /// only) — see this sprint's return report. Deliberately a SEPARATE entry point rather than a
-    /// change to `read`'s own return type: `read`'s `[OfficeBlock]` shape is depended on by
-    /// `DocumentTypes.readOffice` and `MarkdownDocument`, neither of which this sprint may touch.
-    static func documentDefaultFontSize(from archive: ZipArchive) -> CGFloat {
+    /// `documentDefaultFontSize` parameter's own doc. Named (and shaped) to match `OfficeDocumentReader`
+    /// exactly, and reached ONLY through `DocumentTypes.officeDefaultBodyFontSize` — see that file for
+    /// why a second, direct call site would risk the same reader/extension divergence invariant 29
+    /// records.
+    static func documentDefaultBodyFontSize(_ archive: ZipArchive) -> CGFloat {
         guard archive.contains("word/styles.xml"),
               let data = try? archive.data(for: "word/styles.xml"),
               let root = try? buildTree(data),

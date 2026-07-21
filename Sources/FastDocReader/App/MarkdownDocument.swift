@@ -12,9 +12,9 @@ final class MarkdownDocument: NSDocument {
 
     /// The SOURCE document's own default body run size, in points — see
     /// `OfficeTextBuilder.build`'s `documentDefaultFontSize` doc for the font-size model this
-    /// feeds. `11` (the OOXML default when a document states none) until a reader actually
-    /// resolves `w:docDefaults`/ODT's default paragraph style and passes a real value into
-    /// `setOfficeContent` — this sprint only wires the parameter through; no reader sets it yet.
+    /// feeds. Set from `DocumentTypes.officeDefaultBodyFontSize`, both on first `read(from:)` and on
+    /// `reloadDocument` (see `ReloadOutcome.office`), so the two behave identically. `11` (the
+    /// fallback both readers themselves return) when the document declares no default of its own.
     private(set) var officeDefaultBodyFontSize: CGFloat = 11
 
     /// The archive `officeBlocks` was parsed from, kept so an `.image` block's id (an archive entry
@@ -92,7 +92,9 @@ final class MarkdownDocument: NSDocument {
         }
         let archive = try ZipArchive(data: data)
         let ext = fileURL?.pathExtension ?? untitledExtension ?? ""
-        setOfficeContent(blocks: try DocumentTypes.readOffice(archive, extension: ext), archive: archive)
+        setOfficeContent(
+            blocks: try DocumentTypes.readOffice(archive, extension: ext), archive: archive,
+            defaultBodyFontSize: DocumentTypes.officeDefaultBodyFontSize(archive, extension: ext))
     }
 
     /// The office-document seam `read(from:)` and `reloadDocument` both go through: the parser's
@@ -131,7 +133,7 @@ final class MarkdownDocument: NSDocument {
     /// failing meant the function silently did nothing, which looks identical to a successful no-op
     /// reload and hides a real problem (deleted file, permissions, a corrupted archive) from the user.
     enum ReloadOutcome {
-        case office(blocks: [OfficeBlock], archive: ZipArchive)
+        case office(blocks: [OfficeBlock], archive: ZipArchive, defaultBodyFontSize: CGFloat)
         case text(TextFile)
         case failure(String)
     }
@@ -154,7 +156,8 @@ final class MarkdownDocument: NSDocument {
         do {
             let archive = try ZipArchive(data: data)
             let blocks = try DocumentTypes.readOffice(archive, extension: ext)
-            return .office(blocks: blocks, archive: archive)
+            let defaultBodyFontSize = DocumentTypes.officeDefaultBodyFontSize(archive, extension: ext)
+            return .office(blocks: blocks, archive: archive, defaultBodyFontSize: defaultBodyFontSize)
         } catch {
             return .failure(error.localizedDescription)
         }
@@ -178,11 +181,13 @@ final class MarkdownDocument: NSDocument {
         if let url = fileURL {
             let ext = url.pathExtension.isEmpty ? (untitledExtension ?? "") : url.pathExtension
             switch Self.reloadOutcome(url: url, kind: kind, extension: ext) {
-            case .office(let blocks, let archive):
+            case .office(let blocks, let archive, let defaultBodyFontSize):
                 // Re-parse the archive, same as the initial read — never through the text-decode
                 // path (invariant: an office document's bytes are never handed to
-                // `TextEncodingDetector`).
-                setOfficeContent(blocks: blocks, archive: archive)
+                // `TextEncodingDetector`). `defaultBodyFontSize` is carried through too, so a
+                // reload renders identically to the first open of the same file (see invariant 29's
+                // "reload must behave the same as first open" lesson).
+                setOfficeContent(blocks: blocks, archive: archive, defaultBodyFontSize: defaultBodyFontSize)
             case .text(let reread):
                 // The undo stack holds source OFFSETS into the text we're replacing. Re-reading the
                 // file can move every one of them (the file may have changed behind us), so an undo

@@ -389,6 +389,133 @@ final class OfficeDocumentTests: XCTestCase {
                        "render(into:) must use the DOCUMENT's own default (8), not OfficeTextBuilder's 11pt fallback")
     }
 
+    // MARK: S16 — the document's OWN declared default body size, read through the real dispatch
+    // (`DocumentTypes.officeDefaultBodyFontSize`), not injected via `setOfficeContent` directly.
+    // `DocxReaderTests`/`OdtReaderTests` already prove each reader reports the right number in
+    // isolation — that proves nothing about whether `MarkdownDocument.read(from:)` actually wires it
+    // in, which is exactly the class of bug invariant 29 records (a reader that works but is never
+    // reached).
+
+    private func fixtureDocxWithDocDefaultsAndExplicitRun() -> Data {
+        let styles = """
+        <?xml version="1.0" encoding="UTF-8"?><w:styles>
+          <w:docDefaults><w:rPrDefault><w:rPr><w:sz w:val="20"/></w:rPr></w:rPrDefault></w:docDefaults>
+        </w:styles>
+        """
+        let document = """
+        <?xml version="1.0" encoding="UTF-8"?><w:document><w:body>
+          <w:p><w:r><w:rPr><w:sz w:val="22"/></w:rPr><w:t>Body</w:t></w:r></w:p>
+        </w:body></w:document>
+        """
+        return buildZip([
+            ("word/document.xml", Data(document.utf8)),
+            ("word/styles.xml", Data(styles.utf8)),
+        ])
+    }
+
+    private func fixtureOdtWithDefaultStyleAndExplicitRun() -> Data {
+        let content = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <office:document-content>
+          <office:automatic-styles>
+            <style:style style:name="Styled" style:family="text">
+              <style:text-properties fo:font-size="11pt"/>
+            </style:style>
+          </office:automatic-styles>
+          <office:body><office:text>
+            <text:p><text:span text:style-name="Styled">Body</text:span></text:p>
+          </office:text></office:body>
+        </office:document-content>
+        """
+        let styles = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <office:document-styles>
+          <office:styles>
+            <style:default-style style:family="paragraph">
+              <style:text-properties fo:font-size="13pt"/>
+            </style:default-style>
+          </office:styles>
+        </office:document-styles>
+        """
+        return buildZip([
+            ("content.xml", Data(content.utf8)),
+            ("styles.xml", Data(styles.utf8)),
+        ])
+    }
+
+    func testDocxDeclaringANonDefaultBodySizeRendersScaledThroughMarkdownDocumentsOwnReadPath() throws {
+        let originalSize = FontSizeStore.size
+        FontSizeStore.size = 20   // reading size == the document's own declared default (10pt) × 2
+        defer { FontSizeStore.size = originalSize }
+
+        let (doc, wc) = try openOffice(fixtureDocxWithDocDefaultsAndExplicitRun())
+        XCTAssertEqual(doc.officeDefaultBodyFontSize, 10,
+                       "MarkdownDocument.read(from:) must call DocumentTypes.officeDefaultBodyFontSize, " +
+                       "not leave the 11pt constant every call site used to hardcode")
+        let storage = try XCTUnwrap(wc.textStorageRef)
+        let font = try XCTUnwrap(storage.attribute(.font, at: 0, effectiveRange: nil) as? NSFont)
+        // scale = 20/10 = 2; the run's authored 11pt renders at 22pt.
+        XCTAssertEqual(font.pointSize, 22)
+    }
+
+    func testOdtDeclaringANonDefaultBodySizeRendersScaledThroughMarkdownDocumentsOwnReadPath() throws {
+        let originalSize = FontSizeStore.size
+        FontSizeStore.size = 26   // reading size == the document's own declared default (13pt) × 2
+        defer { FontSizeStore.size = originalSize }
+
+        let (doc, wc) = try openOffice(fixtureOdtWithDefaultStyleAndExplicitRun(),
+                                        ext: "odt", uti: "org.oasis-open.opendocument.text")
+        XCTAssertEqual(doc.officeDefaultBodyFontSize, 13,
+                       "MarkdownDocument.read(from:) must call DocumentTypes.officeDefaultBodyFontSize " +
+                       "for .odt too, through the SAME dispatch readOffice uses")
+        let storage = try XCTUnwrap(wc.textStorageRef)
+        let font = try XCTUnwrap(storage.attribute(.font, at: 0, effectiveRange: nil) as? NSFont)
+        // scale = 26/13 = 2; the run's authored 11pt renders at 22pt.
+        XCTAssertEqual(font.pointSize, 22)
+    }
+
+    func testDocumentDeclaringNoDefaultStillUses11PointFallback() throws {
+        let (doc, _) = try openOffice(fixtureDocx())
+        XCTAssertEqual(doc.officeDefaultBodyFontSize, 11)
+    }
+
+    /// An unstyled document (no `Span.fontSize` anywhere) must render exactly as it did before this
+    /// wiring existed — `fontSizeScale` only multiplies a run that names an explicit size (see
+    /// `OfficeTextBuilder.build`'s own doc), so a document with none must be untouched by whatever
+    /// `officeDefaultBodyFontSize` resolves to.
+    func testUnstyledDocumentIsUnaffectedByTheDefaultBodyFontSizeWiring() throws {
+        let (doc, wc) = try openOffice(fixtureDocx())
+        XCTAssertEqual(doc.officeDefaultBodyFontSize, 11)
+        let storage = try XCTUnwrap(wc.textStorageRef)
+        let bodyRange = try XCTUnwrap(storage.string.range(of: "Body text."))
+        let bodyIndex = storage.string.distance(from: storage.string.startIndex, to: bodyRange.lowerBound)
+        let font = try XCTUnwrap(storage.attribute(.font, at: bodyIndex, effectiveRange: nil) as? NSFont)
+        XCTAssertEqual(font.pointSize, FontSizeStore.size,
+                       "an unsized run must render at the theme's own body size, unscaled")
+    }
+
+    /// Invariant 29's own lesson, applied to THIS wiring: a document must render identically on
+    /// first open and after ⌘R. `ReloadOutcome.office` carries `defaultBodyFontSize` alongside
+    /// `blocks`/`archive` for exactly this — assert the two paths agree rather than assume it.
+    func testReloadProducesTheSameDefaultBodyFontSizeAsFirstOpen() throws {
+        let data = fixtureDocxWithDocDefaultsAndExplicitRun()
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("fmd-office-reload-fontsize-\(UUID().uuidString).docx")
+        try data.write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let doc = MarkdownDocument()
+        doc.fileURL = url
+        try doc.read(from: data, ofType: "org.openxmlformats.wordprocessingml.document")
+        XCTAssertEqual(doc.officeDefaultBodyFontSize, 10)
+
+        guard case .office(_, _, let reloadedDefault) =
+            MarkdownDocument.reloadOutcome(url: url, kind: .office, extension: "docx")
+        else { return XCTFail("expected a successful office reload") }
+        XCTAssertEqual(reloadedDefault, doc.officeDefaultBodyFontSize,
+                       "a reload must resolve the same default body size as the first open of the same file")
+    }
+
     // MARK: Read-only enforcement
 
     func testDataOfTypeThrowsForOfficeDocument() throws {

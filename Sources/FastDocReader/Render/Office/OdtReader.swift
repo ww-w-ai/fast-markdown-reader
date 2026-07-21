@@ -9,7 +9,7 @@ import AppKit
 /// `DocxReader`, deliberately shaped the same way (same XML-tree approach, same error type, same
 /// span-reassembly, same unresolvable-image convention) so two office readers don't diverge for no
 /// reason — but the underlying markup is different enough that nothing is shared code, only shape.
-enum OdtReader {
+enum OdtReader: OfficeDocumentReader {
     enum ReadError: Swift.Error, Equatable, LocalizedError {
         /// `content.xml` is missing from the archive. Returning an empty document here would look
         /// like a genuinely blank file — the worst failure mode for a reader — so this throws.
@@ -98,12 +98,11 @@ enum OdtReader {
     /// `style:default-style` (the family-wide fallback every paragraph without its own explicit
     /// size ultimately falls back to, family `"paragraph"`)'s `style:text-properties/fo:font-size`.
     /// A SEPARATE entry point from `read()` rather than a second return value: `read()`'s signature
-    /// (`[OfficeBlock]`) is a call-site contract this sprint does not own (`DocumentTypes.readOffice`/
-    /// `MarkdownDocument` — see this sprint's own report for why wiring the result into
-    /// `OfficeTextBuilder.build`'s `documentDefaultFontSize` parameter is left for whoever DOES own
-    /// those call sites). `11` — the same default `OfficeTextBuilder.build` itself falls back to — is
-    /// returned when the document declares no `style:default-style` at all, or one with no font size,
-    /// so a caller that doesn't wire this through yet loses nothing (11 is what it already assumes).
+    /// (`[OfficeBlock]`) is a call-site contract `DocumentTypes.readOffice`/`MarkdownDocument` depend
+    /// on. Reached ONLY through `DocumentTypes.officeDefaultBodyFontSize`, never called directly by
+    /// `MarkdownDocument` — see `DocumentTypes.officeReaderType`'s doc for why. `11` — the same
+    /// default `OfficeTextBuilder.build` itself falls back to — is returned when the document
+    /// declares no `style:default-style` at all, or one with no font size.
     static func documentDefaultBodyFontSize(_ archive: ZipArchive) -> CGFloat {
         guard archive.contains("content.xml"),
               let contentData = try? archive.data(for: "content.xml"),
