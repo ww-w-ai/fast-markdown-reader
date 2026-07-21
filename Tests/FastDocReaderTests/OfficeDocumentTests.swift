@@ -145,6 +145,19 @@ final class OfficeDocumentTests: XCTestCase {
         ])
     }
 
+    /// S10 invariant 29: a display equation (`m:oMathPara`) must reach `doc.officeBlocks` — AND the
+    /// rendered text storage as a web block `MarkdownDocument`'s pre-render pass can find — through
+    /// the real `MarkdownDocument.read` dispatch, not only through `DocxReaderTests`/
+    /// `OfficeTextBuilderTests` calling the parser/builder directly.
+    private func fixtureDocxWithFormula() -> Data {
+        let document = """
+        <?xml version="1.0" encoding="UTF-8"?><w:document><w:body>
+          <w:p><m:oMathPara><m:oMath><m:r><m:t>x^2</m:t></m:r></m:oMath></m:oMathPara></w:p>
+        </w:body></w:document>
+        """
+        return buildZip([("word/document.xml", Data(document.utf8))])
+    }
+
     private func fixtureOdtWithTableImage() -> Data {
         let content = """
         <?xml version="1.0" encoding="UTF-8"?>
@@ -238,6 +251,22 @@ final class OfficeDocumentTests: XCTestCase {
         let cellBlocks = rows.first?.first?.blocks ?? []
         XCTAssertTrue(cellBlocks.contains { if case .image = $0 { return true }; return false },
                       "the cell's image must survive the full read path, not just OdtReader.read directly")
+    }
+
+    /// S10 invariant 29: an office equation must reach both `doc.officeBlocks` (`.formula`) and the
+    /// SAME `enumerateWebBlocks` seam `MarkdownDocument.prerenderAllDiagrams`/`presizeKnownMedia`
+    /// use, through the real read path — a parser-only test (`DocxReaderTests`) cannot see whether
+    /// the attribute actually reaches the text storage `OfficeTextBuilder.build` produces.
+    func testFormulaReachesOfficeBlocksAndTheWebBlockSeamThroughTheFullReadPath() throws {
+        let (doc, wc) = try openOffice(fixtureDocxWithFormula())
+        XCTAssertTrue(doc.officeBlocks.contains { if case .formula = $0 { return true }; return false },
+                      "the equation must survive the full read path, not just DocxReader.read directly")
+        let storage = try XCTUnwrap(wc.textStorageRef)
+        var found: [WebBlock] = []
+        storage.enumerateWebBlocks { block, _ in found.append(block) }
+        XCTAssertEqual(found.count, 1)
+        XCTAssertEqual(found.first?.engine, .math)
+        XCTAssertEqual(found.first?.code, "x^2")
     }
 
     func testMalformedArchiveThrowsRatherThanProducingAnEmptyDocument() {

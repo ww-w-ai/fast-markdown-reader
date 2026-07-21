@@ -183,7 +183,7 @@ enum DocxReader {
         case .heading(let level, let spans): return .heading(level: level, spans: [marker] + spans)
         case .listItem(let level, let ordered, let spans, let itemMarker):
             return .listItem(level: level, ordered: ordered, spans: [marker] + spans, marker: itemMarker)
-        case .table, .image, .unsupportedGraphic: return nil
+        case .table, .image, .unsupportedGraphic, .formula: return nil
         }
     }
 
@@ -720,7 +720,7 @@ enum DocxReader {
         switch block {
         case .paragraph(let spans), .heading(_, let spans), .listItem(_, _, let spans, _):
             return spans.isEmpty
-        case .table, .image, .unsupportedGraphic:
+        case .table, .image, .unsupportedGraphic, .formula:
             return false
         }
     }
@@ -980,6 +980,12 @@ enum DocxReader {
         let drawingBlocks = collectDrawingBlocks(
             in: p, styleInfo: styleInfo, numbering: numbering, relationships: relationships,
             notes: notes, listState: listState)
+        // A display equation (`m:oMathPara`) is collected separately from `spans`, not folded into
+        // them — `collectSpans` deliberately SKIPS `m:oMathPara` (see its own switch) so its content
+        // is never also flattened into plain text there; a bare inline `m:oMath` takes the opposite
+        // path (degraded to a `Span` INSIDE `spans` by `collectSpans` itself), matching this
+        // sprint's inline-vs-block decision (see `WebBlock`'s doc / `OfficeBlock.formula`'s doc).
+        let formulaBlocks = collectFormulaBlocks(in: p)
         // Heading wins over list, even when the paragraph ALSO carries `w:numPr` — Word-authored
         // contracts routinely attach a multilevel list to their heading styles so "1. Definitions"
         // / "2.1 Interpretation" number themselves, and `outlineLvl` is the author's explicit
@@ -995,7 +1001,7 @@ enum DocxReader {
         // value it never visibly used.
         let pStyleId = pPr?.child("w:pStyle")?.attributes["w:val"]
         let textBlock: OfficeBlock?
-        let skipEmptyText = spans.isEmpty && !drawingBlocks.isEmpty
+        let skipEmptyText = spans.isEmpty && (!drawingBlocks.isEmpty || !formulaBlocks.isEmpty)
         if let level = headingLevel(pPr: pPr, pStyleId: pStyleId, styleInfo: styleInfo) {
             textBlock = skipEmptyText ? nil : .heading(level: level, spans: spans)
         } else if let numPr = pPr?.child("w:numPr") {
@@ -1016,7 +1022,49 @@ enum DocxReader {
         var blocks: [OfficeBlock] = []
         if let textBlock { blocks.append(textBlock) }
         blocks.append(contentsOf: drawingBlocks)
+        blocks.append(contentsOf: formulaBlocks)
         return blocks
+    }
+
+    /// Finds every `m:oMathPara` (a display equation on its own line) anywhere inside a paragraph
+    /// and translates each `m:oMath` it wraps into a `.formula` block — one block per equation, in
+    /// document order. Deliberately shallow compared to `collectDrawingBlocks`: real documents put
+    /// `m:oMathPara` directly as a `w:p` child, not buried inside `mc:AlternateContent`, but the
+    /// generic `default: walk` still descends through anything unanticipated (a tracked-change
+    /// wrapper, say) so an equation is never missed just because Word nested it one level deeper
+    /// than expected. Does NOT recurse into `m:oMathPara` itself once found — its own children are
+    /// exactly the `m:oMath` elements being collected, not further paragraph structure to walk.
+    private static func collectFormulaBlocks(in node: XMLNode) -> [OfficeBlock] {
+        var blocks: [OfficeBlock] = []
+        func walk(_ node: XMLNode) {
+            for child in node.children {
+                if child.name == "m:oMathPara" {
+                    for oMath in child.children where oMath.name == "m:oMath" {
+                        blocks.append(formulaBlock(for: oMath))
+                    }
+                    continue
+                }
+                walk(child)
+            }
+        }
+        walk(node)
+        return blocks
+    }
+
+    /// One `m:oMath` → one `.formula` block, with the SAME never-nothing fallback ladder every
+    /// other content type in this reader uses: real LaTeX shape when the translation produced any
+    /// (`OmmlTranslator.latex` already degrades unrecognized sub-constructs to their own text, so
+    /// this is usually non-empty even for equations this translator only partially understands);
+    /// failing that, the equation's flattened text as an ordinary paragraph; failing THAT — an
+    /// `m:oMath` with no `m:t` anywhere in it at all — a literal, honest placeholder rather than a
+    /// block that renders as nothing (the brief's explicit requirement: "an equation with no
+    /// translatable content at all still produces something visible").
+    private static func formulaBlock(for oMath: XMLNode) -> OfficeBlock {
+        let latex = OmmlTranslator.latex(for: oMath).trimmingCharacters(in: .whitespacesAndNewlines)
+        if !latex.isEmpty { return .formula(latex: latex) }
+        let text = OmmlTranslator.flattenText(oMath).trimmingCharacters(in: .whitespacesAndNewlines)
+        if !text.isEmpty { return .paragraph(spans: [Span(text: text)]) }
+        return .paragraph(spans: [Span(text: "[equation]")])
     }
 
     /// A grid position a row's own `<w:tc>` sequence doesn't literally cover — because `w:tcPr`
@@ -1251,6 +1299,21 @@ enum DocxReader {
                      "w:bookmarkStart", "w:bookmarkEnd", "w:proofErr",
                      "w:sectPr", "w:commentRangeStart", "w:commentRangeEnd", "w:commentReference":
                     continue
+                // A display equation — `collectFormulaBlocks` (called separately, once per
+                // paragraph, from `parseParagraph`) already turns this into its OWN `.formula`
+                // block; walking it here too would flatten its `m:t` runs a SECOND time into this
+                // paragraph's ordinary text, duplicating the equation's symbols right next to its
+                // proper rendering.
+                case "m:oMathPara":
+                    continue
+                // A bare, INLINE equation (mixed into a sentence, or standing alone without the
+                // `m:oMathPara` wrapper) — this sprint gives it no web-block placeholder (see
+                // `WebBlock`'s doc: block-only, no inline mechanism), so it degrades to its own
+                // text, IN PLACE, exactly where it sits among the surrounding runs — the sentence
+                // stays intact rather than being broken into separate blocks for one symbol.
+                case "m:oMath":
+                    let text = OmmlTranslator.flattenText(child)
+                    if !text.isEmpty { appendMerging(Span(text: text, link: link)) }
                 case "w:hyperlink":
                     // A hyperlink whose target can't be resolved (no `r:id`/`w:anchor`, or a
                     // relationship id absent from `document.xml.rels`) still keeps its text — only
@@ -1411,6 +1474,273 @@ enum DocxReader {
             throw ReadError.malformedXML("xml")
         }
         return root
+    }
+}
+
+/// Translates one `m:oMath` node (OOXML's Office Math Markup Language) into the LaTeX the app's
+/// existing formula engine already renders (`WebBlock.Engine.math`, KaTeX). Lives in THIS file
+/// (not its own) because it walks `XMLNode`, which is deliberately `private` to this file to avoid
+/// colliding with `OdtReader`'s own type of the same name — `OmmlTranslator` is `DocxReader`'s
+/// caller-only helper, so file-private access is exactly the right shape, not a workaround.
+///
+/// Coverage is deliberately partial (the sprint brief is explicit: "do not attempt full OMML
+/// coverage"). What IS covered: `m:r`/`m:t` (runs/text), `m:f` (fraction), `m:sSup`/`m:sSub`/
+/// `m:sSubSup` (super/subscript), `m:rad` (radical), `m:d` (delimiters), `m:nary` (sum/product/
+/// integral), `m:m`/`m:mr` (matrix), `m:func` (function application), `m:limLow`/`m:limUpp`
+/// (limits), `m:bar` (over/underline), `m:acc` (accents), `m:groupChr` (over/underbrace),
+/// `m:eqArr` (stacked equations).
+///
+/// The one rule every construct obeys: an element this translator does NOT specifically know how
+/// to shape falls back to `flattenText` — its own `m:t` runs, concatenated — rather than producing
+/// nothing. That fallback is the `default:` case of `translate(_:)`, not a case anyone has to
+/// remember to add for a new/unhandled element, so it also covers constructs never named above
+/// (`m:box`, `m:borderBox`, `m:phant`, …) automatically. Losing the author's SHAPE (no fraction
+/// bar, no radical sign) is accepted; losing their SYMBOLS is not — see CLAUDE.md's standing rule
+/// that content loss is this project's one unforgivable failure, layout loss is not.
+private enum OmmlTranslator {
+    /// The LaTeX for one `m:oMath` node — its direct children, translated and concatenated. Empty
+    /// only when the equation carries no content at all (an empty `m:oMath`, or one whose only
+    /// children are property elements) — the caller (`DocxReader.formulaBlock`) is responsible for
+    /// turning THAT into something visible rather than emitting a formula block with nothing in it.
+    static func latex(for oMath: XMLNode) -> String {
+        translateChildren(oMath.children)
+    }
+
+    /// Every `m:t` found anywhere below `node`, depth-first, concatenated verbatim. The universal
+    /// fallback (see the type doc) and also what `DocxReader.collectSpans` uses for a genuinely
+    /// INLINE `m:oMath` (mixed into a sentence) that this sprint deliberately never turns into a
+    /// web block at all — no inline placeholder mechanism exists yet (`WebBlock` is block-only).
+    static func flattenText(_ node: XMLNode) -> String {
+        var out = ""
+        func walk(_ n: XMLNode) {
+            if n.name == "m:t" { out += n.text; return }
+            for c in n.children { walk(c) }
+        }
+        walk(node)
+        return out
+    }
+
+    // MARK: - Dispatch
+
+    private static func translateChildren(_ nodes: [XMLNode]) -> String {
+        nodes.compactMap { translate($0) }.joined()
+    }
+
+    /// `nil` for property/formatting elements (`m:*Pr`) — they carry no equation content of their
+    /// own and must contribute nothing, not even their (nonexistent) text; every other unrecognized
+    /// element falls to `flattenText`, never to `nil`, so a real author symbol is never silently
+    /// dropped just because this translator doesn't know its shape.
+    private static func translate(_ node: XMLNode) -> String? {
+        switch node.name {
+        case let n where n.hasSuffix("Pr"): return nil
+        case "m:r": return run(node)
+        case "m:f": return fraction(node)
+        case "m:sSup": return superscript(node)
+        case "m:sSub": return subscriptTranslate(node)
+        case "m:sSubSup": return subSup(node)
+        case "m:rad": return radical(node)
+        case "m:d": return delimiter(node)
+        case "m:nary": return nary(node)
+        case "m:m": return matrix(node)
+        case "m:func": return funcApply(node)
+        case "m:limLow": return limLow(node)
+        case "m:limUpp": return limUpp(node)
+        case "m:bar": return bar(node)
+        case "m:acc": return accent(node)
+        case "m:groupChr": return groupChr(node)
+        case "m:eqArr": return eqArr(node)
+        default:
+            return flattenText(node)
+        }
+    }
+
+    /// `m:r`'s only content is `m:t` (its `m:rPr`/`w:rPr` are formatting, skipped by the `Pr` rule
+    /// above) — `flattenText` finds it regardless of exactly how deep it sits.
+    private static func run(_ node: XMLNode) -> String { flattenText(node) }
+
+    // MARK: - Structural constructs
+
+    private static func fraction(_ node: XMLNode) -> String {
+        let num = node.child("m:num").map { translateChildren($0.children) } ?? ""
+        let den = node.child("m:den").map { translateChildren($0.children) } ?? ""
+        return "\\frac{\(num)}{\(den)}"
+    }
+
+    private static func superscript(_ node: XMLNode) -> String {
+        let base = element(node, "m:e")
+        let sup = element(node, "m:sup")
+        return "{\(base)}^{\(sup)}"
+    }
+
+    private static func subscriptTranslate(_ node: XMLNode) -> String {
+        let base = element(node, "m:e")
+        let sub = element(node, "m:sub")
+        return "{\(base)}_{\(sub)}"
+    }
+
+    private static func subSup(_ node: XMLNode) -> String {
+        let base = element(node, "m:e")
+        let sub = element(node, "m:sub")
+        let sup = element(node, "m:sup")
+        return "{\(base)}_{\(sub)}^{\(sup)}"
+    }
+
+    /// A hidden degree (`m:radPr`'s `m:degHide` = "1") is Word's own square-root shorthand — the
+    /// SOURCE says there is no degree to show, not that this translator lost one.
+    private static func radical(_ node: XMLNode) -> String {
+        let radicand = element(node, "m:e")
+        let degHidden = propVal(node.child("m:radPr"), "m:degHide") == "1"
+        let deg = node.child("m:deg").map { translateChildren($0.children) } ?? ""
+        if degHidden || deg.trimmingCharacters(in: .whitespaces).isEmpty {
+            return "\\sqrt{\(radicand)}"
+        }
+        return "\\sqrt[\(deg)]{\(radicand)}"
+    }
+
+    /// One or more `m:e` arguments wrapped in the delimiters the source declared (`m:begChr`/
+    /// `m:endChr`, under `m:dPr`) — defaulting to `(`/`)`, Word's own default when a document omits
+    /// them entirely (an EMPTY `m:val=""` is a real, different, deliberate choice — "no visible
+    /// delimiter" — and is honoured as empty, not silently overridden back to parentheses).
+    private static func delimiter(_ node: XMLNode) -> String {
+        let dPr = node.child("m:dPr")
+        let beg = propVal(dPr, "m:begChr") ?? "("
+        let end = propVal(dPr, "m:endChr") ?? ")"
+        let args = node.children.filter { $0.name == "m:e" }.map { translateChildren($0.children) }
+        let inner = args.joined(separator: ", ")
+        let left = beg.isEmpty ? "." : escapeDelimiter(beg)
+        let right = end.isEmpty ? "." : escapeDelimiter(end)
+        return "\\left\(left) \(inner) \\right\(right)"
+    }
+
+    private static func escapeDelimiter(_ c: String) -> String {
+        switch c {
+        case "{": return "\\{"
+        case "}": return "\\}"
+        case "|": return "|"
+        default: return c
+        }
+    }
+
+    /// The operator glyph (`m:naryPr`'s `m:chr`) maps to a handful of common LaTeX big-operator
+    /// commands; anything else keeps the source glyph literally rather than guessing a command name
+    /// for it — the SAME "don't invent, degrade honestly" posture the rest of this translator uses.
+    private static func nary(_ node: XMLNode) -> String {
+        let naryPr = node.child("m:naryPr")
+        let chr = propVal(naryPr, "m:chr") ?? "\u{2211}"
+        let cmd = naryCommand(chr)
+        let subHidden = propVal(naryPr, "m:subHide") == "1"
+        let supHidden = propVal(naryPr, "m:supHide") == "1"
+        let sub = node.child("m:sub").map { translateChildren($0.children) } ?? ""
+        let sup = node.child("m:sup").map { translateChildren($0.children) } ?? ""
+        let operand = element(node, "m:e")
+        var out = cmd
+        if !subHidden, !sub.isEmpty { out += "_{\(sub)}" }
+        if !supHidden, !sup.isEmpty { out += "^{\(sup)}" }
+        return "\(out) \(operand)"
+    }
+
+    private static func naryCommand(_ chr: String) -> String {
+        switch chr {
+        case "\u{2211}": return "\\sum"          // ∑
+        case "\u{220F}": return "\\prod"          // ∏
+        case "\u{222B}": return "\\int"           // ∫
+        case "\u{222C}": return "\\iint"          // ∬
+        case "\u{222D}": return "\\iiint"         // ∭
+        case "\u{222E}": return "\\oint"          // ∮
+        case "\u{22C3}": return "\\bigcup"        // ⋃
+        case "\u{22C2}": return "\\bigcap"        // ⋂
+        default: return chr
+        }
+    }
+
+    /// Every `m:mr` row's `m:e` cells, `&`-separated, rows `\\`-separated.
+    private static func matrix(_ node: XMLNode) -> String {
+        let rows = node.children.filter { $0.name == "m:mr" }.map { row -> String in
+            row.children.filter { $0.name == "m:e" }
+                .map { translateChildren($0.children) }
+                .joined(separator: " & ")
+        }
+        return "\\begin{matrix} \(rows.joined(separator: " \\\\ ")) \\end{matrix}"
+    }
+
+    /// `m:fName` is itself OMML content (usually a plain run like "sin"), not a bare string
+    /// attribute — translated the same way any other sub-expression is.
+    private static func funcApply(_ node: XMLNode) -> String {
+        let name = node.child("m:fName").map { translateChildren($0.children) } ?? ""
+        let arg = element(node, "m:e")
+        return "\(name)\\left(\(arg)\\right)"
+    }
+
+    private static func limLow(_ node: XMLNode) -> String {
+        let base = element(node, "m:e")
+        let lim = node.child("m:lim").map { translateChildren($0.children) } ?? ""
+        return lim.isEmpty ? base : "\(base)_{\(lim)}"
+    }
+
+    private static func limUpp(_ node: XMLNode) -> String {
+        let base = element(node, "m:e")
+        let lim = node.child("m:lim").map { translateChildren($0.children) } ?? ""
+        return lim.isEmpty ? base : "\(base)^{\(lim)}"
+    }
+
+    /// `m:barPr`'s `m:pos` (`"bot"` = underline, anything else, including absent, = overline —
+    /// Word's own default for a bar with no `m:pos` at all).
+    private static func bar(_ node: XMLNode) -> String {
+        let pos = propVal(node.child("m:barPr"), "m:pos")
+        let e = element(node, "m:e")
+        return pos == "bot" ? "\\underline{\(e)}" : "\\overline{\(e)}"
+    }
+
+    /// The accent glyph (`m:accPr`'s `m:chr`) maps to a handful of common LaTeX accent commands;
+    /// an unmapped glyph is kept literally alongside the base rather than dropped, same posture as
+    /// `nary`'s unmapped operator.
+    private static func accent(_ node: XMLNode) -> String {
+        let chr = propVal(node.child("m:accPr"), "m:chr") ?? ""
+        let e = element(node, "m:e")
+        switch chr {
+        case "\u{0302}": return "\\hat{\(e)}"           // combining circumflex
+        case "\u{20D7}": return "\\vec{\(e)}"           // combining right arrow above
+        case "\u{0307}": return "\\dot{\(e)}"           // combining dot above
+        case "\u{0303}": return "\\tilde{\(e)}"         // combining tilde
+        case "\u{0305}", "\u{0304}": return "\\bar{\(e)}" // combining overline / macron
+        case "": return e
+        default: return "\(e)\(chr)"
+        }
+    }
+
+    /// The brace glyph + position (`m:groupChrPr`'s `m:chr`/`m:pos`) maps overbrace/underbrace;
+    /// anything else keeps the source glyph, appended, rather than being silently dropped.
+    private static func groupChr(_ node: XMLNode) -> String {
+        let groupPr = node.child("m:groupChrPr")
+        let chr = propVal(groupPr, "m:chr") ?? "\u{23DE}"
+        let pos = propVal(groupPr, "m:pos") ?? "top"
+        let e = element(node, "m:e")
+        switch (chr, pos) {
+        case ("\u{23DE}", "top"), ("\u{FE37}", "top"): return "\\overbrace{\(e)}"
+        case ("\u{23DF}", "bot"), ("\u{FE38}", "bot"): return "\\underbrace{\(e)}"
+        default: return pos == "bot" ? "\\underbrace{\(e)}" : "\\overbrace{\(e)}"
+        }
+    }
+
+    /// Each `m:e` on its own line — LaTeX's `aligned` environment, `\\`-separated.
+    private static func eqArr(_ node: XMLNode) -> String {
+        let rows = node.children.filter { $0.name == "m:e" }.map { translateChildren($0.children) }
+        return "\\begin{aligned} \(rows.joined(separator: " \\\\ ")) \\end{aligned}"
+    }
+
+    // MARK: - Small helpers
+
+    /// The translated content of `node`'s FIRST child named `tag`, or empty text if absent —
+    /// absence is common (`m:sub`/`m:sup`/`m:deg` are all individually optional per the OMML
+    /// schema) and must degrade to an empty group, never a crash or a dropped construct.
+    private static func element(_ node: XMLNode, _ tag: String) -> String {
+        node.child(tag).map { translateChildren($0.children) } ?? ""
+    }
+
+    /// `pr?.child(tag)?.attributes["m:val"]` — the one shape every OMML property value takes
+    /// (`<m:chr m:val="…"/>`, `<m:begChr m:val="…"/>`, …).
+    private static func propVal(_ pr: XMLNode?, _ tag: String) -> String? {
+        pr?.child(tag)?.attributes["m:val"]
     }
 }
 

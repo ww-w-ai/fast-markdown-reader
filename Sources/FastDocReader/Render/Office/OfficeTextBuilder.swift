@@ -61,6 +61,9 @@ enum OfficeTextBuilder {
 
             case let .unsupportedGraphic(label, size):
                 appendUnsupportedGraphic(label: label, size: size, columnWidth: columnWidth, into: result)
+
+            case let .formula(latex):
+                appendFormula(latex: latex, into: result)
             }
             tagBlock(from: start)
         }
@@ -309,6 +312,11 @@ enum OfficeTextBuilder {
                 if result.length > 0, result.string.hasSuffix("\n") {
                     result.deleteCharacters(in: NSRange(location: result.length - 1, length: 1))
                 }
+            case let .formula(latex):
+                appendFormula(latex: latex, into: result)
+                if result.length > 0, result.string.hasSuffix("\n") {
+                    result.deleteCharacters(in: NSRange(location: result.length - 1, length: 1))
+                }
             }
             if index < blocks.count - 1 {
                 result.append(NSAttributedString(string: "\n", attributes: [.font: baseFont]))
@@ -407,6 +415,27 @@ enum OfficeTextBuilder {
         att.bounds = NSRect(origin: .zero, size: fitted)
         att.image = frame
         result.append(NSAttributedString(attachment: att))
+        result.append(NSAttributedString(string: "\n"))
+    }
+
+    // MARK: Formulas
+
+    /// Reserves a placeholder exactly the way `MarkdownRenderer.appendWebBlock` does for a markdown
+    /// `$$…$$` — same `MDAttr.math` attribute, same `SizedAttachmentCell`-owned guessed size (260×60).
+    /// `MarkdownDocument`'s pre-render/pre-size passes key off `enumerateWebBlocks`
+    /// (`storage.enumerateAttribute(MDAttr.math, …)`), not this document's `kind`, so an office
+    /// formula is picked up by the SAME up-front measure pass a markdown one is — nothing here (or
+    /// in `MarkdownDocument`) had to be taught that office documents exist. The guessed size is only
+    /// a placeholder; the up-front pass replaces it with the exact cached-PDF size before layout
+    /// (invariant 1: reserved size must never depend on whether pixels are loaded).
+    private static func appendFormula(latex: String, into result: NSMutableAttributedString) {
+        let size = NSSize(width: 260, height: 60)
+        let att = NSTextAttachment()
+        att.bounds = NSRect(origin: .zero, size: size)
+        att.attachmentCell = SizedAttachmentCell(reservedSize: size)
+        let ph = NSMutableAttributedString(attachment: att)
+        ph.addAttribute(MDAttr.math, value: latex, range: NSRange(location: 0, length: ph.length))
+        result.append(ph)
         result.append(NSAttributedString(string: "\n"))
     }
 }

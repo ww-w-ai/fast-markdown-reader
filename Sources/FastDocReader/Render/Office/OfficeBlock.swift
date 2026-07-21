@@ -117,4 +117,17 @@ enum OfficeBlock: Equatable {
     /// revised — there is no later pixel arrival to protect invariant 1 against here, since unlike
     /// `.image` this case's rendering is synthesized once, fully, at build time.
     case unsupportedGraphic(label: String, size: CGSize)
+    /// A Word/OOXML equation (`m:oMathPara` — a display equation on its own line), translated to
+    /// the LaTeX the app's existing formula engine already renders (`OmmlTranslator`). Rides the
+    /// SAME web-block pipeline a markdown `$$…$$` does — `OfficeTextBuilder` reserves a placeholder
+    /// tagged with the identical `MDAttr.math` attribute `MarkdownRenderer.appendWebBlock` uses —
+    /// so `MarkdownDocument`'s pre-render/pre-size passes (which enumerate `MDAttr.math` wherever it
+    /// appears, not by document kind) pick it up automatically; invariant 1/2's scroll stability is
+    /// inherited, not re-earned. Only a genuinely STANDALONE display equation becomes this case — a
+    /// bare inline `m:oMath` mixed into a sentence has no web-block equivalent this sprint (no
+    /// inline placeholder mechanism exists in `WebBlock`), so `DocxReader` degrades it to plain text
+    /// INSIDE the surrounding paragraph's spans instead of ever reaching here. `latex` is never
+    /// empty: an equation with no translatable content at all is degraded, before construction, to
+    /// a visible text block by the reader — this case never carries "nothing to render".
+    case formula(latex: String)
 }

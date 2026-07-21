@@ -1713,4 +1713,215 @@ final class DocxReaderTests: XCTestCase {
             .paragraph(spans: [Span(text: "1", superscript: true), Span(text: " Cell footnote.")]),
         ])
     }
+
+    // MARK: - S10: OMML equations (m:oMath / m:oMathPara)
+
+    /// Wraps `content` (raw OMML, no `m:oMath` of its own) in a minimal single-equation
+    /// `m:oMathPara` and reads it as a standalone paragraph — the shape every per-construct test
+    /// below shares.
+    private func formula(_ content: String) throws -> OfficeBlock {
+        let blocks = try read(document: "<w:p><m:oMathPara><m:oMath>\(content)</m:oMath></m:oMathPara></w:p>")
+        guard blocks.count == 1 else { XCTFail("expected exactly one block, got \(blocks)"); throw ReadFixtureError.wrongShape }
+        return blocks[0]
+    }
+
+    private enum ReadFixtureError: Error { case wrongShape }
+
+    private func run(_ text: String) -> String { "<m:r><m:t>\(text)</m:t></m:r>" }
+
+    // MARK: m:r / m:t
+
+    func testRunTextTranslatesVerbatim() throws {
+        XCTAssertEqual(try formula(run("x")), .formula(latex: "x"))
+    }
+
+    // MARK: m:f (fraction)
+
+    func testFractionTranslatesToFracCommand() throws {
+        let xml = "<m:f><m:num>\(run("1"))</m:num><m:den>\(run("2"))</m:den></m:f>"
+        XCTAssertEqual(try formula(xml), .formula(latex: "\\frac{1}{2}"))
+    }
+
+    // MARK: m:sSup / m:sSub / m:sSubSup
+
+    func testSuperscriptTranslatesToCaret() throws {
+        let xml = "<m:sSup><m:e>\(run("x"))</m:e><m:sup>\(run("2"))</m:sup></m:sSup>"
+        XCTAssertEqual(try formula(xml), .formula(latex: "{x}^{2}"))
+    }
+
+    func testSubscriptTranslatesToUnderscore() throws {
+        let xml = "<m:sSub><m:e>\(run("a"))</m:e><m:sub>\(run("i"))</m:sub></m:sSub>"
+        XCTAssertEqual(try formula(xml), .formula(latex: "{a}_{i}"))
+    }
+
+    func testSubSupTranslatesBothAtOnce() throws {
+        let xml = "<m:sSubSup><m:e>\(run("x"))</m:e><m:sub>\(run("i"))</m:sub><m:sup>\(run("2"))</m:sup></m:sSubSup>"
+        XCTAssertEqual(try formula(xml), .formula(latex: "{x}_{i}^{2}"))
+    }
+
+    // MARK: m:rad (radical)
+
+    func testRadicalWithDegreeTranslatesToBracketedSqrt() throws {
+        let xml = "<m:rad><m:deg>\(run("3"))</m:deg><m:e>\(run("x"))</m:e></m:rad>"
+        XCTAssertEqual(try formula(xml), .formula(latex: "\\sqrt[3]{x}"))
+    }
+
+    func testRadicalWithHiddenDegreeOmitsTheBracket() throws {
+        let xml = "<m:rad><m:radPr><m:degHide m:val=\"1\"/></m:radPr><m:deg/><m:e>\(run("x"))</m:e></m:rad>"
+        XCTAssertEqual(try formula(xml), .formula(latex: "\\sqrt{x}"))
+    }
+
+    // MARK: m:d (delimiters)
+
+    func testDelimiterDefaultsToParenthesesWhenNoneDeclared() throws {
+        let xml = "<m:d><m:e>\(run("x"))</m:e></m:d>"
+        XCTAssertEqual(try formula(xml), .formula(latex: "\\left( x \\right)"))
+    }
+
+    func testDelimiterHonoursDeclaredBracketCharacters() throws {
+        let xml = """
+        <m:d><m:dPr><m:begChr m:val="["/><m:endChr m:val="]"/></m:dPr><m:e>\(run("x"))</m:e></m:d>
+        """
+        XCTAssertEqual(try formula(xml), .formula(latex: "\\left[ x \\right]"))
+    }
+
+    // MARK: m:nary (sum/product/integral)
+
+    func testNaryWithSumGlyphTranslatesToSumWithBoundsAndOperand() throws {
+        let xml = """
+        <m:nary><m:naryPr><m:chr m:val="\u{2211}"/></m:naryPr>
+          <m:sub>\(run("i=1"))</m:sub><m:sup>\(run("n"))</m:sup><m:e>\(run("i"))</m:e>
+        </m:nary>
+        """
+        XCTAssertEqual(try formula(xml), .formula(latex: "\\sum_{i=1}^{n} i"))
+    }
+
+    func testNaryWithHiddenBoundsOmitsThem() throws {
+        let xml = """
+        <m:nary><m:naryPr><m:chr m:val="\u{222B}"/><m:subHide m:val="1"/><m:supHide m:val="1"/></m:naryPr>
+          <m:sub>\(run("a"))</m:sub><m:sup>\(run("b"))</m:sup><m:e>\(run("f"))</m:e>
+        </m:nary>
+        """
+        XCTAssertEqual(try formula(xml), .formula(latex: "\\int f"))
+    }
+
+    /// An operator glyph this translator doesn't know is kept literally, never dropped.
+    func testNaryWithUnmappedGlyphKeepsTheGlyphLiterally() throws {
+        let xml = "<m:nary><m:naryPr><m:chr m:val=\"\u{2295}\"/></m:naryPr><m:e>\(run("x"))</m:e></m:nary>"
+        XCTAssertEqual(try formula(xml), .formula(latex: "\u{2295} x"))
+    }
+
+    // MARK: m:m / m:mr (matrix)
+
+    func testMatrixTranslatesRowsAndColumnsWithAmpersandAndDoubleBackslash() throws {
+        let xml = """
+        <m:m>
+          <m:mr>\(["a", "b"].map { "<m:e>\(run($0))</m:e>" }.joined())</m:mr>
+          <m:mr>\(["c", "d"].map { "<m:e>\(run($0))</m:e>" }.joined())</m:mr>
+        </m:m>
+        """
+        XCTAssertEqual(try formula(xml), .formula(latex: "\\begin{matrix} a & b \\\\ c & d \\end{matrix}"))
+    }
+
+    // MARK: m:func (function application)
+
+    func testFuncTranslatesNameApplication() throws {
+        let xml = "<m:func><m:fName>\(run("sin"))</m:fName><m:e>\(run("x"))</m:e></m:func>"
+        XCTAssertEqual(try formula(xml), .formula(latex: "sin\\left(x\\right)"))
+    }
+
+    // MARK: m:limLow / m:limUpp
+
+    func testLimLowTranslatesToSubscript() throws {
+        let xml = "<m:limLow><m:e>\(run("lim"))</m:e><m:lim>\(run("x\\to 0"))</m:lim></m:limLow>"
+        XCTAssertEqual(try formula(xml), .formula(latex: "lim_{x\\to 0}"))
+    }
+
+    func testLimUppTranslatesToSuperscript() throws {
+        let xml = "<m:limUpp><m:e>\(run("f"))</m:e><m:lim>\(run("n"))</m:lim></m:limUpp>"
+        XCTAssertEqual(try formula(xml), .formula(latex: "f^{n}"))
+    }
+
+    // MARK: m:bar (over/underline)
+
+    func testBarDefaultsToOverline() throws {
+        let xml = "<m:bar><m:e>\(run("x"))</m:e></m:bar>"
+        XCTAssertEqual(try formula(xml), .formula(latex: "\\overline{x}"))
+    }
+
+    func testBarWithBottomPositionUnderlines() throws {
+        let xml = "<m:bar><m:barPr><m:pos m:val=\"bot\"/></m:barPr><m:e>\(run("x"))</m:e></m:bar>"
+        XCTAssertEqual(try formula(xml), .formula(latex: "\\underline{x}"))
+    }
+
+    // MARK: m:acc (accents)
+
+    func testAccentCircumflexTranslatesToHat() throws {
+        let xml = "<m:acc><m:accPr><m:chr m:val=\"\u{0302}\"/></m:accPr><m:e>\(run("x"))</m:e></m:acc>"
+        XCTAssertEqual(try formula(xml), .formula(latex: "\\hat{x}"))
+    }
+
+    /// An accent glyph this translator doesn't know is kept literally alongside the base.
+    func testAccentUnmappedGlyphKeepsTheGlyphLiterally() throws {
+        let xml = "<m:acc><m:accPr><m:chr m:val=\"\u{0327}\"/></m:accPr><m:e>\(run("x"))</m:e></m:acc>"
+        XCTAssertEqual(try formula(xml), .formula(latex: "x\u{0327}"))
+    }
+
+    // MARK: m:groupChr (over/underbrace)
+
+    func testGroupChrOverbraceAtTop() throws {
+        let xml = """
+        <m:groupChr><m:groupChrPr><m:chr m:val="\u{23DE}"/><m:pos m:val="top"/></m:groupChrPr><m:e>\(run("x+y"))</m:e></m:groupChr>
+        """
+        XCTAssertEqual(try formula(xml), .formula(latex: "\\overbrace{x+y}"))
+    }
+
+    // MARK: m:eqArr (stacked equations)
+
+    func testEqArrTranslatesEachRowOnItsOwnLine() throws {
+        let xml = "<m:eqArr><m:e>\(run("x=1"))</m:e><m:e>\(run("y=2"))</m:e></m:eqArr>"
+        XCTAssertEqual(try formula(xml), .formula(latex: "\\begin{aligned} x=1 \\\\ y=2 \\end{aligned}"))
+    }
+
+    // MARK: Fallback — unrecognized construct degrades to its own text, never to nothing
+
+    /// `m:box` isn't one of the constructs this translator specifically knows how to shape — it
+    /// must still surface the author's symbol rather than vanish.
+    func testUnrecognizedConstructFallsBackToItsOwnText() throws {
+        let xml = "<m:box>\(run("z"))</m:box>"
+        XCTAssertEqual(try formula(xml), .formula(latex: "z"))
+    }
+
+    /// An equation with genuinely NOTHING translatable (no `m:t` anywhere, only property elements)
+    /// must still produce something visible — never a formula block with empty LaTeX.
+    func testEquationWithNoTranslatableContentDegradesToAVisiblePlaceholder() throws {
+        let blocks = try read(document: "<w:p><m:oMathPara><m:oMath><m:radPr/></m:oMath></m:oMathPara></w:p>")
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "[equation]")])])
+    }
+
+    // MARK: Inline vs. standalone (WebBlock has no inline placeholder this sprint)
+
+    /// A display equation — wrapped in `m:oMathPara`, alone in its own paragraph — becomes a
+    /// `.formula` block, with no accompanying (empty) text block.
+    func testStandaloneOMathParaBecomesAFormulaBlockAlone() throws {
+        let blocks = try read(document: "<w:p><m:oMathPara><m:oMath>\(run("E=mc^2"))</m:oMath></m:oMathPara></w:p>")
+        XCTAssertEqual(blocks, [.formula(latex: "E=mc^2")])
+    }
+
+    /// A BARE `m:oMath` (no `m:oMathPara` wrapper) mixed into a sentence has no web-block
+    /// placeholder this sprint — it degrades to its own text, merged in place with the runs around
+    /// it, so the sentence stays one block rather than being broken into three for one symbol.
+    func testInlineBareOMathMixedIntoASentenceDegradesToTextInPlace() throws {
+        let xml = "<w:p><w:r><w:t>Before </w:t></w:r><m:oMath>\(run("x"))</m:oMath><w:r><w:t> after</w:t></w:r></w:p>"
+        let blocks = try read(document: xml)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Before x after")])])
+    }
+
+    /// A BARE `m:oMath` standing entirely alone in its own paragraph (the `m:oMathPara` wrapper
+    /// omitted — some producers do this) still degrades to text under this sprint's rule: only the
+    /// explicit `m:oMathPara` wrapper is read as "the author asked for a display equation".
+    func testBareStandaloneOMathWithoutParaWrapperStillDegradesToText() throws {
+        let blocks = try read(document: "<w:p><m:oMath>\(run("y"))</m:oMath></w:p>")
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "y")])])
+    }
 }

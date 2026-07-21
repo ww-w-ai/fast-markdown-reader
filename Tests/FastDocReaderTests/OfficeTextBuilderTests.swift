@@ -691,4 +691,47 @@ final class OfficeTextBuilderTests: XCTestCase {
         XCTAssertEqual(tallBlock?.rowSpan, 2)
         XCTAssertEqual(blocks.count, 3, "the tall cell's own row, no separate cell fabricated below it")
     }
+
+    // MARK: Formulas (S10)
+
+    /// Invariant 1: a formula's reserved size must be exact-and-final at build time, same as an
+    /// image's, and its pixels (`.image`) must be nil — nothing has rendered it yet.
+    func testFormulaBlockReservesAPlaceholderSizeWithNoPixelsYet() throws {
+        let out = build([.formula(latex: "x^2")])
+        var found: NSTextAttachment?
+        out.enumerateAttribute(.attachment, in: NSRange(location: 0, length: out.length)) { value, _, _ in
+            if let att = value as? NSTextAttachment { found = att }
+        }
+        let attachment = try XCTUnwrap(found)
+        XCTAssertNil(attachment.image)
+        let cell = try XCTUnwrap(attachment.attachmentCell as? SizedAttachmentCell)
+        XCTAssertGreaterThan(cell.reservedSize.width, 0)
+        XCTAssertGreaterThan(cell.reservedSize.height, 0)
+    }
+
+    /// The seam a parser test cannot see (invariant 29): an office formula must carry the SAME
+    /// `MDAttr.math` attribute a markdown `$$…$$` does, because `MarkdownDocument`'s pre-render and
+    /// pre-size passes find their work exclusively through `enumerateWebBlocks`
+    /// (`storage.enumerateAttribute(MDAttr.math, …)`), never by asking whether the document is
+    /// markdown or office. If this attribute were missing or misnamed, the formula would sit in the
+    /// text storage forever unrendered and unsized — a defect no `DocxReader`-only test could catch.
+    func testFormulaBlockIsFoundByTheSharedWebBlockEnumerationThePrerenderPassUses() {
+        let out = build([.paragraph(spans: [span("before")]), .formula(latex: "\\frac{1}{2}"), .paragraph(spans: [span("after")])])
+        var found: [WebBlock] = []
+        out.enumerateWebBlocks { block, _ in found.append(block) }
+        XCTAssertEqual(found.count, 1)
+        XCTAssertEqual(found.first?.engine, .math)
+        XCTAssertEqual(found.first?.code, "\\frac{1}{2}")
+    }
+
+    /// A formula block inside a table cell must still reach the same web-block machinery — cells
+    /// render through `cellContent`, a separate switch from the top-level `build` loop, and it is
+    /// easy for a new `OfficeBlock` case to be wired into one and forgotten in the other.
+    func testFormulaBlockInsideATableCellIsStillFoundByWebBlockEnumeration() {
+        let out = build([.table(rows: [[Cell(blocks: [.formula(latex: "y=mx+b")])]], headerRows: 0)])
+        var found: [WebBlock] = []
+        out.enumerateWebBlocks { block, _ in found.append(block) }
+        XCTAssertEqual(found.count, 1)
+        XCTAssertEqual(found.first?.code, "y=mx+b")
+    }
 }
