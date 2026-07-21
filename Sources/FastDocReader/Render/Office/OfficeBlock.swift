@@ -30,9 +30,34 @@ struct Span: Equatable {
 /// about anchors. All-1 spans (this sprint's parsers emit nothing else yet) reproduce a plain
 /// rectangular grid exactly — one `Cell` per visible position, nothing skipped.
 struct Cell: Equatable {
-    var spans: [Span]
+    /// A cell's content is the SAME format-neutral block vocabulary as the top of a document —
+    /// a paragraph, heading, list item, image, or (flattened, never a real nested grid — see
+    /// `OfficeTextBuilder`'s cell renderer) another table — not a bare run of spans. That is what
+    /// gives an image or a list item inside a cell somewhere to go at all: before this sprint
+    /// `Cell` could only ever hold formatted text, so both `.image` and `.listItem` collection had
+    /// to be skipped the moment the cell walk found them (gap-list rows 6 and 7). Rendering
+    /// recurses through `OfficeTextBuilder`'s existing per-block machinery rather than growing a
+    /// second, cell-only set of cases.
+    var blocks: [OfficeBlock]
     var rowSpan: Int = 1
     var colSpan: Int = 1
+
+    /// Back-compat convenience for the many construction sites (both readers' plain-text cells,
+    /// most existing tests) that only ever need a cell of formatted text — wraps the spans in a
+    /// single `.paragraph`, which `OfficeTextBuilder` renders BYTE-IDENTICAL to the pre-sprint
+    /// direct-spans path: no block-level separator is added around a lone paragraph, so a
+    /// plain-text cell looks exactly as it did before `Cell` could hold anything else.
+    init(spans: [Span], rowSpan: Int = 1, colSpan: Int = 1) {
+        self.blocks = [.paragraph(spans: spans)]
+        self.rowSpan = rowSpan
+        self.colSpan = colSpan
+    }
+
+    init(blocks: [OfficeBlock], rowSpan: Int = 1, colSpan: Int = 1) {
+        self.blocks = blocks
+        self.rowSpan = rowSpan
+        self.colSpan = colSpan
+    }
 }
 
 /// The format-neutral block vocabulary between a document-format parser (docx/odt/… — later

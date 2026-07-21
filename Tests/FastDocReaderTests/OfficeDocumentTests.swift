@@ -113,6 +113,18 @@ final class OfficeDocumentTests: XCTestCase {
         return buildZip([("content.xml", Data(content.utf8))])
     }
 
+    /// S7 invariant 29: a `Cell`-shape change (spans → blocks) must be proven through the same real
+    /// dispatch table every other office capability is, not only through `DocxReaderTests`/
+    /// `OfficeTextBuilderTests` calling their parser/builder directly — this is that seam for tables.
+    private func fixtureDocxWithTable() -> Data {
+        let document = """
+        <?xml version="1.0" encoding="UTF-8"?><w:document><w:body>
+          <w:tbl><w:tr><w:tc><w:p><w:r><w:t>Cell A</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+        </w:body></w:document>
+        """
+        return buildZip([("word/document.xml", Data(document.utf8))])
+    }
+
     /// Opens a fixture office document through the real document/window pipeline, mirroring how
     /// `SpliceRenderTests.open` drives markdown/plain-text. `ext`/`uti` select which office format
     /// the fixture pretends to be, exactly the two pieces of information `MarkdownDocument` itself
@@ -162,6 +174,16 @@ final class OfficeDocumentTests: XCTestCase {
         // `data(ofType:)` below); the rendered string comes from `officeBlocks` alone.
         XCTAssertEqual(doc.text, "")
         XCTAssertEqual(doc.officeBlocks.count, 2)
+    }
+
+    /// S7 invariant 29: `Cell` changing from `spans: [Span]` to `blocks: [OfficeBlock]` must still
+    /// let a table cell's text reach the rendered document through `MarkdownDocument.read` +
+    /// `render(into:)` — not just through `DocxReaderTests`/`OfficeTextBuilderTests`, which call the
+    /// parser/builder directly and would not have caught a dispatch-level regression.
+    func testTableCellTextReachesTheRenderedDocumentThroughTheFullReadPath() throws {
+        let (_, wc) = try openOffice(fixtureDocxWithTable())
+        let storage = try XCTUnwrap(wc.textStorageRef)
+        XCTAssertTrue(storage.string.contains("Cell A"))
     }
 
     func testMalformedArchiveThrowsRatherThanProducingAnEmptyDocument() {

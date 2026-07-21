@@ -800,7 +800,12 @@ final class DocxReaderTests: XCTestCase {
         let cellContent = para("Outer") + "<w:tbl><w:tr>\(tc(para("Nested")))</w:tr></w:tbl>"
         let blocks = try read(document: "<w:tbl><w:tr>\(tc(cellContent))</w:tr></w:tbl>")
         guard case .table(let rows, _) = blocks.first else { return XCTFail("expected a table block") }
-        let allText = rows.flatMap { $0 }.flatMap { $0.spans }.map(\.text).joined()
+        // `Cell` holds `blocks`, not `spans`, since S7 — the reader still flattens a nested table
+        // into a single `.paragraph` at parse time, so pull its spans back out for this assertion.
+        let allText = rows.flatMap { $0 }.flatMap { $0.blocks }.flatMap { block -> [Span] in
+            if case .paragraph(let spans) = block { return spans }
+            return []
+        }.map(\.text).joined()
         XCTAssertTrue(allText.contains("Outer"), "the cell's own paragraph text must survive")
         XCTAssertTrue(allText.contains("Nested"), "the nested table's text must survive, not disappear")
     }

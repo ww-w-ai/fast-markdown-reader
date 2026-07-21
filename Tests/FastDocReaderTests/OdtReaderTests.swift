@@ -341,7 +341,12 @@ final class OdtReaderTests: XCTestCase {
         </table:table>
         """)
         guard case .table(let rows, _) = blocks.first else { return XCTFail("expected a table block") }
-        let allText = rows.flatMap { $0 }.flatMap { $0.spans }.map(\.text).joined()
+        // `Cell` holds `blocks`, not `spans`, since S7 — the reader still flattens a nested table
+        // into a single `.paragraph` at parse time, so pull its spans back out for this assertion.
+        let allText = rows.flatMap { $0 }.flatMap { $0.blocks }.flatMap { block -> [Span] in
+            if case .paragraph(let spans) = block { return spans }
+            return []
+        }.map(\.text).joined()
         XCTAssertTrue(allText.contains("Outer"), "outer paragraph text must survive")
         XCTAssertTrue(allText.contains("Nested"), "nested table's text must survive, not disappear")
     }

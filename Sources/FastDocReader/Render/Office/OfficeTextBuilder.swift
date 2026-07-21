@@ -252,13 +252,83 @@ enum OfficeTextBuilder {
         let cellRows: [[TableBlockBuilder.CellContent]] = rows.enumerated().map { r, anchors in
             let isHeader = r < headerRows
             return anchors.map { cell in
-                let content = spansAttributedString(cell.spans, baseFont: isHeader ? headerFont : theme.bodyFont,
-                                                    baseColor: theme.textColor, theme: theme)
+                let content = cellContent(cell.blocks, baseFont: isHeader ? headerFont : theme.bodyFont, theme: theme)
                 return TableBlockBuilder.CellContent(content: content, rowSpan: cell.rowSpan, columnSpan: cell.colSpan)
             }
         }
         result.append(TableBlockBuilder.build(rows: cellRows, headerRows: headerRows, theme: theme))
         result.append(NSAttributedString(string: "\n"))
+    }
+
+    /// Renders one cell's blocks. Deliberately NOT `build(_:theme:columnWidth:)` reused wholesale:
+    /// that function ends every block with its own trailing `"\n"` PLUS a block-level paragraph
+    /// style (heading/body line-height, paragraph spacing) sized for the full text column — inside
+    /// a cell that fights `TableBlockBuilder`'s own paragraph style (`cellLH`, applied to the whole
+    /// cell content afterwards) and would draw a spurious blank line under a single-paragraph cell.
+    /// So the SEPARATOR is minimal here (a plain `"\n"` between blocks, none after the last) and no
+    /// block gets its own `.paragraphStyle` — everything folds into the outer cell paragraph style.
+    /// The single-block, single-paragraph case (the compatibility initialiser's shape) therefore
+    /// renders BYTE-IDENTICAL to the pre-sprint `spansAttributedString(cell.spans, …)` call this
+    /// replaces: no separator is ever emitted around a lone block.
+    ///
+    /// `.table` is handled by flattening rather than recursing into `appendTable`/
+    /// `TableBlockBuilder` — a cell must never contain a REAL nested `NSTextTable` grid (the
+    /// project's standing "nested tables flatten to text" decision, applied identically by both
+    /// readers at parse time; this is the renderer's own backstop in case a `.table` block ever
+    /// reaches a cell some other way).
+    private static func cellContent(_ blocks: [OfficeBlock], baseFont: NSFont, theme: RenderTheme) -> NSAttributedString {
+        let result = NSMutableAttributedString()
+        for (index, block) in blocks.enumerated() {
+            switch block {
+            case let .heading(level, spans):
+                result.append(spansAttributedString(spans, baseFont: theme.headingFont(level: level),
+                                                     baseColor: theme.textColor, theme: theme))
+            case let .paragraph(spans):
+                result.append(spansAttributedString(spans, baseFont: baseFont, baseColor: theme.textColor, theme: theme))
+            case let .listItem(level, ordered, spans, marker):
+                // Cell-local numbering state — a list embedded in one cell doesn't continue a
+                // count begun in a sibling cell or at top level.
+                var counters: [Int: Int] = [:]
+                appendListItem(level: level, ordered: ordered, spans: spans, marker: marker, into: result,
+                                theme: theme, orderedCounters: &counters)
+                if result.length > 0, result.string.hasSuffix("\n") {
+                    result.deleteCharacters(in: NSRange(location: result.length - 1, length: 1))
+                }
+            case let .table(nestedRows, _):
+                result.append(flattenTableToText(nestedRows, baseFont: baseFont, theme: theme))
+            case let .image(id, size):
+                appendImage(id: id, size: size, columnWidth: .greatestFiniteMagnitude, into: result)
+                if result.length > 0, result.string.hasSuffix("\n") {
+                    result.deleteCharacters(in: NSRange(location: result.length - 1, length: 1))
+                }
+            }
+            if index < blocks.count - 1 {
+                result.append(NSAttributedString(string: "\n", attributes: [.font: baseFont]))
+            }
+        }
+        return result
+    }
+
+    /// Flattens a nested table's cells into one run of text — a tab between cells, a newline after
+    /// each non-empty row — so a reader glancing at the flattened text can still tell where one
+    /// cell ended and the next began, even though the grid itself is gone. Mirrors the readers' own
+    /// `flattenNestedTable` (applied when a `<w:tbl>`/`<table:table>` is found while COLLECTING a
+    /// cell's spans, before a `Cell` even exists); this is the renderer-side twin for the case
+    /// where a `.table` block reaches `cellContent` directly instead.
+    private static func flattenTableToText(_ rows: [[Cell]], baseFont: NSFont, theme: RenderTheme) -> NSAttributedString {
+        let result = NSMutableAttributedString()
+        for row in rows {
+            var rowHasContent = false
+            for cell in row {
+                let text = cellContent(cell.blocks, baseFont: baseFont, theme: theme)
+                guard text.length > 0 else { continue }
+                if rowHasContent { result.append(NSAttributedString(string: "\t", attributes: [.font: baseFont])) }
+                result.append(text)
+                rowHasContent = true
+            }
+            if rowHasContent { result.append(NSAttributedString(string: "\n", attributes: [.font: baseFont])) }
+        }
+        return result
     }
 
     // MARK: Images

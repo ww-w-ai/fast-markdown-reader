@@ -570,4 +570,80 @@ final class OfficeTextBuilderTests: XCTestCase {
             .flatMap { ($0 as? NSTextAttachment)?.attachmentCell as? SizedAttachmentCell }
         XCTAssertEqual(cell?.reservedSize, declared)
     }
+
+    // MARK: Cells hold blocks now (S7)
+
+    /// The regression guard the sprint brief calls out by name: a cell built the OLD way
+    /// (`Cell(spans:)`) must render EXACTLY what the pre-sprint direct-spans path produced — the
+    /// span text/attributes, the cell's own trailing line break, and the table block's trailing
+    /// separator, nothing else added around it.
+    func testCellBuiltFromSpansRendersByteIdenticalToTheDirectSpansPath() {
+        let spans = [span("Hello", bold: true)]
+        let out = build([.table(rows: [[Cell(spans: spans)]], headerRows: 0)])
+        let expectedRun = OfficeTextBuilder.spansAttributedString(spans, baseFont: theme.bodyFont,
+                                                                   baseColor: theme.textColor, theme: theme)
+        XCTAssertEqual(out.string, expectedRun.string + "\n\n",
+                        "cell content, cell's own line break, table's trailing separator — nothing more")
+        let font = out.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+        XCTAssertEqual(font?.fontDescriptor.symbolicTraits.contains(.bold), true)
+    }
+
+    /// Vocabulary-level proof for gap-list row 7: a cell built from `blocks:` rather than `spans:`
+    /// can hold a `.listItem`, and that item's computed marker reaches the cell's rendered text —
+    /// S8 is what teaches a reader's cell walk to actually collect one of these, this only proves
+    /// the renderer has somewhere to put it.
+    func testCellContainingAListItemRendersItsMarker() {
+        let cell = Cell(blocks: [.listItem(level: 0, ordered: true, spans: [span("first")])])
+        let out = build([.table(rows: [[cell]], headerRows: 0)])
+        XCTAssertTrue(out.string.contains("1.\tfirst"), "marker text must reach the cell: \(out.string)")
+    }
+
+    /// Vocabulary-level proof for gap-list row 6: a cell built from `blocks:` can hold an
+    /// `.image`, and it reserves that image's declared area exactly like a top-level image does —
+    /// same `SizedAttachmentCell`/invariant-1 machinery, reused rather than duplicated for cells.
+    func testCellContainingAnImageBlockReservesThatImagesArea() throws {
+        let size = CGSize(width: 100, height: 50)
+        let cell = Cell(blocks: [.image(id: "cell-img", size: size)])
+        let out = build([.table(rows: [[cell]], headerRows: 0)])
+        var found: NSTextAttachment?
+        out.enumerateAttribute(.attachment, in: NSRange(location: 0, length: out.length)) { value, _, _ in
+            if let att = value as? NSTextAttachment { found = att }
+        }
+        let attachment = try XCTUnwrap(found, "an image block inside a cell must still produce an attachment")
+        let sizedCell = attachment.attachmentCell as? SizedAttachmentCell
+        XCTAssertEqual(sizedCell?.reservedSize, size)
+    }
+
+    /// The nested-table decision (flatten, never build a real grid) must hold even when a `.table`
+    /// block reaches a cell directly, not only when a reader has already flattened one into spans
+    /// before `Cell` existed. `tableBlocks(in:)` counting exactly the OUTER table's one anchor proves
+    /// no second `NSTextTableBlock` grid was built for the nested table.
+    func testCellContainingANestedTableBlockFlattensToTextRatherThanBuildingARealNestedGrid() {
+        let nested: OfficeBlock = .table(rows: [[Cell(spans: [span("Nested")])]], headerRows: 0)
+        let outer = Cell(blocks: [.paragraph(spans: [span("Outer")]), nested])
+        let out = build([.table(rows: [[outer]], headerRows: 0)])
+        // Exact string, not just substring containment: a flattened nested table produces "Outer"
+        // + separator + "Nested" + the nested table's own row/cell newlines — recursing into a
+        // REAL nested `NSTextTableBlock` instead (the mutation this guards against) adds an extra
+        // trailing newline from `appendTable`'s own per-table separator, which a mere `.contains`
+        // check on each word would miss.
+        XCTAssertEqual(out.string, "Outer\nNested\n\n\n")
+        let outerBlocks = tableBlocks(in: out)
+        XCTAssertEqual(outerBlocks.count, 1, "only the outer table's own anchor cell — no nested grid")
+    }
+
+    /// The anchor-cells-only merge contract must still hold for a cell built the NEW way
+    /// (`blocks:`), not only for the spans compatibility path every other merge test here uses.
+    func testMergedCellBuiltFromBlocksStillAppliesItsRowSpan() {
+        let tall = Cell(blocks: [.paragraph(spans: [span("tall")])], rowSpan: 2, colSpan: 1)
+        let rows: [[Cell]] = [
+            [tall, Cell(spans: [span("top-right")])],
+            [Cell(spans: [span("bottom-right")])],
+        ]
+        let out = build([.table(rows: rows, headerRows: 0)])
+        let blocks = tableBlocks(in: out)
+        let tallBlock = blocks.first { $0.startingColumn == 0 }
+        XCTAssertEqual(tallBlock?.rowSpan, 2)
+        XCTAssertEqual(blocks.count, 3, "the tall cell's own row, no separate cell fabricated below it")
+    }
 }
