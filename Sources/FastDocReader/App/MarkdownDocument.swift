@@ -116,6 +116,42 @@ final class MarkdownDocument: NSDocument {
 
     // MARK: - Font size (menu actions routed through the responder chain)
 
+    /// What attempting to reload the file found — decided in one place, separate from the NSAlert
+    /// `reloadDocument` shows for `.failure`, so the decision itself is testable headlessly (an
+    /// `NSAlert.runModal()` is not). Before this existed, `reloadDocument` reached for `try?` at
+    /// `Data(contentsOf:)`, `ZipArchive(data:)` AND `DocumentTypes.readOffice` — any one of the three
+    /// failing meant the function silently did nothing, which looks identical to a successful no-op
+    /// reload and hides a real problem (deleted file, permissions, a corrupted archive) from the user.
+    enum ReloadOutcome {
+        case office(blocks: [OfficeBlock], archive: ZipArchive)
+        case text(TextFile)
+        case failure(String)
+    }
+
+    /// Reads `url` fresh (never the in-memory `text`/`officeBlocks` — this IS the re-read) and
+    /// reports what happened. `kind`/`ext` are passed in rather than read from `self` so this stays
+    /// a pure function of its arguments: nothing here mutates the document, which is what makes
+    /// `MarkdownDocumentReloadTests` able to call it directly and assert `.failure` without ever
+    /// constructing a window.
+    static func reloadOutcome(url: URL, kind: DocumentKind, extension ext: String) -> ReloadOutcome {
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch {
+            return .failure(error.localizedDescription)
+        }
+        guard kind == .office else {
+            return .text(TextEncodingDetector.decode(data))
+        }
+        do {
+            let archive = try ZipArchive(data: data)
+            let blocks = try DocumentTypes.readOffice(archive, extension: ext)
+            return .office(blocks: blocks, archive: archive)
+        } catch {
+            return .failure(error.localizedDescription)
+        }
+    }
+
     /// ⌘R: re-read the file from disk and re-render, keeping the scroll position. Note this
     /// reloads the DOCUMENT's content — it runs the currently-launched app binary, so it does
     /// not pick up a new app build (that still needs a relaunch).
@@ -131,17 +167,15 @@ final class MarkdownDocument: NSDocument {
             a.addButton(withTitle: "Cancel")
             guard a.runModal() == .alertFirstButtonReturn else { return }
         }
-        if let url = fileURL, let data = try? Data(contentsOf: url) {
-            if kind == .office {
+        if let url = fileURL {
+            let ext = url.pathExtension.isEmpty ? (untitledExtension ?? "") : url.pathExtension
+            switch Self.reloadOutcome(url: url, kind: kind, extension: ext) {
+            case .office(let blocks, let archive):
                 // Re-parse the archive, same as the initial read — never through the text-decode
                 // path (invariant: an office document's bytes are never handed to
                 // `TextEncodingDetector`).
-                let ext = fileURL?.pathExtension ?? untitledExtension ?? ""
-                if let archive = try? ZipArchive(data: data), let blocks = try? DocumentTypes.readOffice(archive, extension: ext) {
-                    setOfficeContent(blocks: blocks, archive: archive)
-                }
-            } else {
-                let reread = TextEncodingDetector.decode(data)
+                setOfficeContent(blocks: blocks, archive: archive)
+            case .text(let reread):
                 // The undo stack holds source OFFSETS into the text we're replacing. Re-reading the
                 // file can move every one of them (the file may have changed behind us), so an undo
                 // applied afterwards would overwrite the wrong span. Drop the history rather than
@@ -151,6 +185,17 @@ final class MarkdownDocument: NSDocument {
                 self.file = reread
                 self.text = reread.text
                 updateChangeCount(.changeCleared)     // the document now matches the file again
+            case .failure(let message):
+                // Nothing above this case has touched `self.text`/`self.file`/`officeBlocks` —
+                // the document on screen stays exactly what it was. Silently doing nothing (the
+                // old `try?` behaviour) looked identical to a successful no-op reload; this says
+                // out loud that the file on disk could not be read.
+                let a = NSAlert()
+                a.alertStyle = .warning
+                a.messageText = "Couldn't reload \(url.lastPathComponent)"
+                a.informativeText = message
+                a.addButton(withTitle: "OK")
+                a.runModal()
             }
         }
         guard let wc = windowControllers.first as? DocumentWindowController else { return }

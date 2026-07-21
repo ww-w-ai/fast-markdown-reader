@@ -224,6 +224,29 @@ final class DocxReaderTests: XCTestCase {
         XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "  spaced  ")])])
     }
 
+    /// CLAUDE.md S2 item 2: `w:noBreakHyphen`, `w:softHyphen` and `w:ptab` are text, and used to be
+    /// silently dropped by `buildSpan`'s `default: continue` — the author's character just vanished.
+    func testNoBreakHyphenSurvivesAsNonBreakingHyphen() throws {
+        let blocks = try read(document: """
+        <w:p><w:r><w:t>well</w:t><w:noBreakHyphen/><w:t>known</w:t></w:r></w:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "well\u{2011}known")])])
+    }
+
+    func testSoftHyphenSurvivesAsSoftHyphen() throws {
+        let blocks = try read(document: """
+        <w:p><w:r><w:t>super</w:t><w:softHyphen/><w:t>cali</w:t></w:r></w:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "super\u{00AD}cali")])])
+    }
+
+    func testPtabSurvivesAsTab() throws {
+        let blocks = try read(document: """
+        <w:p><w:r><w:t>Col1</w:t><w:ptab w:relativeTo="margin" w:alignment="left" w:leader="none"/><w:t>Col2</w:t></w:r></w:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Col1\tCol2")])])
+    }
+
     // MARK: Lists
 
     private let bulletThenDecimalNumbering = """

@@ -54,6 +54,48 @@
 		</dict>
 		<dict>
 			<key>CFBundleTypeName</key>
+			<string>Word Macro-Enabled Document</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>org.openxmlformats.wordprocessingml.document.macroenabled</string>
+			</array>
+			<key>NSDocumentClass</key>
+			<string>FastDocReader.MarkdownDocument</string>
+		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Word Template</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>org.openxmlformats.wordprocessingml.template</string>
+			</array>
+			<key>NSDocumentClass</key>
+			<string>FastDocReader.MarkdownDocument</string>
+		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Word Macro-Enabled Template</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>org.openxmlformats.wordprocessingml.template.macroenabled</string>
+			</array>
+			<key>NSDocumentClass</key>
+			<string>FastDocReader.MarkdownDocument</string>
+		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
 			<string>OpenDocument Text</string>
 			<key>CFBundleTypeRole</key>
 			<string>Viewer</string>

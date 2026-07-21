@@ -17,7 +17,10 @@ enum DocumentTypes {
     /// Office formats, read-only (see invariants 22 and CLAUDE.md S4). `.rtf` was surveyed and
     /// dropped (see the roadmap's Revision 2 — AppKit's RTF reader loses structure and images
     /// outright); `.odt` gained a reader in R3, so it belongs here now.
-    static let officeExtensions = ["docx", "odt"]
+    /// `.docm`/`.dotx`/`.dotm` (Word macro-enabled document/template, and template) share the exact
+    /// same `word/document.xml` shape as `.docx` — this app only ever reads XML out of the zip, so
+    /// macros are never executed, just never even looked at. They route to `DocxReader` below.
+    static let officeExtensions = ["docx", "docm", "dotx", "dotm", "odt"]
 
     static func opensInApp(_ ext: String) -> Bool {
         let e = ext.lowercased()
@@ -41,7 +44,7 @@ enum DocumentTypes {
     /// programmer error, not a malformed file — it throws rather than silently guessing Word.
     static func readOffice(_ archive: ZipArchive, extension ext: String) throws -> [OfficeBlock] {
         switch ext.lowercased() {
-        case "docx": return try DocxReader.read(archive)
+        case "docx", "docm", "dotx", "dotm": return try DocxReader.read(archive)
         case "odt": return try OdtReader.read(archive)
         default:
             throw NSError(domain: "ai.ww-w.fast-md-reader", code: 3, userInfo: [

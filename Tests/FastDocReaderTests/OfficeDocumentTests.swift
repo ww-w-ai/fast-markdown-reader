@@ -1,5 +1,6 @@
 import XCTest
 import AppKit
+import UniformTypeIdentifiers
 @testable import FastDocReader
 
 /// S4: the wire-up from office bytes (`.docx`, `.odt`) to an open, read-only window.
@@ -269,5 +270,67 @@ final class OfficeDocumentTests: XCTestCase {
         let wc = try XCTUnwrap(doc.windowControllers.first as? DocumentWindowController)
         let storage = try XCTUnwrap(wc.textStorageRef)
         XCTAssertEqual(storage.string, "line one\nline two\n")
+    }
+
+    // MARK: CLAUDE.md S2 item 1 — `.docm`/`.dotx`/`.dotm` open through the SAME real pipeline as
+    // `.docx`, per invariant 29: a test that only proves `DocxReader` parses these bytes (it always
+    // could — the XML shape is identical) says nothing about whether the app will let the file
+    // through the door at all. `.odt` shipped registered-but-unreachable once already; these three
+    // go through `MarkdownDocument.read(from:)` for exactly that reason.
+
+    func testDocmOpensThroughMarkdownDocumentAndParsesLikeDocx() throws {
+        let (doc, wc) = try openOffice(fixtureDocx(), ext: "docm",
+                                       uti: "org.openxmlformats.wordprocessingml.document.macroenabled")
+        XCTAssertEqual(doc.kind, .office)
+        let storage = try XCTUnwrap(wc.textStorageRef)
+        XCTAssertTrue(storage.string.contains("Title"))
+        XCTAssertTrue(storage.string.contains("Body text."))
+    }
+
+    func testDotxOpensThroughMarkdownDocumentAndParsesLikeDocx() throws {
+        let (doc, wc) = try openOffice(fixtureDocx(), ext: "dotx",
+                                       uti: "org.openxmlformats.wordprocessingml.template")
+        XCTAssertEqual(doc.kind, .office)
+        let storage = try XCTUnwrap(wc.textStorageRef)
+        XCTAssertTrue(storage.string.contains("Title"))
+    }
+
+    func testDotmOpensThroughMarkdownDocumentAndParsesLikeDocx() throws {
+        let (doc, wc) = try openOffice(fixtureDocx(), ext: "dotm",
+                                       uti: "org.openxmlformats.wordprocessingml.template.macroenabled")
+        XCTAssertEqual(doc.kind, .office)
+        let storage = try XCTUnwrap(wc.textStorageRef)
+        XCTAssertTrue(storage.string.contains("Title"))
+    }
+
+    func testDocumentTypesOfficeExtensionsIncludesAllFourWordFormats() {
+        XCTAssertTrue(DocumentTypes.officeExtensions.contains("docx"))
+        XCTAssertTrue(DocumentTypes.officeExtensions.contains("docm"))
+        XCTAssertTrue(DocumentTypes.officeExtensions.contains("dotx"))
+        XCTAssertTrue(DocumentTypes.officeExtensions.contains("dotm"))
+    }
+
+    /// Mechanical, per CLAUDE.md's testing note: `DocumentTypes.officeExtensions` and
+    /// `Resources/Info.plist`'s `CFBundleDocumentTypes` are two lists nothing keeps in sync but a
+    /// human — read the plist straight out of the repo and assert every office extension this app
+    /// claims to open (`DocumentTypes`) has a matching `LSItemContentTypes` entry the system can
+    /// actually resolve back to that extension (`UTType(filenameExtension:)`), and vice versa.
+    func testOfficeExtensionsAgreeWithInfoPlistDocumentTypes() throws {
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let plistURL = repoRoot.appendingPathComponent("Resources/Info.plist")
+        let plistData = try Data(contentsOf: plistURL)
+        let plist = try XCTUnwrap(try PropertyListSerialization.propertyList(from: plistData, options: [], format: nil) as? [String: Any])
+        let docTypes = try XCTUnwrap(plist["CFBundleDocumentTypes"] as? [[String: Any]])
+        let plistContentTypes = Set(docTypes.flatMap { ($0["LSItemContentTypes"] as? [String]) ?? [] })
+
+        for ext in DocumentTypes.officeExtensions {
+            guard let uti = UTType(filenameExtension: ext) else {
+                XCTFail("no system UTType for office extension \"\(ext)\"")
+                continue
+            }
+            XCTAssertTrue(plistContentTypes.contains(uti.identifier),
+                          "Info.plist has no CFBundleDocumentTypes entry for \".\(ext)\" (\(uti.identifier))")
+        }
     }
 }

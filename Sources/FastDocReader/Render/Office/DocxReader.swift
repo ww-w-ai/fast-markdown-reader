@@ -881,7 +881,9 @@ enum DocxReader {
     /// is a hint to XML WRITERS about whether to preserve whitespace-only nodes; a parser already
     /// reports the literal characters present, so there is nothing extra to honour here (and
     /// nothing here trims). `w:br`/`w:tab` are not text but stand for one, so they are turned
-    /// into `\n`/`\t` in place. `w:sym` is a special-character reference (`w:font`+`w:char`, a
+    /// into `\n`/`\t` in place, and so do `w:noBreakHyphen`/`w:softHyphen`/`w:ptab` (U+2011, U+00AD,
+    /// `\t` — the author's punctuation/whitespace, not formatting; dropping them silently deleted a
+    /// real character). `w:sym` is a special-character reference (`w:font`+`w:char`, a
     /// code point in that FONT's own private encoding, e.g. Wingdings) with no `w:t` fallback at
     /// all — this reader has no way to map an arbitrary symbol-font code point to a real Unicode
     /// glyph, but silently emitting nothing would make the author's character disappear entirely
@@ -898,6 +900,13 @@ enum DocxReader {
             case "w:br": text += "\n"
             case "w:tab": text += "\t"
             case "w:sym": text += "▯"
+            // A non-breaking hyphen/soft hyphen IS text (the author's punctuation choice, not
+            // formatting), and a positioned tab (`w:ptab`) is whitespace like `w:tab` even though
+            // this reader doesn't honour its absolute position — dropping any of the three silently
+            // deleted the author's character (see the function doc above).
+            case "w:noBreakHyphen": text += "\u{2011}"
+            case "w:softHyphen": text += "\u{00AD}"
+            case "w:ptab": text += "\t"
             default: continue
             }
         }
