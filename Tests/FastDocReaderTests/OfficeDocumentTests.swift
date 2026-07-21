@@ -511,4 +511,83 @@ final class OfficeDocumentTests: XCTestCase {
                           "Info.plist has no CFBundleDocumentTypes entry for \".\(ext)\" (\(uti.identifier))")
         }
     }
+
+    // MARK: Internal (in-document) links (S11) — through the REAL read path (invariant 29): a
+    // parser-only test (`DocxReaderTests`) can prove the span carries the right target, but not
+    // that it reaches the text storage `DocumentWindowController` actually clicks on, and a
+    // builder-only test (`OfficeTextBuilderTests`) can prove the attribute shape but not that the
+    // real click handler resolves and navigates from it.
+
+    /// A leading, deliberately unrelated paragraph is important, not decoration: it puts the link
+    /// at a non-zero character position, so a mutant that resolved a dead anchor to "0" (document
+    /// start) or otherwise guessed would be caught by `testInternalLinkToAMissingBookmarkDoesNothingRatherThanMisfiring`
+    /// instead of coincidentally matching "stayed at the click position" — see invariant 30.
+    private func fixtureDocxWithInternalLink(anchor: String, bookmarkName: String?) -> Data {
+        let bookmarkPara = bookmarkName.map {
+            "<w:bookmarkStart w:id=\"0\" w:name=\"\($0)\"/><w:r><w:t>Clause 7</w:t></w:r><w:bookmarkEnd w:id=\"0\"/>"
+        } ?? "<w:r><w:t>Clause 7, no bookmark</w:t></w:r>"
+        let body = """
+        <w:p><w:r><w:t>Preamble text before the link.</w:t></w:r></w:p>
+        <w:p><w:hyperlink w:anchor="\(anchor)"><w:r><w:t>See above</w:t></w:r></w:hyperlink></w:p>
+        <w:p>\(bookmarkPara)</w:p>
+        """
+        return buildZip([("word/document.xml", Data("""
+        <?xml version="1.0" encoding="UTF-8"?><w:document><w:body>\(body)</w:body></w:document>
+        """.utf8))])
+    }
+
+    /// The actual defect: clicking an internal link (`w:anchor`, no `r:id`) must resolve through
+    /// `MDAttr.anchor`, never fall to the generic URL branch that would try to open a file named
+    /// after the bookmark. Proven by resolving AND by the attribute shape at the click point.
+    func testInternalLinkWithAResolvableBookmarkNavigatesToItsSpan() throws {
+        let (_, wc) = try openOffice(fixtureDocxWithInternalLink(anchor: "_Toc1", bookmarkName: "_Toc1"))
+        let storage = try XCTUnwrap(wc.textStorageRef)
+        let linkLoc = (storage.string as NSString).range(of: "See above").location
+        // Full-pipeline proof (invariant 29) that the anchor attribute — not a bare `#_Toc1` URL —
+        // reached the real text storage `clickedOnLink` reads.
+        XCTAssertEqual(storage.attribute(MDAttr.anchor, at: linkLoc, effectiveRange: nil) as? String, "_Toc1")
+        XCTAssertNil(storage.attribute(MDAttr.filePath, at: linkLoc, effectiveRange: nil))
+        let linkURL = storage.attribute(.link, at: linkLoc, effectiveRange: nil) as? URL
+        XCTAssertEqual(linkURL, URL(string: "fmdanchor:jump"))
+
+        let before = wc.textView.selectedRange()
+        let handled = wc.textView(wc.textView, clickedOnLink: linkURL as Any, at: linkLoc)
+        XCTAssertTrue(handled)
+        let targetLoc = (storage.string as NSString).range(of: "Clause 7").location
+        XCTAssertEqual(wc.textView.selectedRange(), NSRange(location: targetLoc, length: 0))
+        XCTAssertNotEqual(wc.textView.selectedRange(), before)
+    }
+
+    /// A link to a bookmark that doesn't exist (deleted in a real document, common) — MUST NOT
+    /// misfire as a file-open attempt, and must do NOTHING VISIBLE: the selection stays put.
+    ///
+    /// MUTATION CHECK: if `jumpToAnchor` guessed instead of returning early on a `nil` resolve (e.g.
+    /// falling back to "jump to document start"), `selectedRange` would change and this would fail
+    /// — proving this test is sensitive to the "do nothing" behaviour, not just "doesn't crash".
+    func testInternalLinkToAMissingBookmarkDoesNothingRatherThanMisfiring() throws {
+        let (_, wc) = try openOffice(fixtureDocxWithInternalLink(anchor: "_Deleted", bookmarkName: "_Toc1"))
+        let storage = try XCTUnwrap(wc.textStorageRef)
+        let linkLoc = (storage.string as NSString).range(of: "See above").location
+        wc.textView.setSelectedRange(NSRange(location: linkLoc, length: 0))
+        let linkURL = storage.attribute(.link, at: linkLoc, effectiveRange: nil) as? URL
+
+        let handled = wc.textView(wc.textView, clickedOnLink: linkURL as Any, at: linkLoc)
+        XCTAssertTrue(handled, "an anchor link is still HANDLED (never falls through to file-open) even when it doesn't resolve")
+        XCTAssertEqual(wc.textView.selectedRange(), NSRange(location: linkLoc, length: 0),
+                       "an unresolved anchor must not move the selection/scroll at all")
+    }
+
+    /// `AnchorResolver`'s pure decision, exercised against the REAL storage the full read path
+    /// produces (not a synthetic dictionary) — the part of invariant 29 that doesn't need a window.
+    func testAnchorResolverAgreesWithTheRealDocumentsStorage() throws {
+        let (_, wc) = try openOffice(fixtureDocxWithInternalLink(anchor: "_Toc1", bookmarkName: "_Toc1"))
+        let storage = try XCTUnwrap(wc.textStorageRef)
+        var bookmarks: [String: Int] = [:]
+        storage.enumerateAttribute(MDAttr.bookmarkTarget, in: NSRange(location: 0, length: storage.length)) { v, r, _ in
+            (v as? [String])?.forEach { bookmarks[$0] = r.location }
+        }
+        let targetLoc = (storage.string as NSString).range(of: "Clause 7").location
+        XCTAssertEqual(AnchorResolver.resolve(target: "_Toc1", bookmarks: bookmarks, headings: []), targetLoc)
+        XCTAssertNil(AnchorResolver.resolve(target: "_Deleted", bookmarks: bookmarks, headings: []))
+    }
 }

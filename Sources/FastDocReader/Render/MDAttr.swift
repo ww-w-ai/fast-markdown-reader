@@ -52,7 +52,16 @@ enum MDAttr {
     /// Value = NSValue(range:) of this block's span in the ORIGINAL markdown source (line-based,
     /// UTF-16). Lets a rendered selection map back to source markdown for block-level editing.
     static let srcRange = NSAttributedString.Key("mdSrcRange")
-    /// Value = the raw fragment (without `#`) of an in-document anchor link (a TOC entry). The
-    /// click handler resolves it to the matching heading and scrolls there.
+    /// Value = the raw fragment (without `#`) of an in-document anchor link (a TOC entry, or an
+    /// office cross-reference/bookmark link). The click handler resolves it — first against
+    /// `bookmarkTarget` (exact name), then by GFM heading-slug match — and scrolls there; a target
+    /// that resolves to neither does nothing (see `AnchorResolver`).
     static let anchor = NSAttributedString.Key("mdAnchor")
+    /// Value = `[String]`, the bookmark name(s) (docx `w:bookmarkStart/@w:name`, odt
+    /// `text:bookmark(-start)/@text:name`) whose target position is the START of this span — the
+    /// destination side of an in-document anchor link, recorded by the office readers exactly the
+    /// way a markdown heading's own text already doubles as its jump target. `AnchorResolver`
+    /// matches an anchor link's raw fragment against these names EXACTLY (bookmark names are
+    /// opaque ids like `_Toc123`, never slugified).
+    static let bookmarkTarget = NSAttributedString.Key("mdBookmarkTarget")
 }

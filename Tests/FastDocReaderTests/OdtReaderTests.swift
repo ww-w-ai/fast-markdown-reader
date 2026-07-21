@@ -547,6 +547,38 @@ final class OdtReaderTests: XCTestCase {
         XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "no href")])])
     }
 
+    /// ODF's same-document convention: `xlink:href` beginning with `#` — must survive verbatim
+    /// (`OfficeTextBuilder` is what turns this into a non-file-opening jump, not this reader).
+    func testInternalHrefProducesAFragmentLinkVerbatim() throws {
+        let blocks = try read(body: """
+        <text:p><text:a xlink:href="#BookmarkName">see above</text:a></text:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "see above", link: "#BookmarkName")])])
+    }
+
+    // MARK: Bookmarks (in-document link TARGETS, not the links themselves)
+
+    /// `text:bookmark` — the zero-length, point form used for most cross-reference targets.
+    func testPointBookmarkAttachesItsNameToTheFollowingSpan() throws {
+        let blocks = try read(body: """
+        <text:p><text:bookmark text:name="Target1"/>Clause 7</text:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Clause 7", bookmarks: ["Target1"])])])
+    }
+
+    /// `text:bookmark-start`/`text:bookmark-end` — the ranged form, mirroring docx's
+    /// `w:bookmarkStart`/`w:bookmarkEnd`.
+    func testRangedBookmarkAttachesItsNameToTheWrappedSpanOnly() throws {
+        let blocks = try read(body: """
+        <text:p>See <text:bookmark-start text:name="Ref9"/>clause 7<text:bookmark-end text:name="Ref9"/> above</text:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [
+            Span(text: "See "),
+            Span(text: "clause 7", bookmarks: ["Ref9"]),
+            Span(text: " above"),
+        ])])
+    }
+
     // MARK: Footnotes / endnotes
     //
     // NOTE ON EVIDENCE: like `DocxReaderTests`' footnote section, this is entirely synthetic — no

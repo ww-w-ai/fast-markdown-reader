@@ -522,6 +522,41 @@ final class OfficeTextBuilderTests: XCTestCase {
         XCTAssertEqual(officeURL, URL(string: "https://example.com/doc"))
     }
 
+    /// THE ACTUAL BUG (S11): an office in-document link (`span.link == "#BookmarkName"`, docx
+    /// `w:anchor` / odt same-document `xlink:href`) must NEVER become a bare `.link` URL built from
+    /// the raw fragment — `DocumentWindowController.textView(_:clickedOnLink:at:)` treats any
+    /// scheme-less, non-anchor URL as a relative file path and tries to open a file named after the
+    /// bookmark. It must instead carry `MDAttr.anchor` (the click handler's own escape hatch,
+    /// checked before the file-path branch) with the placeholder link markdown's own TOC links use.
+    ///
+    /// MUTATION CHECK: reverting `OfficeTextBuilder`'s `#`-prefix branch to the old
+    /// `attrs[.link] = url` behaviour makes `officeURL` equal `URL(string: "#BookmarkName")` and
+    /// `officeAnchor` nil — this assertion fails under that code, proving it exercises the fix.
+    func testInDocumentAnchorLinkNeverBecomesABareFragmentURL() {
+        var linked = span("clause 7"); linked.link = "#BookmarkName"
+        let out = build([.paragraph(spans: [linked])])
+        let officeAnchor = out.attribute(MDAttr.anchor, at: 0, effectiveRange: nil) as? String
+        let officeURL = out.attribute(.link, at: 0, effectiveRange: nil) as? URL
+        XCTAssertEqual(officeAnchor, "BookmarkName")
+        XCTAssertEqual(officeURL, URL(string: "fmdanchor:jump"))
+        XCTAssertNotEqual(officeURL, URL(string: "#BookmarkName"))
+    }
+
+    /// A bookmark's target position (`Span.bookmarks`) reaches the rendered text as
+    /// `MDAttr.bookmarkTarget`, over the span it marks — not the whole block, not lost.
+    ///
+    /// MUTATION CHECK: dropping the `!span.bookmarks.isEmpty` block in `spansAttributedString`
+    /// makes `target` nil — this assertion fails under that code.
+    func testBookmarkedSpanCarriesBookmarkTargetAttribute() {
+        var marked = span("Clause 7"); marked.bookmarks = ["_Toc1"]
+        let out = build([.paragraph(spans: [span("Intro. "), marked])])
+        let loc = (out.string as NSString).range(of: "Clause 7").location
+        let target = out.attribute(MDAttr.bookmarkTarget, at: loc, effectiveRange: nil) as? [String]
+        XCTAssertEqual(target, ["_Toc1"])
+        // The preceding, unrelated text must NOT carry it.
+        XCTAssertNil(out.attribute(MDAttr.bookmarkTarget, at: 0, effectiveRange: nil))
+    }
+
     // MARK: Images
 
     /// Requirement 7 / invariant 1: the reserved size must be exactly the declared size, and the

@@ -117,10 +117,28 @@ enum OfficeTextBuilder {
             // Same colour/underline treatment `MarkdownRenderer.inlineFragment`'s `Markdown.Link`
             // case uses — a link must look and behave identically whether it arrived via markdown
             // or an office hyperlink, not grow a second visual style.
-            if let link = span.link, let url = URL(string: link) {
-                attrs[.foregroundColor] = theme.linkColor
-                attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue
-                attrs[.link] = url
+            if let link = span.link {
+                if link.hasPrefix("#") {
+                    // An in-document anchor (docx `w:anchor`, odt same-document `xlink:href`) —
+                    // NEVER a `.link` URL built from the raw fragment. `MarkdownRenderer`'s own TOC
+                    // links use the identical placeholder-URL-plus-`MDAttr.anchor` pair (see its
+                    // `Markdown.Link` case) precisely so the click handler's `MDAttr.anchor` check
+                    // catches this BEFORE it can ever reach the generic URL branch that treats a
+                    // bare `#fragment` as a relative file path — that misread (clicking a
+                    // cross-reference tries to open a file named after the bookmark) is the defect
+                    // this exists to prevent, not a style nicety.
+                    attrs[.foregroundColor] = theme.linkColor
+                    attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue
+                    attrs[MDAttr.anchor] = String(link.dropFirst())
+                    attrs[.link] = URL(string: "fmdanchor:jump")!
+                } else if let url = URL(string: link) {
+                    attrs[.foregroundColor] = theme.linkColor
+                    attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue
+                    attrs[.link] = url
+                }
+            }
+            if !span.bookmarks.isEmpty {
+                attrs[MDAttr.bookmarkTarget] = span.bookmarks
             }
             out.append(NSAttributedString(string: span.text, attributes: attrs))
         }

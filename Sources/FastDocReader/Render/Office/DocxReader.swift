@@ -1267,8 +1267,26 @@ enum DocxReader {
     /// markers, and section properties.
     private static func collectSpans(in node: XMLNode, relationships: Relationships, notes: NoteNumbering) -> [Span] {
         var spans: [Span] = []
+        // Names collected from `w:bookmarkStart` since the last span was emitted, waiting for the
+        // next real content to attach to (a bookmark almost always wraps its target rather than
+        // standing alone) — see the `w:bookmarkStart` case in `walk` and the doc comment on
+        // `Span.bookmarks`. `_GoBack` is filtered here, not recorded and never resolvable: Word
+        // inserts it automatically (last-edit-location bookkeeping) into nearly every real
+        // document, no hyperlink ever targets it, and recording it would force every span right
+        // after one — text a user never asked to navigate to — out of the ordinary run-merging path.
+        var pendingBookmarks: [String] = []
         func appendMerging(_ span: Span) {
-            if let last = spans.last, last.bold == span.bold, last.italic == span.italic,
+            var span = span
+            if !pendingBookmarks.isEmpty {
+                span.bookmarks += pendingBookmarks
+                pendingBookmarks = []
+            }
+            guard span.bookmarks.isEmpty else { spans.append(span); return }
+            // A bookmarked span is also never EXTENDED by whatever comes right after it — merging
+            // trailing text into it would grow the bookmark's rendered span past its real target,
+            // the same boundary-smearing `Span.bookmarks`' doc comment warns against, just from the
+            // other direction.
+            if let last = spans.last, last.bookmarks.isEmpty, last.bold == span.bold, last.italic == span.italic,
                last.underline == span.underline, last.code == span.code, last.link == span.link,
                last.strikethrough == span.strikethrough, last.superscript == span.superscript,
                last.subscripted == span.subscripted {
@@ -1296,8 +1314,17 @@ enum DocxReader {
                 // record of "moved away" markers rather than relying on them being harmlessly
                 // empty.
                 case "w:pPr", "w:rPr", "w:del", "w:moveFrom", "w:moveFromRangeStart", "w:moveFromRangeEnd",
-                     "w:bookmarkStart", "w:bookmarkEnd", "w:proofErr",
+                     "w:bookmarkEnd", "w:proofErr",
                      "w:sectPr", "w:commentRangeStart", "w:commentRangeEnd", "w:commentReference":
+                    continue
+                // A bookmark's name is the target an in-document link (`w:anchor`) jumps to — see
+                // `Span.bookmarks`/`hyperlinkTarget` below. `_GoBack` is Word's own auto-inserted
+                // bookmark (nothing in a real document ever links to it) and is deliberately never
+                // recorded — see the doc comment on `pendingBookmarks` above.
+                case "w:bookmarkStart":
+                    if let name = child.attributes["w:name"], name != "_GoBack" {
+                        pendingBookmarks.append(name)
+                    }
                     continue
                 // A display equation — `collectFormulaBlocks` (called separately, once per
                 // paragraph, from `parseParagraph`) already turns this into its OWN `.formula`
@@ -1368,6 +1395,15 @@ enum DocxReader {
     /// internal same-document link (e.g. a cross-reference to a heading) carries no `r:id` at all,
     /// only `w:anchor` naming a bookmark — turned into a `#`-prefixed fragment, the same convention
     /// markdown links already use for in-document anchors.
+    ///
+    /// PRECEDENCE, `r:id` present alongside `w:anchor`: `r:id` wins, `w:anchor` is ignored — per
+    /// ECMA-376 Part 1 §17.16.22 (`CT_Hyperlink`), `id` is "the relationship id of the target of
+    /// this hyperlink" and, when present, `anchor` names a location WITHIN that relationship's
+    /// target (a bookmark inside the linked document), not a location in the current one. This
+    /// reader has no way to jump inside an external target, so honouring `w:anchor` there would be
+    /// wrong twice over — it would misread it as an in-document bookmark AND ignore the external
+    /// target entirely. Dropping it and following `r:id` alone is the correct reading, not just the
+    /// simpler one.
     private static func hyperlinkTarget(_ hyperlink: XMLNode, relationships: Relationships) -> String? {
         if let rId = hyperlink.attributes["r:id"] {
             return relationships.byId[rId]?.target

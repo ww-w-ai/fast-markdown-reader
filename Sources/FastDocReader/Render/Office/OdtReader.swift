@@ -728,9 +728,28 @@ enum OdtReader {
         in node: XMLNode, style: TextStyle, textStyles: [String: TextStyle], notes: NoteCollector
     ) -> [Span] {
         var spans: [Span] = []
+        // Same role as `DocxReader.collectSpans`'s `pendingBookmarks`: names collected from
+        // `text:bookmark`/`text:bookmark-start` since the last span, attached to the next real
+        // content. ODF has no known equivalent of Word's auto-inserted `_GoBack`, so nothing is
+        // filtered here.
+        var pendingBookmarks: [String] = []
         func appendMerging(_ text: String, _ style: TextStyle, _ link: String?) {
             guard !text.isEmpty else { return }
-            if let last = spans.last, last.bold == style.bold, last.italic == style.italic, last.underline == style.underline,
+            var bookmarks: [String] = []
+            if !pendingBookmarks.isEmpty {
+                bookmarks = pendingBookmarks
+                pendingBookmarks = []
+            }
+            guard bookmarks.isEmpty else {
+                spans.append(Span(
+                    text: text, bold: style.bold, italic: style.italic, underline: style.underline, link: link,
+                    strikethrough: style.strikethrough, superscript: style.superscript, subscripted: style.subscripted,
+                    bookmarks: bookmarks))
+                return
+            }
+            // A bookmarked span is never EXTENDED by trailing text either — see the matching guard
+            // in `DocxReader.collectSpans`.
+            if let last = spans.last, last.bookmarks.isEmpty, last.bold == style.bold, last.italic == style.italic, last.underline == style.underline,
                last.strikethrough == style.strikethrough, last.superscript == style.superscript,
                last.subscripted == style.subscripted, last.link == link {
                 spans[spans.count - 1].text += text
@@ -817,7 +836,14 @@ enum OdtReader {
                         ? (child.attributes["text:string-value-if-true"] ?? "")
                         : (child.attributes["text:string-value-if-false"] ?? "")
                     appendMerging(text, style, link)
-                case "text:bookmark-start", "text:bookmark-end", "text:bookmark", "office:annotation",
+                case "text:bookmark-start", "text:bookmark":
+                    // `text:bookmark` (a zero-length, point bookmark — the common case for a
+                    // cross-reference target) and `text:bookmark-start` (the open end of a ranged
+                    // bookmark) both carry the target name the SAME way: `text:name`. Recorded here,
+                    // never rendered as text — see `Span.bookmarks`.
+                    if let name = child.attributes["text:name"] { pendingBookmarks.append(name) }
+                    continue
+                case "text:bookmark-end", "office:annotation",
                      "office:annotation-end", "text:soft-page-break":
                     continue // markers with no renderable text of their own
                 default:

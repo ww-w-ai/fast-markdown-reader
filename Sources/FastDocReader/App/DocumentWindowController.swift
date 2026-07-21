@@ -973,9 +973,15 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
     /// Open clicked links: web URLs in the browser, `.md` files as a tab (focusing an already-
     /// open one), other files in their associated app, and folders in Finder.
     func textView(_ tv: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
-        // In-document anchor (a TOC entry) → scroll to the matching heading.
-        if let slug = tv.textStorage?.attribute(MDAttr.anchor, at: charIndex, effectiveRange: nil) as? String {
-            jumpToHeading(slug: slug); return true
+        // In-document anchor (a markdown TOC entry, or an office cross-reference/bookmark link) —
+        // resolved against bookmark markers first, then heading slugs (`AnchorResolver`). This MUST
+        // be checked, and must return, before the raw-URL/file-path branches below: an office
+        // bookmark link carries no `.link` scheme AppKit can route on its own (see
+        // `OfficeTextBuilder`'s `#`-prefixed-link handling), so falling through here is exactly the
+        // defect this branch exists to prevent — a bare `#BookmarkName` misread as a relative file
+        // path and handed to `openFile`.
+        if let target = tv.textStorage?.attribute(MDAttr.anchor, at: charIndex, effectiveRange: nil) as? String {
+            jumpToAnchor(target: target); return true
         }
         // A detected file path (stored raw so it can be resolved against the document's folder).
         if let raw = tv.textStorage?.attribute(MDAttr.filePath, at: charIndex, effectiveRange: nil) as? String {
@@ -1013,33 +1019,28 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         }
     }
 
-    /// Resolve a GFM anchor slug to its heading and scroll there (top-anchored). Slugs are matched
-    /// by the GitHub rule: lowercase, drop punctuation, spaces→hyphens (Hangul/CJK preserved).
-    private func jumpToHeading(slug: String) {
+    /// Resolve an in-document anchor's raw target and scroll there (top-anchored) — same reveal
+    /// path `goToOutlineEntry` uses, so a bookmark/cross-reference jump feels identical to clicking
+    /// the sidebar. The matching itself is `AnchorResolver`'s pure decision (bookmark exact match,
+    /// then GFM heading-slug match); this function's only job is gathering the two candidate sets
+    /// from the live text storage and acting on the result. A target that resolves to nothing does
+    /// NOTHING VISIBLE — a link to a deleted bookmark/heading is common in real documents and is
+    /// not an error a reader should announce (no beep, no guess).
+    private func jumpToAnchor(target: String) {
         guard let storage = textView.textStorage else { return }
-        let target = Self.slugify(slug)
-        var found: Int?
-        storage.enumerateAttribute(MDAttr.heading, in: NSRange(location: 0, length: storage.length)) { v, r, stop in
+        var bookmarks: [String: Int] = [:]
+        storage.enumerateAttribute(MDAttr.bookmarkTarget, in: NSRange(location: 0, length: storage.length)) { v, r, _ in
+            guard let names = v as? [String] else { return }
+            for name in names { bookmarks[name] = r.location }
+        }
+        var headings: [(text: String, position: Int)] = []
+        storage.enumerateAttribute(MDAttr.heading, in: NSRange(location: 0, length: storage.length)) { v, r, _ in
             guard v != nil else { return }
-            if Self.slugify((storage.string as NSString).substring(with: r)) == target {
-                found = r.location; stop.pointee = true
-            }
+            headings.append((text: (storage.string as NSString).substring(with: r), position: r.location))
         }
-        if let f = found {
-            textView.setSelectedRange(NSRange(location: f, length: 0))
-            scrollCharToTop(f)
-        } else {
-            NSSound.beep()
-        }
-    }
-
-    private static func slugify(_ s: String) -> String {
-        var out = ""
-        for ch in s.lowercased() {
-            if ch == " " || ch == "\t" { out.append("-") }
-            else if ch == "-" || ch == "_" || ch.isLetter || ch.isNumber { out.append(ch) }
-        }
-        return out
+        guard let found = AnchorResolver.resolve(target: target, bookmarks: bookmarks, headings: headings) else { return }
+        textView.setSelectedRange(NSRange(location: found, length: 0))
+        scrollCharToTop(found)
     }
 
     /// ⌘-click on a selection: open whatever was highlighted, even without an http prefix.

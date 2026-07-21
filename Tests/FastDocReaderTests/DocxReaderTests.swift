@@ -967,6 +967,67 @@ final class DocxReaderTests: XCTestCase {
         ])])
     }
 
+    // MARK: Bookmarks (in-document link TARGETS, not the links themselves)
+
+    /// The common real-world shape: a bookmark wraps the run it names, closing again inside the
+    /// same paragraph. `_Toc1` must land on the span, not vanish the way `w:bookmarkStart`/`End`
+    /// alone do.
+    func testBookmarkWrappingARunAttachesItsNameToThatSpan() throws {
+        let blocks = try read(document: """
+        <w:p>
+          <w:bookmarkStart w:id="0" w:name="_Toc1"/>
+          <w:r><w:t>Clause 7</w:t></w:r>
+          <w:bookmarkEnd w:id="0"/>
+        </w:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Clause 7", bookmarks: ["_Toc1"])])])
+    }
+
+    /// MUTATION CHECK (invariant 30): without the `!span.bookmarks.isEmpty` merge guard in
+    /// `appendMerging`, this run would merge into a same-formatted neighbour and the name would be
+    /// silently dropped rather than misplaced — this asserts the name actually reaches the span,
+    /// which a test only checking "no crash" would not catch.
+    func testBookmarkedRunDoesNotMergeIntoAnIdenticallyFormattedNeighbour() throws {
+        let blocks = try read(document: """
+        <w:p>
+          <w:r><w:t>See </w:t></w:r>
+          <w:bookmarkStart w:id="0" w:name="_Ref9"/>
+          <w:r><w:t>clause 7</w:t></w:r>
+          <w:bookmarkEnd w:id="0"/>
+          <w:r><w:t> above</w:t></w:r>
+        </w:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [
+            Span(text: "See "),
+            Span(text: "clause 7", bookmarks: ["_Ref9"]),
+            Span(text: " above"),
+        ])])
+    }
+
+    /// Word's own auto-inserted "last edit location" bookmark — real corpus noise in nearly every
+    /// document, never a real cross-reference target. Regression guard for the existing
+    /// `testBookmarksAndProofErrProduceNoPhantomSpansAndDoNotSplitARunPair` merge behaviour: if
+    /// `_GoBack` were recorded like any other name, that test's "AB" would split into two spans.
+    func testGoBackBookmarkIsNeverRecorded() throws {
+        let blocks = try read(document: """
+        <w:p>
+          <w:bookmarkStart w:id="0" w:name="_GoBack"/>
+          <w:bookmarkEnd w:id="0"/>
+          <w:r><w:t>Text</w:t></w:r>
+        </w:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Text")])])
+    }
+
+    /// `r:id` and `w:anchor` both present — per ECMA-376 §17.16.22, `id` wins and `anchor` names a
+    /// location WITHIN that external target, not this document; see `hyperlinkTarget`'s doc comment.
+    func testHyperlinkWithBothRIdAndAnchorFollowsRId() throws {
+        let blocks = try read(
+            document: "<w:p><w:hyperlink r:id=\"rId5\" w:anchor=\"Ignored\"><w:r><w:t>go</w:t></w:r></w:hyperlink></w:p>",
+            rels: "<Relationships xmlns=\"x\"><Relationship Id=\"rId5\" Type=\"x\" Target=\"https://example.com/doc\" TargetMode=\"External\"/></Relationships>")
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "go", link: "https://example.com/doc")])])
+    }
+
     // MARK: Content controls (`w:sdt`) — unwrapped, never skipped
 
     func testContentControlWrappingAParagraphIsUnwrappedNotSkipped() throws {

@@ -21,6 +21,13 @@ struct Span: Equatable {
     /// backticks at every call site (`` `subscript` ``). `superscript`/`subscripted` reads a little
     /// unevenly next to each other, but stays typeable everywhere without ceremony.
     var subscripted: Bool = false
+    /// Bookmark name(s) (docx `w:bookmarkStart`, odt `text:bookmark`/`text:bookmark-start`) whose
+    /// target position is the START of this span — empty for ordinary text. `OfficeTextBuilder`
+    /// turns a non-empty value into `MDAttr.bookmarkTarget` so an in-document anchor link elsewhere
+    /// in the document can jump here by exact name. A span carrying a bookmark is never merged into
+    /// its neighbour (see both readers' `appendMerging`) — merging would smear the marker's exact
+    /// position across text that predates the bookmark.
+    var bookmarks: [String] = []
 }
 
 /// One cell of a table row. Only ANCHOR cells — the top-left corner of a merge — appear in
