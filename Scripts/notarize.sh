@@ -24,7 +24,18 @@ APP="FastMDReader.app"
 ZIP="FastMDReader.zip"
 
 echo "==> Building release"
-./Scripts/make-app.sh release
+# DIST_IDENTITY keeps the real bundle identifier: a local build otherwise gets a .dev suffix so it
+# cannot share per-app state (recent documents above all) with an installed release.
+DIST_IDENTITY=1 ./Scripts/make-app.sh release
+
+# Verify it rather than trust the flag — shipping a .dev identifier would be a broken update for
+# every existing user, and the symptom (their app "forgetting" everything) appears only after install.
+BUILT_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' FastMDReader.app/Contents/Info.plist)"
+if [[ "$BUILT_ID" == *.dev ]]; then
+  echo "REFUSING TO SHIP: bundle identifier is $BUILT_ID — DIST_IDENTITY did not take effect." >&2
+  exit 1
+fi
+echo "    shipping identifier: $BUILT_ID"
 
 echo "==> Signing with Developer ID + hardened runtime (NO sandbox — see below)"
 # No --deep: the bundle is a single binary with no embedded frameworks or dylibs,

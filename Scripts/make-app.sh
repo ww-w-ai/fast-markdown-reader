@@ -18,6 +18,29 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/FastMDReader"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
+
+# A local build gets its OWN bundle identifier, so it cannot touch the installed app's state.
+#
+# macOS keys per-app state — the recent-documents list above all — to the bundle identifier. A build
+# from here is ad-hoc signed, and an ad-hoc signature's cdhash changes on EVERY build, so each one
+# reads to macOS as a different app claiming the same identifier. Sharing the identifier with an
+# installed release therefore wipes that release's recent files every time a developer rebuilds
+# (see the "Open Recent" invariant in CLAUDE.md). Separating the identifier removes the shared state
+# entirely, whatever the exact mechanism.
+#
+# Distribution MUST keep the real identifier: notarize.sh and appstore.sh set DIST_IDENTITY=1, and
+# both verify afterwards that it survived — a default that only holds when every future caller
+# remembers to opt out is not a default worth having.
+if [[ -z "${DIST_IDENTITY:-}" ]]; then
+  PB=/usr/libexec/PlistBuddy
+  REAL_ID="$($PB -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist")"
+  $PB -c "Set :CFBundleIdentifier ${REAL_ID}.dev" "$APP/Contents/Info.plist"
+  $PB -c "Set :CFBundleName FastMD (Dev)" "$APP/Contents/Info.plist"
+  $PB -c "Set :CFBundleDisplayName Fast Markdown Reader (Dev)" "$APP/Contents/Info.plist"
+  echo "    identifier: ${REAL_ID}.dev  (local build — separate from any installed release)"
+else
+  echo "    identifier: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist")  (DISTRIBUTION)"
+fi
 # bundle runtime resources (mermaid.min.js added in Task 5, etc.) — everything in Resources/ except
 # build inputs that must not ship inside the bundle (Info.plist is placed above; entitlements are a
 # signing input).

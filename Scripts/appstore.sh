@@ -38,7 +38,18 @@ KC_PW="$(security find-generic-password -a ww-w-signing -s ww-w-signing-keychain
 security unlock-keychain -p "$KC_PW" "$KEYCHAIN"
 
 echo "==> Building release"
-./Scripts/make-app.sh release
+# DIST_IDENTITY keeps the real bundle identifier: a local build otherwise gets a .dev suffix so it
+# cannot share per-app state (recent documents above all) with an installed release.
+DIST_IDENTITY=1 ./Scripts/make-app.sh release
+
+# Verify rather than trust the flag. Here a wrong identifier does not just break state — it will not
+# match the provisioning profile, and the failure would surface late, during upload or review.
+BUILT_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist")"
+if [[ "$BUILT_ID" == *.dev ]]; then
+  echo "REFUSING TO SUBMIT: bundle identifier is $BUILT_ID — DIST_IDENTITY did not take effect." >&2
+  exit 1
+fi
+echo "    submitting identifier: $BUILT_ID"
 
 echo "==> Embedding the provisioning profile"
 cp "$PROFILE" "$APP/Contents/embedded.provisionprofile"
