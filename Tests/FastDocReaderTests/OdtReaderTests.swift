@@ -1086,4 +1086,391 @@ final class OdtReaderTests: XCTestCase {
         XCTAssertFalse(allText.contains("Hidden."))
         XCTAssertTrue(allText.contains("Box text."))
     }
+
+    // MARK: S15 — paragraph-family styles: alignment, tab stops, inheritance
+
+    func testExplicitTextAlignOnParagraphStyleSetsAlignment() throws {
+        let blocks = try read(
+            body: "<text:p text:style-name=\"Centered\">Text</text:p>",
+            automaticStyles: """
+            <style:style style:name="Centered" style:family="paragraph">
+              <style:paragraph-properties fo:text-align="center"/>
+            </style:style>
+            """)
+        guard case .paragraph(_, _, let alignment, _) = blocks[0] else { return XCTFail("expected a paragraph") }
+        XCTAssertEqual(alignment, .center)
+    }
+
+    /// `"start"`/`"end"` are writing-direction-relative (ODF 1.3 §20.339) — must resolve against the
+    /// SAME `style:writing-mode` this style declares, not a hardcoded LTR assumption.
+    func testTextAlignStartAndEndResolveAgainstWritingDirection() throws {
+        let ltr = try read(
+            body: "<text:p text:style-name=\"S\">A</text:p>",
+            automaticStyles: """
+            <style:style style:name="S" style:family="paragraph">
+              <style:paragraph-properties fo:text-align="start" style:writing-mode="lr-tb"/>
+            </style:style>
+            """)
+        guard case .paragraph(_, _, let a1, _) = ltr[0] else { return XCTFail("expected a paragraph") }
+        XCTAssertEqual(a1, .left)
+
+        let rtl = try read(
+            body: "<text:p text:style-name=\"S2\">A</text:p>",
+            automaticStyles: """
+            <style:style style:name="S2" style:family="paragraph">
+              <style:paragraph-properties fo:text-align="start" style:writing-mode="rl-tb"/>
+            </style:style>
+            """)
+        guard case .paragraph(_, let rtl2, let a2, _) = rtl[0] else { return XCTFail("expected a paragraph") }
+        XCTAssertTrue(rtl2)
+        XCTAssertEqual(a2, .right)
+    }
+
+    /// S12 left `alignment` `nil` for an RTL paragraph with no explicit `fo:text-align`, relying on
+    /// `.natural` + `baseWritingDirection` to resolve the edge — a paragraph style that DOES declare
+    /// one must override that default rather than being ignored in its favour.
+    func testExplicitAlignmentWinsOverRTLDefault() throws {
+        let noAlignment = try read(
+            body: "<text:p text:style-name=\"Arabic\">Plain</text:p>",
+            automaticStyles: """
+            <style:style style:name="Arabic" style:family="paragraph">
+              <style:paragraph-properties style:writing-mode="rl-tb"/>
+            </style:style>
+            """)
+        guard case .paragraph(_, let rtl1, let a1, _) = noAlignment[0] else { return XCTFail("expected a paragraph") }
+        XCTAssertTrue(rtl1)
+        XCTAssertNil(a1)
+
+        let explicitLeft = try read(
+            body: "<text:p text:style-name=\"ArabicLeft\">Plain</text:p>",
+            automaticStyles: """
+            <style:style style:name="ArabicLeft" style:family="paragraph">
+              <style:paragraph-properties style:writing-mode="rl-tb" fo:text-align="left"/>
+            </style:style>
+            """)
+        guard case .paragraph(_, let rtl2, let a2, _) = explicitLeft[0] else { return XCTFail("expected a paragraph") }
+        XCTAssertTrue(rtl2)
+        XCTAssertEqual(a2, .left)
+    }
+
+    func testParagraphStyleTabStopsResolveToPoints() throws {
+        let blocks = try read(
+            body: "<text:p text:style-name=\"Tabbed\">A\tB</text:p>",
+            automaticStyles: """
+            <style:style style:name="Tabbed" style:family="paragraph">
+              <style:paragraph-properties>
+                <style:tab-stops>
+                  <style:tab-stop style:position="36pt"/>
+                  <style:tab-stop style:position="1in"/>
+                </style:tab-stops>
+              </style:paragraph-properties>
+            </style:style>
+            """)
+        guard case .paragraph(_, _, _, let tabStops) = blocks[0] else { return XCTFail("expected a paragraph") }
+        XCTAssertEqual(tabStops, [36, 72])
+    }
+
+    func testParagraphStyleInheritsOutlineLevelFromParentStyleName() throws {
+        let blocks = try read(
+            body: "<text:p text:style-name=\"Child\">Heading via inheritance</text:p>",
+            automaticStyles: """
+            <style:style style:name="Parent" style:family="paragraph" style:default-outline-level="2"/>
+            <style:style style:name="Child" style:family="paragraph" style:parent-style-name="Parent"/>
+            """)
+        XCTAssertEqual(blocks, [.heading(level: 2, spans: [Span(text: "Heading via inheritance")])])
+    }
+
+    func testChildsOwnOutlineLevelWinsOverParents() throws {
+        let blocks = try read(
+            body: "<text:p text:style-name=\"Child\">X</text:p>",
+            automaticStyles: """
+            <style:style style:name="Parent" style:family="paragraph" style:default-outline-level="2"/>
+            <style:style style:name="Child" style:family="paragraph" style:parent-style-name="Parent" style:default-outline-level="4"/>
+            """)
+        XCTAssertEqual(blocks, [.heading(level: 4, spans: [Span(text: "X")])])
+    }
+
+    /// Invariant 30's own required case: a malformed document where two paragraph styles name each
+    /// other as parent must NOT hang the resolver — the walk's `visited` set must break the cycle.
+    func testParagraphStyleParentCycleDoesNotHangAndResolvesToUnstyled() throws {
+        let blocks = try read(
+            body: "<text:p text:style-name=\"A\">Cyclic</text:p>",
+            automaticStyles: """
+            <style:style style:name="A" style:family="paragraph" style:parent-style-name="B"/>
+            <style:style style:name="B" style:family="paragraph" style:parent-style-name="A"/>
+            """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Cyclic")])])
+    }
+
+    // MARK: S15 — text-family styles: color, highlight, size, font family, inheritance
+
+    func testTextRunColorBackgroundSizeAndFontFamilyAreRead() throws {
+        let blocks = try read(
+            body: "<text:p><text:span text:style-name=\"Styled\">Text</text:span></text:p>",
+            automaticStyles: """
+            <style:style style:name="Styled" style:family="text">
+              <style:text-properties fo:color="#FF0000" fo:background-color="#FFFF00" fo:font-size="14pt" fo:font-family="Georgia"/>
+            </style:style>
+            """)
+        guard case .paragraph(let spans, _, _, _) = blocks[0] else { return XCTFail("expected a paragraph") }
+        XCTAssertEqual(spans[0].fontSize, 14)
+        XCTAssertEqual(spans[0].fontName, "Georgia")
+        XCTAssertNotNil(spans[0].textColor)
+        XCTAssertNotNil(spans[0].highlightColor)
+    }
+
+    /// `style:font-name` is a REFERENCE into `office:font-face-decls`, not a literal family name —
+    /// `"Arial1"` here must resolve to the declared `svg:font-family`, `"Arial"`.
+    func testFontNameResolvesThroughFontFaceDeclarations() throws {
+        let blocks = try read(
+            body: "<text:p><text:span text:style-name=\"Styled\">Text</text:span></text:p>",
+            automaticStyles: """
+            <office:font-face-decls>
+              <style:font-face style:name="Arial1" svg:font-family="Arial"/>
+            </office:font-face-decls>
+            <style:style style:name="Styled" style:family="text">
+              <style:text-properties style:font-name="Arial1"/>
+            </style:style>
+            """)
+        guard case .paragraph(let spans, _, _, _) = blocks[0] else { return XCTFail("expected a paragraph") }
+        XCTAssertEqual(spans[0].fontName, "Arial")
+    }
+
+    /// `fo:background-color="transparent"` means "no highlight", not black — must resolve to `nil`,
+    /// same as the attribute being absent entirely.
+    func testTransparentBackgroundColorMeansNoHighlight() throws {
+        let blocks = try read(
+            body: "<text:p><text:span text:style-name=\"S\">Text</text:span></text:p>",
+            automaticStyles: """
+            <style:style style:name="S" style:family="text">
+              <style:text-properties fo:background-color="transparent"/>
+            </style:style>
+            """)
+        guard case .paragraph(let spans, _, _, _) = blocks[0] else { return XCTFail("expected a paragraph") }
+        XCTAssertNil(spans[0].highlightColor)
+    }
+
+    /// `fo:font-size="150%"` is a legal ODF value this reader does NOT resolve (see
+    /// `parseTextStyleDecls`'s own doc comment) — must read as unspecified, not as a wrong literal
+    /// number.
+    func testPercentageFontSizeIsSkippedRatherThanMisread() throws {
+        let blocks = try read(
+            body: "<text:p><text:span text:style-name=\"S\">Text</text:span></text:p>",
+            automaticStyles: """
+            <style:style style:name="S" style:family="text">
+              <style:text-properties fo:font-size="150%"/>
+            </style:style>
+            """)
+        guard case .paragraph(let spans, _, _, _) = blocks[0] else { return XCTFail("expected a paragraph") }
+        XCTAssertNil(spans[0].fontSize)
+    }
+
+    func testTextStyleInheritsBoldFromParentAndOverridesItalic() throws {
+        let blocks = try read(
+            body: "<text:p><text:span text:style-name=\"Child\">X</text:span></text:p>",
+            automaticStyles: """
+            <style:style style:name="Parent" style:family="text"><style:text-properties fo:font-weight="bold"/></style:style>
+            <style:style style:name="Child" style:family="text" style:parent-style-name="Parent"><style:text-properties fo:font-style="italic"/></style:style>
+            """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "X", bold: true, italic: true)])])
+    }
+
+    /// Invariant 30's own required case for the TEXT-family walk: a cycle must not hang, and the
+    /// non-cyclic field a style DOES declare (`A`'s own bold) must still survive the aborted walk.
+    func testTextStyleParentCycleDoesNotHang() throws {
+        let blocks = try read(
+            body: "<text:p><text:span text:style-name=\"A\">X</text:span></text:p>",
+            automaticStyles: """
+            <style:style style:name="A" style:family="text" style:parent-style-name="B"><style:text-properties fo:font-weight="bold"/></style:style>
+            <style:style style:name="B" style:family="text" style:parent-style-name="A"/>
+            """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "X", bold: true)])])
+    }
+
+    // MARK: S15 — table-cell styles: background, border
+
+    func testTableCellBackgroundAndBorderApplyFromCellStyle() throws {
+        let blocks = try read(
+            body: """
+            <table:table>
+              <table:table-row>
+                <table:table-cell table:style-name="Shaded"><text:p>A1</text:p></table:table-cell>
+              </table:table-row>
+            </table:table>
+            """,
+            automaticStyles: """
+            <style:style style:name="Shaded" style:family="table-cell">
+              <style:table-cell-properties fo:background-color="#EEEEEE" fo:border="1pt solid #000000"/>
+            </style:style>
+            """)
+        guard case .table(let rows, _) = blocks[0], let cell = rows.first?.first else { return XCTFail("expected a table cell") }
+        XCTAssertNotNil(cell.backgroundColor)
+        XCTAssertEqual(cell.borderWidth, 1)
+        XCTAssertNotNil(cell.borderColor)
+    }
+
+    /// Only the FIRST side found wins (`Cell`'s own one-uniform-border scope) — `fo:border-top` alone,
+    /// with no `fo:border` shorthand, must still contribute something rather than nothing.
+    func testAsymmetricBorderTopAloneStillContributesAWidthAndColor() throws {
+        let blocks = try read(
+            body: """
+            <table:table><table:table-row>
+              <table:table-cell table:style-name="TopOnly"><text:p>A</text:p></table:table-cell>
+            </table:table-row></table:table>
+            """,
+            automaticStyles: """
+            <style:style style:name="TopOnly" style:family="table-cell">
+              <style:table-cell-properties fo:border-top="2pt solid #123456"/>
+            </style:style>
+            """)
+        guard case .table(let rows, _) = blocks[0], let cell = rows.first?.first else { return XCTFail("expected a table cell") }
+        XCTAssertEqual(cell.borderWidth, 2)
+        XCTAssertNotNil(cell.borderColor)
+    }
+
+    func testTableCellStyleInheritsBackgroundFromParent() throws {
+        let blocks = try read(
+            body: """
+            <table:table><table:table-row>
+              <table:table-cell table:style-name="Child"><text:p>A</text:p></table:table-cell>
+            </table:table-row></table:table>
+            """,
+            automaticStyles: """
+            <style:style style:name="Parent" style:family="table-cell"><style:table-cell-properties fo:background-color="#00FF00"/></style:style>
+            <style:style style:name="Child" style:family="table-cell" style:parent-style-name="Parent"/>
+            """)
+        guard case .table(let rows, _) = blocks[0], let cell = rows.first?.first else { return XCTFail("expected a table cell") }
+        XCTAssertNotNil(cell.backgroundColor)
+    }
+
+    /// Invariant 30's own required case for the TABLE-CELL-family walk.
+    func testTableCellStyleParentCycleDoesNotHang() throws {
+        let blocks = try read(
+            body: """
+            <table:table><table:table-row>
+              <table:table-cell table:style-name="A"><text:p>A</text:p></table:table-cell>
+            </table:table-row></table:table>
+            """,
+            automaticStyles: """
+            <style:style style:name="A" style:family="table-cell" style:parent-style-name="B"><style:table-cell-properties fo:background-color="#00FF00"/></style:style>
+            <style:style style:name="B" style:family="table-cell" style:parent-style-name="A"/>
+            """)
+        guard case .table(let rows, _) = blocks[0], let cell = rows.first?.first else { return XCTFail("expected a table cell") }
+        XCTAssertNotNil(cell.backgroundColor)
+    }
+
+    // MARK: S15 — table-column widths (table:table-column, previously referenced nowhere)
+
+    func testColumnWidthAppliesFromTableColumnElement() throws {
+        let blocks = try read(
+            body: """
+            <table:table>
+              <table:table-column table:style-name="Col1"/>
+              <table:table-column table:style-name="Col2"/>
+              <table:table-row>
+                <table:table-cell><text:p>A</text:p></table:table-cell>
+                <table:table-cell><text:p>B</text:p></table:table-cell>
+              </table:table-row>
+            </table:table>
+            """,
+            automaticStyles: """
+            <style:style style:name="Col1" style:family="table-column"><style:table-column-properties style:column-width="1in"/></style:style>
+            <style:style style:name="Col2" style:family="table-column"><style:table-column-properties style:column-width="2in"/></style:style>
+            """)
+        guard case .table(let rows, _) = blocks[0] else { return XCTFail("expected a table") }
+        XCTAssertEqual(rows[0][0].width, 72)
+        XCTAssertEqual(rows[0][1].width, 144)
+    }
+
+    /// The running column-position counter must advance past a COLUMN SPAN (not just one column per
+    /// cell element), or every width after a merge would land on the wrong column.
+    func testColumnWidthAlignsCorrectlyAcrossAColumnSpan() throws {
+        let blocks = try read(
+            body: """
+            <table:table>
+              <table:table-column table:style-name="Col1"/>
+              <table:table-column table:style-name="Col2"/>
+              <table:table-column table:style-name="Col3"/>
+              <table:table-row>
+                <table:table-cell table:number-columns-spanned="2"><text:p>Wide</text:p></table:table-cell>
+                <table:covered-table-cell/>
+                <table:table-cell><text:p>Next</text:p></table:table-cell>
+              </table:table-row>
+            </table:table>
+            """,
+            automaticStyles: """
+            <style:style style:name="Col1" style:family="table-column"><style:table-column-properties style:column-width="1in"/></style:style>
+            <style:style style:name="Col2" style:family="table-column"><style:table-column-properties style:column-width="1in"/></style:style>
+            <style:style style:name="Col3" style:family="table-column"><style:table-column-properties style:column-width="3in"/></style:style>
+            """)
+        guard case .table(let rows, _) = blocks[0] else { return XCTFail("expected a table") }
+        XCTAssertEqual(rows[0][0].width, 72)
+        XCTAssertEqual(rows[0][1].width, 216)
+    }
+
+    func testUnstyledTableColumnLeavesWidthNilForAutoLayout() throws {
+        let blocks = try read(body: """
+        <table:table><table:table-row><table:table-cell><text:p>A</text:p></table:table-cell></table:table-row></table:table>
+        """)
+        guard case .table(let rows, _) = blocks[0] else { return XCTFail("expected a table") }
+        XCTAssertNil(rows[0][0].width)
+    }
+
+    // MARK: S15 — document default body font size (style:default-style, family paragraph)
+
+    func testDocumentDefaultBodyFontSizeReadsFromDefaultStyle() throws {
+        let zip = buildOdt(content: doc(body: "<text:p>X</text:p>"), styles: """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <office:document-styles>
+          <office:styles>
+            <style:default-style style:family="paragraph">
+              <style:text-properties fo:font-size="13pt"/>
+            </style:default-style>
+          </office:styles>
+        </office:document-styles>
+        """)
+        let archive = try ZipArchive(data: zip)
+        XCTAssertEqual(OdtReader.documentDefaultBodyFontSize(archive), 13)
+    }
+
+    func testDocumentDefaultBodyFontSizeFallsBackTo11WhenAbsent() throws {
+        let zip = buildOdt(content: doc(body: "<text:p>X</text:p>"))
+        let archive = try ZipArchive(data: zip)
+        XCTAssertEqual(OdtReader.documentDefaultBodyFontSize(archive), 11)
+    }
+
+    func testDocumentDefaultBodyFontSizeReturns11ForAnArchiveWithNoContentXML() throws {
+        let archive = try ZipArchive(data: buildZip([("styles.xml", Data("<x/>".utf8))]))
+        XCTAssertEqual(OdtReader.documentDefaultBodyFontSize(archive), 11)
+    }
+
+    // MARK: S15 — a real read path exercising this sprint's own features (invariant 29)
+
+    func testS15FeaturesSurviveThroughDocumentTypesReadOfficeNotJustOdtReaderDirectly() throws {
+        let zip = buildOdt(content: doc(
+            body: """
+            <table:table>
+              <table:table-column table:style-name="Col1"/>
+              <table:table-row>
+                <table:table-cell table:style-name="Shaded"><text:p text:style-name="Centered">Cell text</text:p></table:table-cell>
+              </table:table-row>
+            </table:table>
+            """,
+            automaticStyles: """
+            <style:style style:name="Col1" style:family="table-column"><style:table-column-properties style:column-width="1in"/></style:style>
+            <style:style style:name="Shaded" style:family="table-cell"><style:table-cell-properties fo:background-color="#EEEEEE"/></style:style>
+            <style:style style:name="Centered" style:family="paragraph"><style:paragraph-properties fo:text-align="center"/></style:style>
+            """))
+        let archive = try ZipArchive(data: zip)
+        let blocks = try DocumentTypes.readOffice(archive, extension: "odt")
+        guard case .table(let rows, _) = blocks.first, let cell = rows.first?.first else {
+            return XCTFail("expected a table with a cell")
+        }
+        XCTAssertEqual(cell.width, 72)
+        XCTAssertNotNil(cell.backgroundColor)
+        guard case .paragraph(_, _, let alignment, _) = cell.blocks.first else {
+            return XCTFail("expected a paragraph in the cell")
+        }
+        XCTAssertEqual(alignment, .center)
+    }
 }

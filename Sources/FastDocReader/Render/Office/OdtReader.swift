@@ -1,5 +1,6 @@
 import Foundation
 import CoreGraphics
+import AppKit
 
 /// `.odt` bytes → `[OfficeBlock]`. An ODT is a ZIP holding `content.xml` (the body, required) and
 /// optionally `styles.xml` — this reader consults BOTH for `text:list-style` (bullet vs number per
@@ -45,15 +46,37 @@ enum OdtReader {
             styleRoots.append(stylesRoot)
         }
         var listStyles: [String: [Int: Bool]] = [:]
-        var textStyles: [String: TextStyle] = [:]
-        var paragraphOutlineLevels: [String: Int] = [:]
-        var paragraphDirections: [String: Bool] = [:]
+        var fontFaces: [String: String] = [:]
+        var textStyleDecls: [String: TextStyleDecl] = [:]
+        var paragraphStyleDecls: [String: ParagraphStyleDecl] = [:]
+        var tableCellStyleDecls: [String: TableCellStyleDecl] = [:]
+        var tableColumnStyleDecls: [String: TableColumnStyleDecl] = [:]
         for root in styleRoots.reversed() {
             listStyles.merge(parseListStyles(from: root)) { existing, _ in existing }
-            textStyles.merge(parseTextStyles(from: root)) { existing, _ in existing }
-            paragraphOutlineLevels.merge(parseParagraphOutlineLevels(from: root)) { existing, _ in existing }
-            paragraphDirections.merge(parseParagraphWritingModes(from: root)) { existing, _ in existing }
+            fontFaces.merge(parseFontFaceDecls(from: root)) { existing, _ in existing }
+            textStyleDecls.merge(parseTextStyleDecls(from: root, fontFaces: fontFaces)) { existing, _ in existing }
+            paragraphStyleDecls.merge(parseParagraphStyleDecls(from: root)) { existing, _ in existing }
+            tableCellStyleDecls.merge(parseTableCellStyleDecls(from: root)) { existing, _ in existing }
+            tableColumnStyleDecls.merge(parseTableColumnStyleDecls(from: root)) { existing, _ in existing }
         }
+        // Resolve every style NAME once, up front, into its final (inheritance-flattened) value —
+        // every call site below keeps reading a plain `[String: TextStyle]`/`[String:
+        // ResolvedParagraphStyle]`/`[String: TableCellStyle]` exactly as before this sprint, so
+        // `style:parent-style-name` chains (see `resolveTextStyle`/`resolveParagraphStyle`/
+        // `resolveTableCellStyle`, each cycle-guarded) are invisible to every consumer past this
+        // point — resolving once here, rather than at every lookup, is also what keeps a malformed
+        // document's cycle guard from doing repeated work for the same name.
+        let textStyles: [String: TextStyle] = Dictionary(
+            uniqueKeysWithValues: textStyleDecls.keys.map { ($0, resolveTextStyle($0, decls: textStyleDecls)) })
+        let paragraphStyles: [String: ResolvedParagraphStyle] = Dictionary(
+            uniqueKeysWithValues: paragraphStyleDecls.keys.map { ($0, resolveParagraphStyle($0, decls: paragraphStyleDecls)) })
+        let tableCellStyles: [String: TableCellStyle] = Dictionary(
+            uniqueKeysWithValues: tableCellStyleDecls.keys.map { ($0, resolveTableCellStyle($0, decls: tableCellStyleDecls)) })
+        let tableColumnStyles: [String: TableColumnStyle] = Dictionary(
+            uniqueKeysWithValues: tableColumnStyleDecls.keys.map { ($0, resolveTableColumnStyle($0, decls: tableColumnStyleDecls)) })
+        let styles = ParsedStyles(
+            listStyles: listStyles, textStyles: textStyles, paragraphStyles: paragraphStyles,
+            tableCellStyles: tableCellStyles, tableColumnStyles: tableColumnStyles)
         guard let body = contentRoot.firstDescendant("office:text") else { return [] }
         // ODF footnotes AND endnotes are the SAME element (`text:note`, told apart only by
         // `text:note-class`), sitting INLINE at the citation point with the note's own marker
@@ -66,13 +89,39 @@ enum OdtReader {
         // sentence. Once the body walk finishes, the collector holds every note in citation order,
         // ready to be rendered — once, here, at the document's end.
         let notes = NoteCollector()
-        let bodyBlocks = parseBody(
-            body, listStyles: listStyles, textStyles: textStyles, paragraphOutlineLevels: paragraphOutlineLevels,
-            paragraphDirections: paragraphDirections, archive: archive, notes: notes)
-        let noteBlocks = buildNoteBlocks(
-            notes.entries, listStyles: listStyles, textStyles: textStyles, paragraphOutlineLevels: paragraphOutlineLevels,
-            paragraphDirections: paragraphDirections, archive: archive)
+        let bodyBlocks = parseBody(body, styles: styles, archive: archive, notes: notes)
+        let noteBlocks = buildNoteBlocks(notes.entries, styles: styles, archive: archive)
         return bodyBlocks + noteBlocks
+    }
+
+    /// The document's own default BODY paragraph size, in points — ODF states this in
+    /// `style:default-style` (the family-wide fallback every paragraph without its own explicit
+    /// size ultimately falls back to, family `"paragraph"`)'s `style:text-properties/fo:font-size`.
+    /// A SEPARATE entry point from `read()` rather than a second return value: `read()`'s signature
+    /// (`[OfficeBlock]`) is a call-site contract this sprint does not own (`DocumentTypes.readOffice`/
+    /// `MarkdownDocument` — see this sprint's own report for why wiring the result into
+    /// `OfficeTextBuilder.build`'s `documentDefaultFontSize` parameter is left for whoever DOES own
+    /// those call sites). `11` — the same default `OfficeTextBuilder.build` itself falls back to — is
+    /// returned when the document declares no `style:default-style` at all, or one with no font size,
+    /// so a caller that doesn't wire this through yet loses nothing (11 is what it already assumes).
+    static func documentDefaultBodyFontSize(_ archive: ZipArchive) -> CGFloat {
+        guard archive.contains("content.xml"),
+              let contentData = try? archive.data(for: "content.xml"),
+              let contentRoot = try? buildTree(contentData)
+        else { return 11 }
+        var roots = [contentRoot]
+        if archive.contains("styles.xml"), let data = try? archive.data(for: "styles.xml"),
+           let stylesRoot = try? buildTree(data) {
+            roots.append(stylesRoot)
+        }
+        // `styles.xml` is where Writer actually puts `style:default-style` in real documents — search
+        // it FIRST (unlike every other style table in this file, which lets content.xml win on a
+        // name collision: `style:default-style` isn't a named style two parts could disagree about,
+        // there is only ever one, so "first part that declares one" is the only meaningful order).
+        for root in roots.reversed() {
+            if let size = parseDefaultParagraphFontSize(from: root) { return size }
+        }
+        return 11
     }
 
     // MARK: Footnotes / endnotes — text:note (told apart by text:note-class, but rendered identically)
@@ -107,18 +156,14 @@ enum OdtReader {
     /// docx-side logic (kept format-specific rather than shared, per the roadmap's own call: the
     /// EXTRACTION differs per format, only the output shape is one-to-one).
     private static func buildNoteBlocks(
-        _ noteEntries: [(marker: String, body: XMLNode)], listStyles: [String: [Int: Bool]],
-        textStyles: [String: TextStyle], paragraphOutlineLevels: [String: Int], paragraphDirections: [String: Bool],
-        archive: ZipArchive
+        _ noteEntries: [(marker: String, body: XMLNode)], styles: ParsedStyles, archive: ZipArchive
     ) -> [OfficeBlock] {
         noteEntries.flatMap { entry -> [OfficeBlock] in
             // A footnote/endnote body cannot itself contain another `text:note` in any real
             // document (ODF disallows it), so a note-body-local `NoteCollector` here only ever
             // guards against a malformed file recursing forever — it is discarded, never merged
             // back into the outer one.
-            var blocks = parseBody(
-                entry.body, listStyles: listStyles, textStyles: textStyles, paragraphOutlineLevels: paragraphOutlineLevels,
-                paragraphDirections: paragraphDirections, archive: archive, notes: NoteCollector())
+            var blocks = parseBody(entry.body, styles: styles, archive: archive, notes: NoteCollector())
             let marker = Span(text: entry.marker, superscript: true)
             if let first = blocks.first, let markedFirst = prependingMarker(marker, to: first) {
                 blocks[0] = markedFirst
@@ -160,7 +205,23 @@ enum OdtReader {
         }
     }
 
-    // MARK: Text (span) styles — automatic-styles → bold/italic/underline
+    // MARK: Every style family this reader resolves, bundled for one-parameter threading
+
+    /// Everything `parseBody`/`parseList`/`collectCellBlocks` need from `content.xml` +
+    /// `styles.xml`'s style tables, already merged AND inheritance-resolved (see `read()`) — bundled
+    /// into one value so adding this sprint's two NEW families (table-cell, table-column) didn't mean
+    /// growing every recursive helper's parameter list by two more names apiece. `listStyles`/
+    /// `textStyles`/`paragraphStyles` existed before this sprint as separate parameters; nothing about
+    /// their OWN shape changed, only that they now travel together.
+    private struct ParsedStyles {
+        var listStyles: [String: [Int: Bool]]
+        var textStyles: [String: TextStyle]
+        var paragraphStyles: [String: ResolvedParagraphStyle]
+        var tableCellStyles: [String: TableCellStyle]
+        var tableColumnStyles: [String: TableColumnStyle]
+    }
+
+    // MARK: Text (span) styles — automatic-styles → bold/italic/underline/color/highlight/size/family
 
     private struct TextStyle: Equatable {
         var bold = false
@@ -169,6 +230,34 @@ enum OdtReader {
         var strikethrough = false
         var superscript = false
         var subscripted = false
+        /// `Span.textColor`/`Span.highlightColor`/`Span.fontSize`/`Span.fontName` — see those fields'
+        /// own doc comments in `OfficeBlock.swift` for exactly how `OfficeTextBuilder` treats each
+        /// once it reaches a `Span`. `nil` means the style (after inheritance) never said — never a
+        /// literal black/zero/system-default value, same "absent stays unspecified" rule every other
+        /// property in this file already follows.
+        var textColor: NSColor? = nil
+        var highlightColor: NSColor? = nil
+        var fontSize: CGFloat? = nil
+        var fontName: String? = nil
+    }
+
+    /// The RAW, per-style, NOT-YET-INHERITED declaration a single `style:style` element (family
+    /// `"text"`) makes — every field is an `Optional` (unlike `TextStyle`'s own `Bool`s, which default
+    /// `false`) precisely so `resolveTextStyle` can tell "this style says OFF" apart from "this style
+    /// says nothing, ask the parent" while walking `parent` — see `resolveTextStyle`'s doc comment.
+    private struct TextStyleDecl {
+        var bold: Bool? = nil
+        var italic: Bool? = nil
+        var underline: Bool? = nil
+        var strikethrough: Bool? = nil
+        var superscript: Bool? = nil
+        var subscripted: Bool? = nil
+        var textColor: NSColor? = nil
+        var highlightColor: NSColor? = nil
+        var fontSize: CGFloat? = nil
+        var fontName: String? = nil
+        /// `style:parent-style-name` — the style this one is based on, resolved by `resolveTextStyle`.
+        var parent: String? = nil
     }
 
     /// Only `style:family="text"` styles are read — ODF reuses `style:style` for paragraph, table,
@@ -176,27 +265,91 @@ enum OdtReader {
     /// the wrong family would collide names (a paragraph style and a text style can share a name).
     /// A style with no `style:text-properties` at all, or one that declares none of the
     /// properties this reader understands, is simply absent from the map — `collectSpans` reads
-    /// that as "no formatting", never a crash.
-    private static func parseTextStyles(from root: XMLNode) -> [String: TextStyle] {
-        var map: [String: TextStyle] = [:]
+    /// that as "no formatting", never a crash. `fontFaces` (already merged from both parts by the
+    /// time this runs — see `read()`) resolves `style:font-name`'s indirection through
+    /// `office:font-face-decls`; `fo:font-family` (rarer, but legal directly on `style:text-
+    /// properties`) is read as a literal name with no such indirection.
+    private static func parseTextStyleDecls(from root: XMLNode, fontFaces: [String: String]) -> [String: TextStyleDecl] {
+        var map: [String: TextStyleDecl] = [:]
         for styleNode in root.allDescendants("style:style") where styleNode.attributes["style:family"] == "text" {
-            guard let name = styleNode.attributes["style:name"], let props = styleNode.child("style:text-properties")
-            else { continue }
-            var style = TextStyle()
-            style.bold = props.attributes["fo:font-weight"] == "bold"
-            style.italic = props.attributes["fo:font-style"] == "italic"
-            if let underline = props.attributes["style:text-underline-style"] { style.underline = underline != "none" }
-            if let strike = props.attributes["style:text-line-through-style"] { style.strikethrough = strike != "none" }
-            // `style:text-position` is `"<super|sub> <percentage>"` (e.g. `"super 58%"`) — only the
-            // leading keyword decides which axis; the percentage is a font-scale hint this viewer
-            // doesn't reproduce (same "skip presentation fidelity" call as everywhere else).
-            if let position = props.attributes["style:text-position"] {
-                style.superscript = position.hasPrefix("super")
-                style.subscripted = position.hasPrefix("sub")
+            guard let name = styleNode.attributes["style:name"] else { continue }
+            var decl = TextStyleDecl()
+            decl.parent = styleNode.attributes["style:parent-style-name"]
+            if let props = styleNode.child("style:text-properties") {
+                if let weight = props.attributes["fo:font-weight"] { decl.bold = weight == "bold" }
+                if let style = props.attributes["fo:font-style"] { decl.italic = style == "italic" }
+                if let underline = props.attributes["style:text-underline-style"] { decl.underline = underline != "none" }
+                if let strike = props.attributes["style:text-line-through-style"] { decl.strikethrough = strike != "none" }
+                // `style:text-position` is `"<super|sub> <percentage>"` (e.g. `"super 58%"`) — only
+                // the leading keyword decides which axis; the percentage is a font-scale hint this
+                // viewer doesn't reproduce (same "skip presentation fidelity" call as everywhere else).
+                if let position = props.attributes["style:text-position"] {
+                    decl.superscript = position.hasPrefix("super")
+                    decl.subscripted = position.hasPrefix("sub")
+                }
+                if let color = props.attributes["fo:color"] { decl.textColor = parseODFColor(color) }
+                if let bg = props.attributes["fo:background-color"] { decl.highlightColor = parseODFColor(bg) }
+                // `fo:font-size` is almost always an absolute length ("12pt") in a real document —
+                // `parseLength` handles that. A PERCENTAGE ("150%", relative to the parent style's own
+                // size) is a real, legal ODF value this reader does NOT resolve: `parseLength` has no
+                // "%" suffix in its table and `Double("150%")` itself fails to parse, so it naturally
+                // returns `nil` — read as "no size specified" rather than a wrong literal number. That
+                // is a deliberate skip, not an oversight (see this sprint's own report).
+                if let size = props.attributes["fo:font-size"] { decl.fontSize = parseLength(size) }
+                if let fontName = props.attributes["style:font-name"] {
+                    decl.fontName = fontFaces[fontName] ?? fontName
+                } else if let family = props.attributes["fo:font-family"] {
+                    decl.fontName = family
+                }
             }
-            map[name] = style
+            map[name] = decl
         }
         return map
+    }
+
+    /// `office:font-face-decls > style:font-face` — the indirection `style:font-name` points through:
+    /// a `style:text-properties/@style:font-name` is a REFERENCE (`style:font-face/@style:name`), not
+    /// the literal family name itself, which lives on that SAME element's `svg:font-family`. Searched
+    /// the same "anywhere below root" way every other style table in this file is, since a font-face
+    /// declaration can live in either part exactly like a style can.
+    private static func parseFontFaceDecls(from root: XMLNode) -> [String: String] {
+        var map: [String: String] = [:]
+        for face in root.allDescendants("style:font-face") {
+            guard let name = face.attributes["style:name"], let family = face.attributes["svg:font-family"] else { continue }
+            map[name] = family
+        }
+        return map
+    }
+
+    /// Resolves one text style's `style:parent-style-name` chain into a final `TextStyle` — the
+    /// NEAREST declaration of each field wins (the style itself, else its parent, else its
+    /// grandparent, …), exactly the way `DocxReader.resolvedOutlineLevel` walks `w:basedOn`. A name
+    /// already visited during THIS walk means a cycle in a malformed document (`A` based on `B` based
+    /// on `A`) — the walk stops there rather than looping forever, same guard, same reasoning. A field
+    /// never declared anywhere in the chain keeps `TextStyle`'s own default (`false`/`nil`).
+    private static func resolveTextStyle(_ styleName: String, decls: [String: TextStyleDecl]) -> TextStyle {
+        var result = TextStyle()
+        var have = (bold: false, italic: false, underline: false, strike: false, sup: false, sub: false,
+                    color: false, highlight: false, size: false, font: false)
+        var currentName: String? = styleName
+        var visited = Set<String>()
+        while let name = currentName {
+            guard !visited.contains(name) else { break }
+            visited.insert(name)
+            guard let decl = decls[name] else { break }
+            if !have.bold, let v = decl.bold { result.bold = v; have.bold = true }
+            if !have.italic, let v = decl.italic { result.italic = v; have.italic = true }
+            if !have.underline, let v = decl.underline { result.underline = v; have.underline = true }
+            if !have.strike, let v = decl.strikethrough { result.strikethrough = v; have.strike = true }
+            if !have.sup, let v = decl.superscript { result.superscript = v; have.sup = true }
+            if !have.sub, let v = decl.subscripted { result.subscripted = v; have.sub = true }
+            if !have.color, let v = decl.textColor { result.textColor = v; have.color = true }
+            if !have.highlight, let v = decl.highlightColor { result.highlightColor = v; have.highlight = true }
+            if !have.size, let v = decl.fontSize { result.fontSize = v; have.size = true }
+            if !have.font, let v = decl.fontName { result.fontName = v; have.font = true }
+            currentName = decl.parent
+        }
+        return result
     }
 
     // MARK: List styles — style name → (0-based level → ordered?)
@@ -240,42 +393,228 @@ enum OdtReader {
     /// scope. `OfficeTextBuilder`'s own counter-based fallback (unchanged) is what ODF lists still
     /// render through, exactly as before this sprint.
 
-    // MARK: Paragraph styles — style name → default-outline-level
+    // MARK: Paragraph styles — outline level, writing direction, alignment, tab stops
+
+    private struct ResolvedParagraphStyle {
+        var outlineLevel: Int? = nil
+        var rtl = false
+        var alignment: NSTextAlignment? = nil
+        var tabStops: [CGFloat] = []
+    }
+
+    /// The RAW, not-yet-inherited declaration of one `style:style` element, family `"paragraph"`.
+    /// `alignmentRaw` stays the FILE's literal `fo:text-align` string (`"start"`/`"end"`/`"left"`/…)
+    /// through resolution — `start`/`end` can only become a real `NSTextAlignment` once the CHAIN's
+    /// resolved `rtl` is known (see `resolveParagraphStyle`), so converting eagerly per-declaration
+    /// would risk resolving against the wrong (this style's OWN, not yet inherited) writing mode.
+    private struct ParagraphStyleDecl {
+        var outlineLevel: Int? = nil
+        var rtl: Bool? = nil
+        var alignmentRaw: String? = nil
+        var tabStops: [CGFloat] = []
+        var parent: String? = nil
+    }
 
     /// A `text:p` isn't the only way ODF marks a heading — Writer also lets a PARAGRAPH STYLE itself
     /// declare `style:default-outline-level` (an attribute directly on `style:style`, family
     /// `"paragraph"`), so a paragraph styled that way is a heading even though its element name is
     /// the plain `text:p` an ordinary paragraph uses. Only `style:family="paragraph"` styles are
-    /// read, mirroring `parseTextStyles`'s own family filter — `style:style` is reused across
+    /// read, mirroring `parseTextStyleDecls`'s own family filter — `style:style` is reused across
     /// several families, and a text/graphic style can share a name with a paragraph style.
-    private static func parseParagraphOutlineLevels(from root: XMLNode) -> [String: Int] {
-        var map: [String: Int] = [:]
+    ///
+    /// `style:writing-mode` (docx's `w:bidi` equivalent) — only the literal value `"rl-tb"`
+    /// (right-to-left, top-to-bottom, the value Writer's own toggle produces) reads as RTL; every
+    /// other value (`lr-tb`, `tb-rl`, `page`, …) reads as an EXPLICIT "not RTL" (`false`, not
+    /// unspecified — see `resolveParagraphStyle`'s `have.rtl` guard, which is why this is `Bool?` and
+    /// not folded into "absent = false").
+    ///
+    /// `fo:text-align`/`style:tab-stops` are this sprint's own additions — read straight off
+    /// `style:paragraph-properties`, the same element `style:writing-mode` already lives on.
+    private static func parseParagraphStyleDecls(from root: XMLNode) -> [String: ParagraphStyleDecl] {
+        var map: [String: ParagraphStyleDecl] = [:]
         for styleNode in root.allDescendants("style:style") where styleNode.attributes["style:family"] == "paragraph" {
-            guard let name = styleNode.attributes["style:name"],
-                  let levelString = styleNode.attributes["style:default-outline-level"],
-                  let level = Int(levelString)
-            else { continue }
-            map[name] = level
+            guard let name = styleNode.attributes["style:name"] else { continue }
+            var decl = ParagraphStyleDecl()
+            decl.parent = styleNode.attributes["style:parent-style-name"]
+            if let levelString = styleNode.attributes["style:default-outline-level"], let level = Int(levelString) {
+                decl.outlineLevel = level
+            }
+            if let props = styleNode.child("style:paragraph-properties") {
+                if let mode = props.attributes["style:writing-mode"] { decl.rtl = mode == "rl-tb" }
+                decl.alignmentRaw = props.attributes["fo:text-align"]
+                if let tabStopsNode = props.child("style:tab-stops") {
+                    decl.tabStops = tabStopsNode.children
+                        .filter { $0.name == "style:tab-stop" }
+                        .compactMap { $0.attributes["style:position"].flatMap(parseLength) }
+                }
+            }
+            map[name] = decl
         }
         return map
     }
 
-    /// A paragraph style's `style:paragraph-properties/@style:writing-mode` — the ODF equivalent of
-    /// docx's `w:pPr/w:bidi` — mapped the same "only what's found, only from a paragraph-family
-    /// style" way `parseParagraphOutlineLevels` reads `style:default-outline-level`. Only the
-    /// literal value `"rl-tb"` (right-to-left, top-to-bottom — the value Writer's own "right-to-left"
-    /// toggle produces) is treated as RTL; every other value (`lr-tb`, `tb-rl`, `page`, …) and an
-    /// absent attribute both mean "not explicitly marked" — this reader reads the file's own say-so,
-    /// never guesses from content the way TextKit's UNMARKED fallback already does on its own.
-    private static func parseParagraphWritingModes(from root: XMLNode) -> [String: Bool] {
-        var map: [String: Bool] = [:]
-        for styleNode in root.allDescendants("style:style") where styleNode.attributes["style:family"] == "paragraph" {
-            guard let name = styleNode.attributes["style:name"],
-                  let mode = styleNode.child("style:paragraph-properties")?.attributes["style:writing-mode"]
-            else { continue }
-            map[name] = mode == "rl-tb"
+    /// Resolves one paragraph style's `style:parent-style-name` chain — same nearest-declaration-wins,
+    /// cycle-guarded walk `resolveTextStyle` uses, just over this family's own four fields. `rtl` is
+    /// resolved BEFORE `alignmentRaw` is turned into a real `NSTextAlignment`, because a `"start"`/
+    /// `"end"` value can only be read against a writing direction once one is known — `resolveAlignment`
+    /// (see below) is what does that conversion, called once here after the walk finishes rather than
+    /// per-level during it, so it always sees the CHAIN's final resolved `rtl`, not one ancestor's own.
+    private static func resolveParagraphStyle(_ styleName: String, decls: [String: ParagraphStyleDecl]) -> ResolvedParagraphStyle {
+        var result = ResolvedParagraphStyle()
+        var alignmentRaw: String? = nil
+        var have = (outline: false, rtl: false, align: false, tabs: false)
+        var currentName: String? = styleName
+        var visited = Set<String>()
+        while let name = currentName {
+            guard !visited.contains(name) else { break }
+            visited.insert(name)
+            guard let decl = decls[name] else { break }
+            if !have.outline, let v = decl.outlineLevel { result.outlineLevel = v; have.outline = true }
+            if !have.rtl, let v = decl.rtl { result.rtl = v; have.rtl = true }
+            if !have.align, let v = decl.alignmentRaw { alignmentRaw = v; have.align = true }
+            if !have.tabs, !decl.tabStops.isEmpty { result.tabStops = decl.tabStops; have.tabs = true }
+            currentName = decl.parent
+        }
+        result.alignment = resolveAlignment(alignmentRaw, rtl: result.rtl)
+        return result
+    }
+
+    /// `fo:text-align`'s `"start"`/`"end"` are WRITING-DIRECTION-RELATIVE (ODF 1.3 §20.339) — which
+    /// edge they mean depends on the paragraph's own base direction, exactly the way CSS's
+    /// `text-align: start` does. Resolving them HERE, into a real `NSTextAlignment`, rather than
+    /// passing `"start"`/`"end"` through unresolved, is what lets the result WIN over `OfficeBlock`'s
+    /// own `rtl`-implies-alignment default (see its doc comment: "an EXPLICIT `alignment` always
+    /// wins") — `OfficeTextBuilder` only ever sees a concrete `NSTextAlignment` or `nil`, never a
+    /// direction-relative keyword it would have to reinterpret itself. `left`/`right`/`center`/
+    /// `justify` are direction-independent and pass through literally; an unrecognised or absent value
+    /// returns `nil` (unspecified — same "absent stays unspecified" rule as everywhere else).
+    private static func resolveAlignment(_ raw: String?, rtl: Bool) -> NSTextAlignment? {
+        switch raw {
+        case "left": return .left
+        case "right": return .right
+        case "center", "centre": return .center
+        case "justify": return .justified
+        case "start": return rtl ? .right : .left
+        case "end": return rtl ? .left : .right
+        default: return nil
+        }
+    }
+
+    // MARK: Table-cell styles — background, border (S15: previously unparsed family)
+
+    private struct TableCellStyle: Equatable {
+        var backgroundColor: NSColor? = nil
+        var borderColor: NSColor? = nil
+        var borderWidth: CGFloat? = nil
+    }
+
+    private struct TableCellStyleDecl {
+        var backgroundColor: NSColor? = nil
+        var borderColor: NSColor? = nil
+        var borderWidth: CGFloat? = nil
+        var parent: String? = nil
+    }
+
+    /// `style:family="table-cell"` — one of the two families `oss-delta-odt.md`'s audit found this
+    /// reader never parsed AT ALL before this sprint (the other is `table-column`, just below). Reads
+    /// straight onto `Cell.backgroundColor`/`borderColor`/`borderWidth` (`OfficeBlock.swift`'s own
+    /// fields, unused by this reader until now) — see `parseODFBorder` for why only ONE side's
+    /// color/width survives even though ODF can state all four independently (`Cell`'s own documented
+    /// scope: one uniform border, not a four-sided model).
+    private static func parseTableCellStyleDecls(from root: XMLNode) -> [String: TableCellStyleDecl] {
+        var map: [String: TableCellStyleDecl] = [:]
+        for styleNode in root.allDescendants("style:style") where styleNode.attributes["style:family"] == "table-cell" {
+            guard let name = styleNode.attributes["style:name"] else { continue }
+            var decl = TableCellStyleDecl()
+            decl.parent = styleNode.attributes["style:parent-style-name"]
+            if let props = styleNode.child("style:table-cell-properties") {
+                if let bg = props.attributes["fo:background-color"] { decl.backgroundColor = parseODFColor(bg) }
+                let border = parseODFBorder(props)
+                decl.borderColor = border.color
+                decl.borderWidth = border.width
+            }
+            map[name] = decl
         }
         return map
+    }
+
+    /// Same nearest-declaration-wins, cycle-guarded walk as `resolveTextStyle`/`resolveParagraphStyle`
+    /// — a table-cell style basing itself on another via `style:parent-style-name` is legal ODF even
+    /// though real documents rarely bother, so the mechanism is implemented for real rather than
+    /// assumed unreachable.
+    private static func resolveTableCellStyle(_ styleName: String, decls: [String: TableCellStyleDecl]) -> TableCellStyle {
+        var result = TableCellStyle()
+        var have = (bg: false, borderColor: false, borderWidth: false)
+        var currentName: String? = styleName
+        var visited = Set<String>()
+        while let name = currentName {
+            guard !visited.contains(name) else { break }
+            visited.insert(name)
+            guard let decl = decls[name] else { break }
+            if !have.bg, let v = decl.backgroundColor { result.backgroundColor = v; have.bg = true }
+            if !have.borderColor, let v = decl.borderColor { result.borderColor = v; have.borderColor = true }
+            if !have.borderWidth, let v = decl.borderWidth { result.borderWidth = v; have.borderWidth = true }
+            currentName = decl.parent
+        }
+        return result
+    }
+
+    // MARK: Table-column styles — declared width (S15: previously unparsed family AND element)
+
+    private struct TableColumnStyle: Equatable {
+        var width: CGFloat? = nil
+    }
+
+    private struct TableColumnStyleDecl {
+        var width: CGFloat? = nil
+        var parent: String? = nil
+    }
+
+    /// `style:family="table-column"` — `oss-delta-odt.md`'s audit found `table:table-column` itself
+    /// (the ELEMENT, not just this style family) referenced nowhere in this file at all before this
+    /// sprint; `parseColumnWidths` (below, called from `parseTable`) is the new caller that walks the
+    /// element, this function resolves the style it points at.
+    private static func parseTableColumnStyleDecls(from root: XMLNode) -> [String: TableColumnStyleDecl] {
+        var map: [String: TableColumnStyleDecl] = [:]
+        for styleNode in root.allDescendants("style:style") where styleNode.attributes["style:family"] == "table-column" {
+            guard let name = styleNode.attributes["style:name"] else { continue }
+            var decl = TableColumnStyleDecl()
+            decl.parent = styleNode.attributes["style:parent-style-name"]
+            if let width = styleNode.child("style:table-column-properties")?.attributes["style:column-width"] {
+                decl.width = parseLength(width)
+            }
+            map[name] = decl
+        }
+        return map
+    }
+
+    private static func resolveTableColumnStyle(_ styleName: String, decls: [String: TableColumnStyleDecl]) -> TableColumnStyle {
+        var result = TableColumnStyle()
+        var currentName: String? = styleName
+        var visited = Set<String>()
+        while let name = currentName {
+            guard !visited.contains(name) else { break }
+            visited.insert(name)
+            guard let decl = decls[name] else { break }
+            if result.width == nil, let v = decl.width { result.width = v }
+            currentName = decl.parent
+        }
+        return result
+    }
+
+    // MARK: Document default body size — style:default-style, family "paragraph"
+
+    /// `style:default-style` (family `"paragraph"`) is ODF's document-wide fallback — every paragraph
+    /// this reader never gave its own explicit size ultimately falls back to it. Deliberately its own
+    /// small function rather than folded into `parseParagraphStyleDecls`: `style:default-style` is a
+    /// SIBLING element of `style:style`, not a `style:style` node itself (no `style:family` attribute,
+    /// no name, exactly one per document), so it needs its own, narrower search.
+    private static func parseDefaultParagraphFontSize(from root: XMLNode) -> CGFloat? {
+        guard let defaultStyle = root.allDescendants("style:default-style")
+            .first(where: { $0.attributes["style:family"] == "paragraph" }),
+            let sizeString = defaultStyle.child("style:text-properties")?.attributes["fo:font-size"]
+        else { return nil }
+        return parseLength(sizeString)
     }
 
     // MARK: content.xml — office:text → blocks
@@ -286,9 +625,7 @@ enum OdtReader {
     private static let maxBodyRecursionDepth = 64
 
     private static func parseBody(
-        _ text: XMLNode, listStyles: [String: [Int: Bool]], textStyles: [String: TextStyle],
-        paragraphOutlineLevels: [String: Int], paragraphDirections: [String: Bool], archive: ZipArchive,
-        notes: NoteCollector, depth: Int = 0
+        _ text: XMLNode, styles: ParsedStyles, archive: ZipArchive, notes: NoteCollector, depth: Int = 0
     ) -> [OfficeBlock] {
         var blocks: [OfficeBlock] = []
         for child in text.children {
@@ -296,24 +633,28 @@ enum OdtReader {
             case "text:h":
                 let rawLevel = Int(child.attributes["text:outline-level"] ?? "") ?? 1
                 let level = min(max(rawLevel, 1), 6)
-                let rtl = child.attributes["text:style-name"].flatMap { paragraphDirections[$0] } ?? false
+                let resolved = resolvedStyle(child.attributes["text:style-name"], styles: styles)
                 blocks.append(contentsOf: paragraphLikeBlocks(
-                    child, make: { .heading(level: level, spans: $0, rtl: rtl) }, textStyles: textStyles, archive: archive,
-                    notes: notes))
+                    child, make: { .heading(level: level, spans: $0, rtl: resolved.rtl, alignment: resolved.alignment,
+                                             tabStops: resolved.tabStops) },
+                    styles: styles, archive: archive, notes: notes))
             case "text:p":
                 // A `text:p` whose OWN paragraph style declares `style:default-outline-level` is a
                 // heading too — Writer produces this shape routinely — resolved on the same 1-based
                 // scale `text:outline-level` already uses, so it's clamped identically.
                 let styleName = child.attributes["text:style-name"]
-                let rtl = styleName.flatMap { paragraphDirections[$0] } ?? false
-                if let styleName, let rawLevel = paragraphOutlineLevels[styleName] {
+                let resolved = resolvedStyle(styleName, styles: styles)
+                if let rawLevel = resolved.outlineLevel {
                     let level = min(max(rawLevel, 1), 6)
                     blocks.append(contentsOf: paragraphLikeBlocks(
-                        child, make: { .heading(level: level, spans: $0, rtl: rtl) }, textStyles: textStyles, archive: archive,
-                        notes: notes))
+                        child, make: { .heading(level: level, spans: $0, rtl: resolved.rtl, alignment: resolved.alignment,
+                                                 tabStops: resolved.tabStops) },
+                        styles: styles, archive: archive, notes: notes))
                 } else {
                     blocks.append(contentsOf: paragraphLikeBlocks(
-                        child, make: { .paragraph(spans: $0, rtl: rtl) }, textStyles: textStyles, archive: archive, notes: notes))
+                        child, make: { .paragraph(spans: $0, rtl: resolved.rtl, alignment: resolved.alignment,
+                                                   tabStops: resolved.tabStops) },
+                        styles: styles, archive: archive, notes: notes))
                 }
             case "text:hidden-paragraph":
                 // Verified against OASIS ODF 1.3 schema (element text:hidden-paragraph):
@@ -328,10 +669,11 @@ enum OdtReader {
                 // SHOWS the content, per this project's governing rule that losing the author's
                 // words is the unforgivable failure, an unknown state is not grounds to hide.
                 if child.attributes["text:is-hidden"] != "true" {
-                    let rtl = child.attributes["text:style-name"].flatMap { paragraphDirections[$0] } ?? false
+                    let resolved = resolvedStyle(child.attributes["text:style-name"], styles: styles)
                     blocks.append(contentsOf: paragraphLikeBlocks(
-                        child, make: { .paragraph(spans: $0, rtl: rtl) }, textStyles: textStyles, archive: archive,
-                        notes: notes))
+                        child, make: { .paragraph(spans: $0, rtl: resolved.rtl, alignment: resolved.alignment,
+                                                   tabStops: resolved.tabStops) },
+                        styles: styles, archive: archive, notes: notes))
                 }
             case "text:numbered-paragraph":
                 // A single numbered/lettered paragraph carrying its OWN `text:list-id`/
@@ -343,25 +685,22 @@ enum OdtReader {
                 let styleName = child.attributes["text:style-name"]
                 let rawLevel = Int(child.attributes["text:list-level"] ?? "") ?? 1
                 let level = max(rawLevel - 1, 0)
-                let ordered = isOrdered(styleName: styleName, level: level, listStyles: listStyles)
+                let ordered = isOrdered(styleName: styleName, level: level, listStyles: styles.listStyles)
                 for item in child.children where item.name == "text:p" {
                     // The item's OWN `text:p` style-name (paragraph formatting), not the enclosing
                     // `text:numbered-paragraph`'s (which names its LIST style, a different lookup
                     // table entirely).
-                    let rtl = item.attributes["text:style-name"].flatMap { paragraphDirections[$0] } ?? false
+                    let resolved = resolvedStyle(item.attributes["text:style-name"], styles: styles)
                     blocks.append(contentsOf: paragraphLikeBlocks(
-                        item, make: { .listItem(level: level, ordered: ordered, spans: $0, rtl: rtl) }, textStyles: textStyles,
-                        archive: archive, notes: notes))
+                        item, make: { .listItem(level: level, ordered: ordered, spans: $0, rtl: resolved.rtl,
+                                                 alignment: resolved.alignment, tabStops: resolved.tabStops) },
+                        styles: styles, archive: archive, notes: notes))
                 }
             case "text:list":
                 blocks.append(contentsOf: parseList(
-                    child, level: 0, inheritedStyleName: nil, listStyles: listStyles, textStyles: textStyles,
-                    paragraphDirections: paragraphDirections, archive: archive, notes: notes))
+                    child, level: 0, inheritedStyleName: nil, styles: styles, archive: archive, notes: notes))
             case "table:table":
-                blocks.append(parseTable(
-                    child, listStyles: listStyles, textStyles: textStyles,
-                    paragraphOutlineLevels: paragraphOutlineLevels, paragraphDirections: paragraphDirections,
-                    archive: archive, notes: notes))
+                blocks.append(parseTable(child, styles: styles, archive: archive, notes: notes))
             case "office:annotation", "text:tracked-changes", "text:sequence-decls", "text:variable-decls",
                  "text:user-field-decls", "office:forms", "office:scripts":
                 // Deliberate exclusions — dropped ON PURPOSE, not by omission (see the permissive
@@ -391,13 +730,22 @@ enum OdtReader {
                 // `text:list`/`table:table` children of its own), which is harmless, not a special
                 // case to guard against.
                 guard depth < maxBodyRecursionDepth else { continue }
-                blocks.append(contentsOf: parseBody(
-                    child, listStyles: listStyles, textStyles: textStyles,
-                    paragraphOutlineLevels: paragraphOutlineLevels, paragraphDirections: paragraphDirections,
-                    archive: archive, notes: notes, depth: depth + 1))
+                blocks.append(contentsOf: parseBody(child, styles: styles, archive: archive, notes: notes, depth: depth + 1))
             }
         }
         return blocks
+    }
+
+    /// One paragraph-style lookup, resolved — the same `ResolvedParagraphStyle` every `text:h`/
+    /// `text:p`/`text:hidden-paragraph`/`text:numbered-paragraph`/list-item case above needs, pulled
+    /// into one place so each case reads `resolved.rtl`/`resolved.alignment`/`resolved.tabStops`/
+    /// `resolved.outlineLevel` instead of four separate dictionary lookups (the shape every one of
+    /// those call sites had before this sprint, ONE field at a time). An absent/unresolvable style
+    /// name returns the all-`nil`/`false`/empty default, exactly what the four separate lookups
+    /// already returned for the same input.
+    private static func resolvedStyle(_ styleName: String?, styles: ParsedStyles) -> ResolvedParagraphStyle {
+        guard let styleName else { return ResolvedParagraphStyle() }
+        return styles.paragraphStyles[styleName] ?? ResolvedParagraphStyle()
     }
 
     /// A heading or paragraph normally contributes exactly one text block, but one carrying an
@@ -407,12 +755,11 @@ enum OdtReader {
     /// no empty text block, so callers never see a phantom `.paragraph(spans: [])` standing in for
     /// a picture.
     private static func paragraphLikeBlocks(
-        _ node: XMLNode, make: ([Span]) -> OfficeBlock, textStyles: [String: TextStyle], archive: ZipArchive,
-        notes: NoteCollector
+        _ node: XMLNode, make: ([Span]) -> OfficeBlock, styles: ParsedStyles, archive: ZipArchive, notes: NoteCollector
     ) -> [OfficeBlock] {
-        let spans = collectSpans(in: node, style: TextStyle(), textStyles: textStyles, notes: notes)
+        let spans = collectSpans(in: node, style: TextStyle(), textStyles: styles.textStyles, notes: notes)
         let images = collectImages(in: node, archive: archive)
-        let textBoxes = collectTextBoxBlocks(in: node, textStyles: textStyles, notes: notes)
+        let textBoxes = collectTextBoxBlocks(in: node, textStyles: styles.textStyles, notes: notes)
         var blocks: [OfficeBlock] = []
         if !(spans.isEmpty && !(images.isEmpty && textBoxes.isEmpty)) { blocks.append(make(spans)) }
         blocks.append(contentsOf: images)
@@ -429,11 +776,11 @@ enum OdtReader {
     /// unordered, which would wrongly flip a nested bullet under a numbered list to a bullet purely
     /// because the inner element omitted a redundant attribute.
     private static func parseList(
-        _ list: XMLNode, level: Int, inheritedStyleName: String?, listStyles: [String: [Int: Bool]],
-        textStyles: [String: TextStyle], paragraphDirections: [String: Bool], archive: ZipArchive, notes: NoteCollector
+        _ list: XMLNode, level: Int, inheritedStyleName: String?, styles: ParsedStyles, archive: ZipArchive,
+        notes: NoteCollector
     ) -> [OfficeBlock] {
         let styleName = list.attributes["text:style-name"] ?? inheritedStyleName
-        let ordered = isOrdered(styleName: styleName, level: level, listStyles: listStyles)
+        let ordered = isOrdered(styleName: styleName, level: level, listStyles: styles.listStyles)
         var blocks: [OfficeBlock] = []
         for item in list.children where item.name == "text:list-item" {
             for child in item.children {
@@ -441,14 +788,15 @@ enum OdtReader {
                 case "text:p":
                     // The item's OWN paragraph style-name, not the enclosing LIST's — same
                     // distinction `text:numbered-paragraph` above draws.
-                    let rtl = child.attributes["text:style-name"].flatMap { paragraphDirections[$0] } ?? false
+                    let resolved = resolvedStyle(child.attributes["text:style-name"], styles: styles)
                     blocks.append(contentsOf: paragraphLikeBlocks(
-                        child, make: { .listItem(level: level, ordered: ordered, spans: $0, rtl: rtl) },
-                        textStyles: textStyles, archive: archive, notes: notes))
+                        child, make: { .listItem(level: level, ordered: ordered, spans: $0, rtl: resolved.rtl,
+                                                  alignment: resolved.alignment, tabStops: resolved.tabStops) },
+                        styles: styles, archive: archive, notes: notes))
                 case "text:list":
                     blocks.append(contentsOf: parseList(
-                        child, level: level + 1, inheritedStyleName: styleName, listStyles: listStyles,
-                        textStyles: textStyles, paragraphDirections: paragraphDirections, archive: archive, notes: notes))
+                        child, level: level + 1, inheritedStyleName: styleName, styles: styles, archive: archive,
+                        notes: notes))
                 default:
                     continue
                 }
@@ -463,33 +811,41 @@ enum OdtReader {
     /// per-row flag the way docx's `w:tblHeader` is — its absence (this fixture has none) means
     /// `headerRows == 0`, never a guess of 1 (`OfficeBlock.table`'s own contract: an un-styled
     /// table is a faithful rendering, a wrongly-bolded row is not).
-    private static func parseTable(
-        _ table: XMLNode, listStyles: [String: [Int: Bool]], textStyles: [String: TextStyle],
-        paragraphOutlineLevels: [String: Int], paragraphDirections: [String: Bool], archive: ZipArchive,
-        notes: NoteCollector
-    ) -> OfficeBlock {
+    private static func parseTable(_ table: XMLNode, styles: ParsedStyles, archive: ZipArchive, notes: NoteCollector) -> OfficeBlock {
+        let columnWidths = parseColumnWidths(table, tableColumnStyles: styles.tableColumnStyles)
         var rows: [[Cell]] = []
         var headerRows = 0
         for child in table.children {
             switch child.name {
             case "table:table-header-rows":
                 let expanded = child.children.filter { $0.name == "table:table-row" }
-                    .flatMap { expandRow(
-                        $0, listStyles: listStyles, textStyles: textStyles,
-                        paragraphOutlineLevels: paragraphOutlineLevels, paragraphDirections: paragraphDirections,
-                        archive: archive, notes: notes) }
+                    .flatMap { expandRow($0, columnWidths: columnWidths, styles: styles, archive: archive, notes: notes) }
                 headerRows += expanded.count
                 rows.append(contentsOf: expanded)
             case "table:table-row":
-                rows.append(contentsOf: expandRow(
-                    child, listStyles: listStyles, textStyles: textStyles,
-                    paragraphOutlineLevels: paragraphOutlineLevels, paragraphDirections: paragraphDirections,
-                    archive: archive, notes: notes))
+                rows.append(contentsOf: expandRow(child, columnWidths: columnWidths, styles: styles, archive: archive, notes: notes))
             default:
                 continue
             }
         }
         return .table(rows: rows, headerRows: headerRows)
+    }
+
+    /// `table:table-column` — the ELEMENT `oss-delta-odt.md`'s audit found referenced nowhere in this
+    /// file at all — declares one or more (via `table:number-columns-repeated`) columns' worth of
+    /// declared width, IN SOURCE ORDER, as DIRECT children of `table:table` (siblings of the
+    /// `table:table-row`s, not inside them). Returns one entry PER COLUMN (repeats expanded, mirroring
+    /// `expandRow`'s own cell/row repeat expansion), `nil` where a column has no `table:style-name` or
+    /// an unresolvable one — so the result's INDEX is a column position, directly usable by
+    /// `expandRow`'s own running column counter.
+    private static func parseColumnWidths(_ table: XMLNode, tableColumnStyles: [String: TableColumnStyle]) -> [CGFloat?] {
+        var widths: [CGFloat?] = []
+        for child in table.children where child.name == "table:table-column" {
+            let width = child.attributes["table:style-name"].flatMap { tableColumnStyles[$0]?.width }
+            let repeated = Int(child.attributes["table:number-columns-repeated"] ?? "") ?? 1
+            widths.append(contentsOf: Array(repeating: width, count: repeated))
+        }
+        return widths
     }
 
     /// ODF collapses runs of identical adjacent cells/rows into one element carrying a
@@ -504,25 +860,53 @@ enum OdtReader {
     /// no cross-row bookkeeping to do, each row already states its own covered positions. Dropping
     /// those placeholders (contributing zero `Cell`s) is therefore correct on its own: what's left
     /// is exactly `OfficeBlock.table`'s anchor-only shape, spans/repeats notwithstanding.
-    private static func expandRow(
-        _ row: XMLNode, listStyles: [String: [Int: Bool]], textStyles: [String: TextStyle],
-        paragraphOutlineLevels: [String: Int], paragraphDirections: [String: Bool], archive: ZipArchive,
-        notes: NoteCollector
-    ) -> [[Cell]] {
+    ///
+    /// `columnWidths` (this sprint's own addition) is read positionally — a running `columnIndex`
+    /// starts at 0 for the row and advances past EVERY column a cell (or a dropped covered-cell)
+    /// occupies, so an anchor's OWN width comes from `columnWidths[columnIndex]` at the moment it's
+    /// reached, before the index advances past it. A `table:covered-table-cell` still advances the
+    /// index by its own (possibly repeated) column count even though it contributes no `Cell` —
+    /// skipping that would misalign every width to its right.
+    private static func expandRow(_ row: XMLNode, columnWidths: [CGFloat?], styles: ParsedStyles, archive: ZipArchive,
+                                   notes: NoteCollector) -> [[Cell]] {
         let rowRepeat = Int(row.attributes["table:number-rows-repeated"] ?? "") ?? 1
         var cells: [Cell] = []
-        for cell in row.children where cell.name == "table:table-cell" {
-            let blocks = collectCellBlocks(
-                cell, listStyles: listStyles, textStyles: textStyles, paragraphOutlineLevels: paragraphOutlineLevels,
-                paragraphDirections: paragraphDirections, archive: archive, notes: notes)
-            let rowSpan = Int(cell.attributes["table:number-rows-spanned"] ?? "") ?? 1
-            let colSpan = Int(cell.attributes["table:number-columns-spanned"] ?? "") ?? 1
-            let colRepeat = Int(cell.attributes["table:number-columns-repeated"] ?? "") ?? 1
-            cells.append(contentsOf: Array(repeating: Cell(blocks: blocks, rowSpan: rowSpan, colSpan: colSpan), count: colRepeat))
+        var columnIndex = 0
+        for child in row.children {
+            switch child.name {
+            case "table:table-cell":
+                let blocks = collectCellBlocks(child, styles: styles, archive: archive, notes: notes)
+                let rowSpan = Int(child.attributes["table:number-rows-spanned"] ?? "") ?? 1
+                let colSpan = Int(child.attributes["table:number-columns-spanned"] ?? "") ?? 1
+                let colRepeat = Int(child.attributes["table:number-columns-repeated"] ?? "") ?? 1
+                let cellStyle = child.attributes["table:style-name"].flatMap { styles.tableCellStyles[$0] }
+                // Each REPEAT instance advances the column index by exactly ONE — its own start
+                // column — never by `colSpan`: the ADDITIONAL columns a span covers are accounted
+                // for by the `table:covered-table-cell` element(s) that follow it in THIS row (see
+                // the `case` below), not by this cell's own element. Advancing by `colSpan` here
+                // would double-count those columns once more when the covered-cell(s) are reached,
+                // shifting every width to the right of a horizontal merge by one column too many
+                // (caught by `testColumnWidthAlignsCorrectlyAcrossAColumnSpan`'s own mutation check).
+                for _ in 0..<colRepeat {
+                    let width = columnIndex < columnWidths.count ? columnWidths[columnIndex] : nil
+                    cells.append(Cell(
+                        blocks: blocks, rowSpan: rowSpan, colSpan: colSpan, backgroundColor: cellStyle?.backgroundColor,
+                        borderColor: cellStyle?.borderColor, borderWidth: cellStyle?.borderWidth, width: width))
+                    columnIndex += 1
+                }
+            case "table:covered-table-cell":
+                // Contributes no `Cell` (see the doc comment above) but still occupies its own
+                // column position(s) — whether it is standing in for the REST of a horizontal span
+                // (same row as its anchor) or for a vertical span's continuation (a later row, no
+                // anchor of its own in THIS row at all), it is exactly one more column than the
+                // element itself would otherwise account for — the running index must still move
+                // past it, once per repeat.
+                let repeated = Int(child.attributes["table:number-columns-repeated"] ?? "") ?? 1
+                columnIndex += repeated
+            default:
+                continue
+            }
         }
-        // `table:covered-table-cell` elements are read only to confirm they exist (and can carry
-        // their own `number-columns-repeated`, e.g. a 3-wide covered run compressed to one element)
-        // — neither contributes a `Cell`, so nothing further happens with them here.
         return Array(repeating: cells, count: rowRepeat)
     }
 
@@ -559,39 +943,38 @@ enum OdtReader {
     /// explicit that it must not change. An empty paragraph is filtered with the SAME
     /// `isEmptyTextBlock` check above: a truly empty cell must produce no block at all, never a
     /// phantom `.paragraph(spans: [])` standing in for "nothing here".
-    private static func collectCellBlocks(
-        _ cell: XMLNode, listStyles: [String: [Int: Bool]], textStyles: [String: TextStyle],
-        paragraphOutlineLevels: [String: Int], paragraphDirections: [String: Bool], archive: ZipArchive,
-        notes: NoteCollector
-    ) -> [OfficeBlock] {
+    private static func collectCellBlocks(_ cell: XMLNode, styles: ParsedStyles, archive: ZipArchive, notes: NoteCollector) -> [OfficeBlock] {
         var blocks: [OfficeBlock] = []
         for child in cell.children {
             switch child.name {
             case "text:h":
                 let rawLevel = Int(child.attributes["text:outline-level"] ?? "") ?? 1
                 let level = min(max(rawLevel, 1), 6)
-                let rtl = child.attributes["text:style-name"].flatMap { paragraphDirections[$0] } ?? false
+                let resolved = resolvedStyle(child.attributes["text:style-name"], styles: styles)
                 blocks.append(contentsOf: paragraphLikeBlocks(
-                    child, make: { .heading(level: level, spans: $0, rtl: rtl) }, textStyles: textStyles, archive: archive,
-                    notes: notes))
+                    child, make: { .heading(level: level, spans: $0, rtl: resolved.rtl, alignment: resolved.alignment,
+                                             tabStops: resolved.tabStops) },
+                    styles: styles, archive: archive, notes: notes))
             case "text:p":
                 let styleName = child.attributes["text:style-name"]
-                let rtl = styleName.flatMap { paragraphDirections[$0] } ?? false
-                if let styleName, let rawLevel = paragraphOutlineLevels[styleName] {
+                let resolved = resolvedStyle(styleName, styles: styles)
+                if let rawLevel = resolved.outlineLevel {
                     let level = min(max(rawLevel, 1), 6)
                     blocks.append(contentsOf: paragraphLikeBlocks(
-                        child, make: { .heading(level: level, spans: $0, rtl: rtl) }, textStyles: textStyles, archive: archive,
-                        notes: notes))
+                        child, make: { .heading(level: level, spans: $0, rtl: resolved.rtl, alignment: resolved.alignment,
+                                                 tabStops: resolved.tabStops) },
+                        styles: styles, archive: archive, notes: notes))
                 } else {
                     blocks.append(contentsOf: paragraphLikeBlocks(
-                        child, make: { .paragraph(spans: $0, rtl: rtl) }, textStyles: textStyles, archive: archive, notes: notes))
+                        child, make: { .paragraph(spans: $0, rtl: resolved.rtl, alignment: resolved.alignment,
+                                                   tabStops: resolved.tabStops) },
+                        styles: styles, archive: archive, notes: notes))
                 }
             case "text:list":
                 blocks.append(contentsOf: parseList(
-                    child, level: 0, inheritedStyleName: nil, listStyles: listStyles, textStyles: textStyles,
-                    paragraphDirections: paragraphDirections, archive: archive, notes: notes))
+                    child, level: 0, inheritedStyleName: nil, styles: styles, archive: archive, notes: notes))
             case "table:table":
-                let spans = flattenNestedTable(child, textStyles: textStyles, notes: notes)
+                let spans = flattenNestedTable(child, textStyles: styles.textStyles, notes: notes)
                 if !spans.isEmpty { blocks.append(.paragraph(spans: spans)) }
             default:
                 continue
@@ -759,6 +1142,40 @@ enum OdtReader {
         return CGFloat(number)
     }
 
+    /// ODF's `color` datatype (`fo:color`, `fo:background-color`'s non-`"transparent"` form) is
+    /// ALWAYS `"#RRGGBB"` — never a CSS colour name, never `0x`-prefixed, never carrying alpha (ODF
+    /// 1.3 §18.3.2). `"transparent"` — `fo:background-color`'s other legal value, meaning "no
+    /// highlight" — returns `nil`, exactly like an absent attribute, never black: see `Span
+    /// .highlightColor`'s own doc for why "no mark" must never become a literal colour.
+    private static func parseODFColor(_ raw: String) -> NSColor? {
+        guard raw != "transparent", raw.hasPrefix("#"), raw.count == 7, let value = UInt32(raw.dropFirst(), radix: 16)
+        else { return nil }
+        return NSColor(
+            deviceRed: CGFloat((value >> 16) & 0xFF) / 255, green: CGFloat((value >> 8) & 0xFF) / 255,
+            blue: CGFloat(value & 0xFF) / 255, alpha: 1)
+    }
+
+    /// ODF's border shorthand is `"<width-length> <line-style> <color>"` (e.g. `"0.06pt solid
+    /// #000000"`, the same three-token shape CSS borders use) — `fo:border` sets all four sides at
+    /// once, `fo:border-top`/`-bottom`/`-left`/`-right` set one side each. `Cell`'s own vocabulary is
+    /// ONE uniform colour/width, not a real four-sided model (`OfficeBlock.swift`'s own doc comment on
+    /// `Cell.borderColor`/`borderWidth`), so the first side declared wins — `fo:border` is checked
+    /// first (the common, symmetric case), then each individual side, so an asymmetric border (only
+    /// `fo:border-top` set, no `fo:border` shorthand) still contributes something rather than nothing.
+    /// The middle token being `"none"`/`"hidden"` means no border on that side, read the same as the
+    /// attribute being absent entirely.
+    private static func parseODFBorder(_ props: XMLNode) -> (color: NSColor?, width: CGFloat?) {
+        for key in ["fo:border", "fo:border-top", "fo:border-bottom", "fo:border-left", "fo:border-right"] {
+            guard let raw = props.attributes[key] else { continue }
+            let tokens = raw.split(separator: " ").map(String.init)
+            if tokens.count >= 2, tokens[1] == "none" || tokens[1] == "hidden" { continue }
+            let width = tokens.first.flatMap(parseLength)
+            let color = tokens.last.flatMap(parseODFColor)
+            if width != nil || color != nil { return (color, width) }
+        }
+        return (nil, nil)
+    }
+
     // MARK: Spans — text:span/text:a/text:s/text:tab/text:line-break, in document order
 
     /// Walks `node`'s children strictly in document order (see `XMLNode`/`#text` below — unlike a
@@ -792,19 +1209,26 @@ enum OdtReader {
                 spans.append(Span(
                     text: text, bold: style.bold, italic: style.italic, underline: style.underline, link: link,
                     strikethrough: style.strikethrough, superscript: style.superscript, subscripted: style.subscripted,
-                    bookmarks: bookmarks))
+                    bookmarks: bookmarks, textColor: style.textColor, highlightColor: style.highlightColor,
+                    fontSize: style.fontSize, fontName: style.fontName))
                 return
             }
             // A bookmarked span is never EXTENDED by trailing text either — see the matching guard
-            // in `DocxReader.collectSpans`.
+            // in `DocxReader.collectSpans`. `textColor`/`highlightColor`/`fontSize`/`fontName` (this
+            // sprint's own additions) join the same equality check — two runs that only differ in,
+            // say, colour must stay two separate `Span`s, or the second run's colour would silently
+            // win for the whole merged range.
             if let last = spans.last, last.bookmarks.isEmpty, last.bold == style.bold, last.italic == style.italic, last.underline == style.underline,
                last.strikethrough == style.strikethrough, last.superscript == style.superscript,
-               last.subscripted == style.subscripted, last.link == link {
+               last.subscripted == style.subscripted, last.link == link, last.textColor == style.textColor,
+               last.highlightColor == style.highlightColor, last.fontSize == style.fontSize, last.fontName == style.fontName {
                 spans[spans.count - 1].text += text
             } else {
                 spans.append(Span(
                     text: text, bold: style.bold, italic: style.italic, underline: style.underline, link: link,
-                    strikethrough: style.strikethrough, superscript: style.superscript, subscripted: style.subscripted))
+                    strikethrough: style.strikethrough, superscript: style.superscript, subscripted: style.subscripted,
+                    textColor: style.textColor, highlightColor: style.highlightColor, fontSize: style.fontSize,
+                    fontName: style.fontName))
             }
         }
         func walk(_ node: XMLNode, style: TextStyle, link: String?) {
