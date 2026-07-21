@@ -1,6 +1,10 @@
 # fast-md-reader — dev notes (read before continuing)
 
-Native macOS Markdown **viewer** (reader-first). It also opens plain text (.txt/.csv/.log…) verbatim.
+Native macOS **document viewer** (reader-first), shipped as **Fast Doc Reader**. Markdown is where it
+started; it also reads **Word `.docx` and OpenDocument `.odt`** (read-only — text, tables with merged
+cells, images, links, footnotes) and opens plain text (.txt/.csv/.log…) verbatim. `.rtf` was
+deliberately dropped (`35c9485`): AppKit's RTF reader loses tables, lists and embedded images, so
+supporting it honestly meant writing a second parser the size of the Word one.
 Writing is deliberate and narrow: right-click a block → Edit / Add Below / Move / Delete, held in
 memory until ⌘S.
 Pure Swift/AppKit + TextKit, SwiftPM executable. No web runtime for text. WebKit renders only two
@@ -11,7 +15,7 @@ Code highlighting is native (34 languages, single-pass scanner), no JS.
 
 - **Build app**: `./Scripts/make-app.sh [debug|release]` → `FastDocReader.app` in repo root (ad-hoc signed).
 - **Toolchain (MUST)**: standalone Command Line Tools has a mismatched SwiftPM ManifestAPI → `swift build` breaks. Always use Xcode's toolchain. `make-app.sh` auto-sets `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer` if unset.
-- **Tests**: `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` (98 tests, keep green). Two are measurement-only and skip unless `FMD_LATENCY_FILE=<a real document>` is set.
+- **Tests**: `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` (279 tests, keep green). Two are measurement-only and skip unless `FMD_LATENCY_FILE=<a real document>` is set.
 - **Run a dev build from the REPO** — `open ./FastDocReader.app`. Do NOT copy it to `/Applications`: that folder holds properly signed builds only (owner's rule). A dev build there is ad-hoc signed, and macOS ties per-app state to the signature, so every rebuild reads as a different app — which is exactly why Open Recent kept emptying (see invariant 21). `/Applications` gets a build from `notarize.sh` or the App Store, nothing else.
 - **Quit cleanly, never `pkill`**: `osascript -e 'tell application "FastDocReader" to quit'`. Force-kill loses recent-docs persistence and can leave state inconsistent.
 - **⌘R (Reload)** reloads the *document* content only — it does NOT pick up a new app build. A code change needs rebuild + relaunch.
@@ -65,6 +69,9 @@ Code highlighting is native (34 languages, single-pass scanner), no JS.
 26. **A control next to the traffic lights is a TITLEBAR ACCESSORY, not a toolbar item.** This macOS lays toolbar items out trailing with the title leading, so a toolbar button lands on the far right no matter how the identifiers are ordered — `.flexibleSpace` doesn't move it, and neither does asking for the system `.toggleSidebar`. `NSTitlebarAccessoryViewController` with `layoutAttribute = .leading` puts it where every Mac app keeps it. Centre it with a constraint; the title bar's height is not ours to guess.
 27. **The sidebar is a real `NSSplitViewItem(sidebarWithViewController:)`.** That is what supplies the inset rounded panel, the system material and the light/dark behaviour. An `NSVisualEffectView` of our own underneath a real sidebar just hides it.
 28. **A local build carries its OWN bundle identifier — `ai.ww-w.fast-md-reader.dev` — and must keep doing so.** `make-app.sh` rewrites `CFBundleIdentifier` and the display name (the Dock shows "Fast Doc Reader (Dev)") in the COPY inside the bundle; `Resources/Info.plist` keeps the real identifier. macOS keys per-app state to the identifier, so while they were shared, every local rebuild took the installed release's Open Recent list with it — invariant 21 explains why a rebuild invalidates it, and a shared identifier is what let that reach an app nobody rebuilt. `notarize.sh` and `appstore.sh` pass `DIST_IDENTITY=1` to keep the real identifier **and then verify it survived**, refusing to ship a `.dev` bundle: a flag that protects only when every future caller remembers to set it is not protection. Consequence when testing a cold start — a dev build's sandbox container is `…Containers/ai.ww-w.fast-md-reader.dev`, so invariant 4's cache path shifts with it.
+29. **A unit test on a parser cannot tell you the parser is REACHED.** `.odt` shipped registered, parsed and covered by 24 passing tests — and could not be opened at all: both office call sites hard-coded `DocxReader`, so ODF bytes went to the Word parser and threw. Every `OdtReaderTests` case called `OdtReader.read` directly, which proves the parser and says nothing about the application. 266 tests were green with the feature completely dead, and only launching the app found it. Two rules follow. **`DocumentTypes.readOffice` is the single dispatch table** — one place that maps an extension to its reader, throwing on anything unhandled rather than falling through to Word; a second, divergent list is how this recurs. And **any new format needs one test through `MarkdownDocument`'s own read path**, not just through its parser, plus an actual open in the built app. The same blindness applies to `Info.plist` (invariant 6) — both are seams no compiler and no unit test can see.
+30. **Measure the corpus before believing it.** All eight contracts ship `word/footnotes.xml`, which read as "footnotes matter here" and ranked a whole sprint — but every one holds ONLY Word's `separator`/`continuationSeparator` boilerplate, which Word writes into nearly every document. Real footnotes: zero. Likewise the claim that filtering those separators is what prevents phantom notes: removing the filter changes nothing, because only CITED notes are ever appended — the filter is a second layer, not the load-bearing one (confirmed by mutation). **When a check passes, break the thing it checks and confirm it fails**; a green assertion whose subject is unreachable proves nothing. Two real defects this session were found by exactly that mutation step, and one "verified" claim was withdrawn because of it.
+
 
 ## Debugging discipline (this app specifically)
 
