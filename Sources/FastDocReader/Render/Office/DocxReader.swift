@@ -871,7 +871,9 @@ enum DocxReader {
                 child, styleInfo: styleInfo, numbering: numbering, relationships: relationships,
                 notes: notes, listState: listState)
         case "w:tbl":
-            return [parseTable(child, relationships: relationships, notes: notes)]
+            return [parseTable(
+                child, styleInfo: styleInfo, numbering: numbering, relationships: relationships, notes: notes,
+                listState: listState)]
         case "w:sdt":
             guard let content = child.child("w:sdtContent") else { return [] }
             return content.children.flatMap {
@@ -946,7 +948,10 @@ enum DocxReader {
     /// cell still carries its own `<w:tc>` occupying its column, per spec), so this cumulative walk
     /// lands on the correct column even when two rows have a different NUMBER of `<w:tc>` (a
     /// horizontal merge changes how many `<w:tc>` a row needs without changing the grid it spans).
-    private static func parseTable(_ tbl: XMLNode, relationships: Relationships, notes: NoteNumbering) -> OfficeBlock {
+    private static func parseTable(
+        _ tbl: XMLNode, styleInfo: StyleInfo, numbering: NumberingInfo, relationships: Relationships,
+        notes: NoteNumbering, listState: ListNumberingState
+    ) -> OfficeBlock {
         let rowNodes = tbl.children.filter { $0.name == "w:tr" }
         var rows: [[Cell]] = []
         // Grid column → where in `rows` its currently-open vertical-merge anchor lives, so a
@@ -978,8 +983,10 @@ enum DocxReader {
                     // to extend, and a `continue` cell is never content of its own, so it is simply
                     // dropped rather than fabricated into a normal cell.
                 } else {
-                    let spans = collectCellSpans(tc, relationships: relationships, notes: notes)
-                    rowCells.append(Cell(spans: spans, rowSpan: 1, colSpan: colSpan))
+                    let blocks = collectCellBlocks(
+                        tc, styleInfo: styleInfo, numbering: numbering, relationships: relationships, notes: notes,
+                        listState: listState)
+                    rowCells.append(Cell(blocks: blocks, rowSpan: 1, colSpan: colSpan))
                     if vMerge != nil {
                         // `val="restart"` — the top of a genuine new vertical-merge chain; later
                         // `continue` cells at this column extend THIS cell's `rowSpan`.
@@ -1018,14 +1025,61 @@ enum DocxReader {
         return .table(rows: rows, headerRows: headerRows)
     }
 
-    /// A cell's content: its own paragraphs, PLUS the two places a naive reader silently drops
-    /// real text from a `<w:tc>` — a `w:sdt` (content control) wrapping a paragraph (a form-field
-    /// cell in a template table is a very common Word shape), and a full nested `<w:tbl>`. `Cell`
-    /// has no case for a nested `.table` block, so a nested table's text is FLATTENED into spans
-    /// (`flattenNestedTable`) rather than dropped — the grid disappears, the words in it do not.
-    /// Deliberately mirrors `OdtReader.collectCellSpans`/`flattenNestedTable` exactly (same
-    /// separator convention: a tab between cells, a newline after each non-empty row), so the two
-    /// formats produce comparable output for the same shape rather than silently disagreeing.
+    /// A cell's content, built from the SAME per-block classification `parseParagraph` gives the
+    /// body — a paragraph, a heading, a list item, an image — rather than a second, cell-only walk
+    /// that only ever knew how to collect plain text. This is what closes gap-list rows 6 and 7:
+    /// before this sprint a cell held nothing but `[Span]`, so an image or a numbered list item
+    /// inside a `<w:tc>` had nowhere to go and was silently skipped.
+    ///
+    /// List numbering inside a cell shares the WHOLE document's `ListNumberingState` (the same
+    /// instance `read()` threads through the body) rather than getting its own — a `w:numId`'s
+    /// counters belong to the numId, not to whether the paragraph using it happens to sit inside a
+    /// table cell, and Word itself continues a list's numbers across an intervening table exactly as
+    /// it does across an ordinary paragraph. A numbered item inside a cell therefore continues the
+    /// document's numbering, never restarts at 1.
+    ///
+    /// Three of the same places `collectCellSpans` already knew text could hide — `w:p`, `w:sdt`, a
+    /// nested `w:tbl` — but a nested table is still FLATTENED to a single `.paragraph` of spans
+    /// (`flattenNestedTable`/`collectCellSpans`, unchanged), never a real nested `.table` block: that
+    /// was decided earlier and is enforced again by the renderer, and this sprint's brief is
+    /// explicit that it must not change.
+    ///
+    /// An empty paragraph — Word's own placeholder for a cell the author left blank, or the stray
+    /// `<w:p/>` a genuinely empty cell always carries (a `<w:tc>` is never bodiless in real OOXML) —
+    /// is filtered out with the SAME `isEmptyTextBlock` check `textBoxBlocks` already uses: a truly
+    /// empty cell must produce no block at all, never a phantom `.paragraph(spans: [])` standing in
+    /// for "nothing here".
+    private static func collectCellBlocks(
+        _ tc: XMLNode, styleInfo: StyleInfo, numbering: NumberingInfo, relationships: Relationships,
+        notes: NoteNumbering, listState: ListNumberingState
+    ) -> [OfficeBlock] {
+        var blocks: [OfficeBlock] = []
+        for child in tc.children {
+            switch child.name {
+            case "w:p":
+                blocks.append(contentsOf: parseParagraph(
+                    child, styleInfo: styleInfo, numbering: numbering, relationships: relationships, notes: notes,
+                    listState: listState))
+            case "w:tbl":
+                let spans = flattenNestedTable(child, relationships: relationships, notes: notes)
+                if !spans.isEmpty { blocks.append(.paragraph(spans: spans)) }
+            case "w:sdt":
+                if let content = child.child("w:sdtContent") {
+                    blocks.append(contentsOf: collectCellBlocks(
+                        content, styleInfo: styleInfo, numbering: numbering, relationships: relationships,
+                        notes: notes, listState: listState))
+                }
+            default:
+                continue
+            }
+        }
+        return blocks.filter { !isEmptyTextBlock($0) }
+    }
+
+    /// A cell's content as plain spans, no block structure — used ONLY by `flattenNestedTable`,
+    /// which deliberately squashes a nested table's grid down to text (`Cell` has no room for a
+    /// second, real nested `.table` block). `collectCellBlocks` above is what a table's OWN cells
+    /// go through now; this stays exactly as it was for the flatten-only path.
     private static func collectCellSpans(_ tc: XMLNode, relationships: Relationships, notes: NoteNumbering) -> [Span] {
         var spans: [Span] = []
         for child in tc.children {

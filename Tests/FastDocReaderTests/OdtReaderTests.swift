@@ -227,7 +227,9 @@ final class OdtReaderTests: XCTestCase {
         """)
         XCTAssertEqual(blocks, [.table(rows: [
             [Cell(spans: [Span(text: "H1")]), Cell(spans: [Span(text: "H2")])],
-            [Cell(spans: [Span(text: "A1")]), Cell(spans: [])],
+            // A cell whose only content is an empty `<text:p/>` is truly empty —
+            // `Cell(blocks: [])`, no phantom `.paragraph(spans: [])` (see `collectCellBlocks`).
+            [Cell(spans: [Span(text: "A1")]), Cell(blocks: [])],
         ], headerRows: 0)])
     }
 
@@ -321,6 +323,85 @@ final class OdtReaderTests: XCTestCase {
         XCTAssertEqual(blocks, [.table(rows: [
             [Cell(spans: [Span(text: "Wide")], rowSpan: 1, colSpan: 3), Cell(spans: [Span(text: "Next")])],
         ], headerRows: 0)])
+    }
+
+    // MARK: S8 — images, lists (and their combination) inside table cells (gap-list rows 6/7)
+
+    func testImageInsideTableCellProducesAnImageBlockWithReservedSize() throws {
+        let zip = buildZip([
+            ("content.xml", Data(doc(body: """
+            <table:table><table:table-row><table:table-cell>
+              <text:p><draw:frame svg:width="72pt" svg:height="36pt">
+              <draw:image xlink:href="Pictures/photo.png"/></draw:frame></text:p>
+            </table:table-cell></table:table-row></table:table>
+            """).utf8)),
+            ("Pictures/photo.png", Data([0x01])),
+        ])
+        let blocks = try OdtReader.read(try ZipArchive(data: zip))
+        XCTAssertEqual(blocks, [.table(rows: [
+            [Cell(blocks: [.image(id: "Pictures/photo.png", size: CGSize(width: 72, height: 36))])],
+        ], headerRows: 0)])
+    }
+
+    func testNumberedListInsideTableCellKeepsItsNumbering() throws {
+        let blocks = try read(
+            body: """
+            <table:table><table:table-row><table:table-cell>
+              <text:list text:style-name="L1"><text:list-item><text:p>In cell</text:p></text:list-item></text:list>
+            </table:table-cell></table:table-row></table:table>
+            """,
+            automaticStyles: numberThenBulletListStyle)
+        XCTAssertEqual(blocks, [.table(rows: [
+            [Cell(blocks: [.listItem(level: 0, ordered: true, spans: [Span(text: "In cell")])])],
+        ], headerRows: 0)])
+    }
+
+    func testBulletedListInsideTableCellKeepsBullets() throws {
+        let blocks = try read(
+            body: """
+            <table:table><table:table-row><table:table-cell>
+              <text:list><text:list-item><text:p>Bullet item</text:p></text:list-item></text:list>
+            </table:table-cell></table:table-row></table:table>
+            """)
+        XCTAssertEqual(blocks, [.table(rows: [
+            [Cell(blocks: [.listItem(level: 0, ordered: false, spans: [Span(text: "Bullet item")])])],
+        ], headerRows: 0)])
+    }
+
+    /// Text, then a numbered list item, then an image, all inside ONE cell — must keep all three, in
+    /// the order the source wrote them, mirroring `DocxReaderTests`' equivalent.
+    func testMixedContentInTableCellKeepsTextListAndImageInSourceOrder() throws {
+        let zip = buildZip([
+            ("content.xml", Data(doc(
+                body: """
+                <table:table><table:table-row><table:table-cell>
+                  <text:p>Intro</text:p>
+                  <text:list text:style-name="L1"><text:list-item><text:p>Listed</text:p></text:list-item></text:list>
+                  <text:p><draw:frame svg:width="72pt" svg:height="72pt">
+                  <draw:image xlink:href="Pictures/photo.png"/></draw:frame></text:p>
+                </table:table-cell></table:table-row></table:table>
+                """,
+                automaticStyles: numberThenBulletListStyle
+            ).utf8)),
+            ("Pictures/photo.png", Data([0x01])),
+        ])
+        let blocks = try OdtReader.read(try ZipArchive(data: zip))
+        XCTAssertEqual(blocks, [.table(rows: [
+            [Cell(blocks: [
+                .paragraph(spans: [Span(text: "Intro")]),
+                .listItem(level: 0, ordered: true, spans: [Span(text: "Listed")]),
+                .image(id: "Pictures/photo.png", size: CGSize(width: 72, height: 72)),
+            ])],
+        ], headerRows: 0)])
+    }
+
+    /// A cell whose only content is an empty `<text:p/>` must produce no block at all —
+    /// `Cell(blocks: [])`, never a phantom `.paragraph(spans: [])`.
+    func testEmptyCellProducesNoPhantomBlock() throws {
+        let blocks = try read(body: """
+        <table:table><table:table-row><table:table-cell><text:p/></table:table-cell></table:table-row></table:table>
+        """)
+        XCTAssertEqual(blocks, [.table(rows: [[Cell(blocks: [])]], headerRows: 0)])
     }
 
     // MARK: Nested tables — flattened to text (Cell has no room for a nested block)

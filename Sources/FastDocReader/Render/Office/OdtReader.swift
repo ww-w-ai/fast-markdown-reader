@@ -323,7 +323,9 @@ enum OdtReader {
                     child, level: 0, inheritedStyleName: nil, listStyles: listStyles, textStyles: textStyles,
                     archive: archive, notes: notes))
             case "table:table":
-                blocks.append(parseTable(child, textStyles: textStyles, notes: notes))
+                blocks.append(parseTable(
+                    child, listStyles: listStyles, textStyles: textStyles,
+                    paragraphOutlineLevels: paragraphOutlineLevels, archive: archive, notes: notes))
             case "office:annotation", "text:tracked-changes", "text:sequence-decls", "text:variable-decls",
                  "text:user-field-decls", "office:forms", "office:scripts":
                 // Deliberate exclusions — dropped ON PURPOSE, not by omission (see the permissive
@@ -421,18 +423,25 @@ enum OdtReader {
     /// per-row flag the way docx's `w:tblHeader` is — its absence (this fixture has none) means
     /// `headerRows == 0`, never a guess of 1 (`OfficeBlock.table`'s own contract: an un-styled
     /// table is a faithful rendering, a wrongly-bolded row is not).
-    private static func parseTable(_ table: XMLNode, textStyles: [String: TextStyle], notes: NoteCollector) -> OfficeBlock {
+    private static func parseTable(
+        _ table: XMLNode, listStyles: [String: [Int: Bool]], textStyles: [String: TextStyle],
+        paragraphOutlineLevels: [String: Int], archive: ZipArchive, notes: NoteCollector
+    ) -> OfficeBlock {
         var rows: [[Cell]] = []
         var headerRows = 0
         for child in table.children {
             switch child.name {
             case "table:table-header-rows":
                 let expanded = child.children.filter { $0.name == "table:table-row" }
-                    .flatMap { expandRow($0, textStyles: textStyles, notes: notes) }
+                    .flatMap { expandRow(
+                        $0, listStyles: listStyles, textStyles: textStyles,
+                        paragraphOutlineLevels: paragraphOutlineLevels, archive: archive, notes: notes) }
                 headerRows += expanded.count
                 rows.append(contentsOf: expanded)
             case "table:table-row":
-                rows.append(contentsOf: expandRow(child, textStyles: textStyles, notes: notes))
+                rows.append(contentsOf: expandRow(
+                    child, listStyles: listStyles, textStyles: textStyles,
+                    paragraphOutlineLevels: paragraphOutlineLevels, archive: archive, notes: notes))
             default:
                 continue
             }
@@ -452,15 +461,20 @@ enum OdtReader {
     /// no cross-row bookkeeping to do, each row already states its own covered positions. Dropping
     /// those placeholders (contributing zero `Cell`s) is therefore correct on its own: what's left
     /// is exactly `OfficeBlock.table`'s anchor-only shape, spans/repeats notwithstanding.
-    private static func expandRow(_ row: XMLNode, textStyles: [String: TextStyle], notes: NoteCollector) -> [[Cell]] {
+    private static func expandRow(
+        _ row: XMLNode, listStyles: [String: [Int: Bool]], textStyles: [String: TextStyle],
+        paragraphOutlineLevels: [String: Int], archive: ZipArchive, notes: NoteCollector
+    ) -> [[Cell]] {
         let rowRepeat = Int(row.attributes["table:number-rows-repeated"] ?? "") ?? 1
         var cells: [Cell] = []
         for cell in row.children where cell.name == "table:table-cell" {
-            let spans = collectCellSpans(cell, textStyles: textStyles, notes: notes)
+            let blocks = collectCellBlocks(
+                cell, listStyles: listStyles, textStyles: textStyles, paragraphOutlineLevels: paragraphOutlineLevels,
+                archive: archive, notes: notes)
             let rowSpan = Int(cell.attributes["table:number-rows-spanned"] ?? "") ?? 1
             let colSpan = Int(cell.attributes["table:number-columns-spanned"] ?? "") ?? 1
             let colRepeat = Int(cell.attributes["table:number-columns-repeated"] ?? "") ?? 1
-            cells.append(contentsOf: Array(repeating: Cell(spans: spans, rowSpan: rowSpan, colSpan: colSpan), count: colRepeat))
+            cells.append(contentsOf: Array(repeating: Cell(blocks: blocks, rowSpan: rowSpan, colSpan: colSpan), count: colRepeat))
         }
         // `table:covered-table-cell` elements are read only to confirm they exist (and can carry
         // their own `number-columns-repeated`, e.g. a 3-wide covered run compressed to one element)
@@ -468,11 +482,80 @@ enum OdtReader {
         return Array(repeating: cells, count: rowRepeat)
     }
 
-    /// A cell's content: its own paragraphs/headings, PLUS — when ODF nests a full
-    /// `<table:table>` directly inside a `<table:table-cell>` — that inner table's text, flattened
-    /// to spans. `Cell` has no case for a nested `.table` block (research-odt.md §4 sanctions this
-    /// as a legitimate depth-1 shortcut for a flat block viewer: the grid disappears, but no text
-    /// does — "skip presentation fidelity freely, never content").
+    /// A text/heading/list block with no spans at all — used only to filter a cell's OWN
+    /// placeholder-empty paragraph (`<text:p/>`, the shape a genuinely blank cell always carries)
+    /// out of what it contributes; an image or table block is never "empty" in this sense and
+    /// always passes through. Mirrors `DocxReader.isEmptyTextBlock` exactly.
+    private static func isEmptyTextBlock(_ block: OfficeBlock) -> Bool {
+        switch block {
+        case .paragraph(let spans), .heading(_, let spans), .listItem(_, _, let spans, _):
+            return spans.isEmpty
+        case .table, .image:
+            return false
+        }
+    }
+
+    /// A cell's content, built from the SAME per-block classification `parseBody` gives the
+    /// document — a paragraph, a heading, a list item, an image — via `paragraphLikeBlocks`/
+    /// `parseList`, rather than a second, cell-only walk that only ever knew how to collect plain
+    /// text. This is what closes gap-list rows 6 and 7: before this sprint a cell held nothing but
+    /// `[Span]`, so an image or a bulleted/numbered list inside a `<table:table-cell>` had nowhere
+    /// to go and was silently skipped.
+    ///
+    /// ODT has no per-numId counter STATE to decide a scope for (unlike `DocxReader`'s
+    /// `ListNumberingState`) — `isOrdered` is a pure function of a list style's name/level, and this
+    /// reader never resolves real marker TEXT for an ODF list (`OfficeBlock.listItem.marker` stays
+    /// `nil` here exactly as it does in the body, see the note above `isOrdered`); `OfficeTextBuilder`
+    /// counts a cell's list items the same way it already counts the body's, so nothing extra is
+    /// threaded through here for numbering to "continue" — there is no reader-level counter to share.
+    ///
+    /// A nested `<table:table>` is still FLATTENED to a single `.paragraph` of spans
+    /// (`flattenNestedTable`/`collectCellSpans`, unchanged), never a real nested `.table` block — the
+    /// same depth-1 shortcut the body's own top-level table already uses, and this sprint's brief is
+    /// explicit that it must not change. An empty paragraph is filtered with the SAME
+    /// `isEmptyTextBlock` check above: a truly empty cell must produce no block at all, never a
+    /// phantom `.paragraph(spans: [])` standing in for "nothing here".
+    private static func collectCellBlocks(
+        _ cell: XMLNode, listStyles: [String: [Int: Bool]], textStyles: [String: TextStyle],
+        paragraphOutlineLevels: [String: Int], archive: ZipArchive, notes: NoteCollector
+    ) -> [OfficeBlock] {
+        var blocks: [OfficeBlock] = []
+        for child in cell.children {
+            switch child.name {
+            case "text:h":
+                let rawLevel = Int(child.attributes["text:outline-level"] ?? "") ?? 1
+                let level = min(max(rawLevel, 1), 6)
+                blocks.append(contentsOf: paragraphLikeBlocks(
+                    child, make: { .heading(level: level, spans: $0) }, textStyles: textStyles, archive: archive,
+                    notes: notes))
+            case "text:p":
+                if let styleName = child.attributes["text:style-name"], let rawLevel = paragraphOutlineLevels[styleName] {
+                    let level = min(max(rawLevel, 1), 6)
+                    blocks.append(contentsOf: paragraphLikeBlocks(
+                        child, make: { .heading(level: level, spans: $0) }, textStyles: textStyles, archive: archive,
+                        notes: notes))
+                } else {
+                    blocks.append(contentsOf: paragraphLikeBlocks(
+                        child, make: { .paragraph(spans: $0) }, textStyles: textStyles, archive: archive, notes: notes))
+                }
+            case "text:list":
+                blocks.append(contentsOf: parseList(
+                    child, level: 0, inheritedStyleName: nil, listStyles: listStyles, textStyles: textStyles,
+                    archive: archive, notes: notes))
+            case "table:table":
+                let spans = flattenNestedTable(child, textStyles: textStyles, notes: notes)
+                if !spans.isEmpty { blocks.append(.paragraph(spans: spans)) }
+            default:
+                continue
+            }
+        }
+        return blocks.filter { !isEmptyTextBlock($0) }
+    }
+
+    /// A cell's content as plain spans, no block structure — used ONLY by `flattenNestedTable`,
+    /// which deliberately squashes a nested table's grid down to text (`Cell` has no room for a
+    /// second, real nested `.table` block). `collectCellBlocks` above is what a table's OWN cells
+    /// go through now; this stays exactly as it was for the flatten-only path.
     private static func collectCellSpans(_ cell: XMLNode, textStyles: [String: TextStyle], notes: NoteCollector) -> [Span] {
         var spans: [Span] = []
         for child in cell.children {

@@ -632,7 +632,9 @@ final class DocxReaderTests: XCTestCase {
         """)
         XCTAssertEqual(blocks, [.table(rows: [
             [Cell(spans: [Span(text: "H1")]), Cell(spans: [Span(text: "H2")])],
-            [Cell(spans: [Span(text: "A1")]), Cell(spans: [])],
+            // A cell whose only content is Word's own placeholder `<w:p></w:p>` is truly empty —
+            // `Cell(blocks: [])`, no phantom `.paragraph(spans: [])` (see `collectCellBlocks`).
+            [Cell(spans: [Span(text: "A1")]), Cell(blocks: [])],
         ], headerRows: 1)])
     }
 
@@ -786,6 +788,110 @@ final class DocxReaderTests: XCTestCase {
         <w:tbl><w:tr>\(tc("<w:sdt><w:sdtPr/><w:sdtContent>\(para("Filled in"))</w:sdtContent></w:sdt>"))</w:tr></w:tbl>
         """)
         XCTAssertEqual(blocks, [.table(rows: [[Cell(spans: [Span(text: "Filled in")])]], headerRows: 0)])
+    }
+
+    // MARK: S8 — images, lists (and their combination) inside table cells (gap-list rows 6/7)
+
+    /// `%1.` decimal at level 0 only — a simpler numbering def than `clauseNumbering`, used where a
+    /// test only needs one level of real ordered-marker text.
+    private let flatDecimalNumbering = """
+    <w:numbering>
+      <w:abstractNum w:abstractNumId="3">
+        <w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl>
+      </w:abstractNum>
+      <w:num w:numId="7"><w:abstractNumId w:val="3"/></w:num>
+    </w:numbering>
+    """
+
+    private let bulletNumbering = """
+    <w:numbering>
+      <w:abstractNum w:abstractNumId="4">
+        <w:lvl w:ilvl="0"><w:numFmt w:val="bullet"/><w:lvlText w:val="\u{f0b7}"/></w:lvl>
+      </w:abstractNum>
+      <w:num w:numId="8"><w:abstractNumId w:val="4"/></w:num>
+    </w:numbering>
+    """
+
+    func testImageInsideTableCellProducesAnImageBlockWithReservedSize() throws {
+        let zip = buildDocx(
+            document: doc("<w:tbl><w:tr>\(tc("<w:p><w:r>\(drawing(cx: 914_400, cy: 457_200, embed: "rId1"))</w:r></w:p>"))</w:tr></w:tbl>"),
+            rels: rels([(id: "rId1", target: "media/image1.png", external: false)]))
+        let blocks = try DocxReader.read(try ZipArchive(data: zip))
+        XCTAssertEqual(blocks, [.table(rows: [
+            [Cell(blocks: [.image(id: "word/media/image1.png", size: CGSize(width: 72, height: 36))])],
+        ], headerRows: 0)])
+    }
+
+    /// A cell's numbered list must continue the DOCUMENT's own numbering, not restart at 1 — a
+    /// numId's counters are document-scoped in Word, which continues them across an intervening
+    /// table exactly as it does across an ordinary paragraph. Item before the table is "1.", the
+    /// cell's own item is "2.", the item after the table is "3." — a restart would show "1." twice.
+    func testNumberedListInsideTableCellContinuesTheDocumentsNumbering() throws {
+        let document = """
+        \(numberedItem("7", 0, "Before"))
+        <w:tbl><w:tr>\(tc(numberedItem("7", 0, "In cell")))</w:tr></w:tbl>
+        \(numberedItem("7", 0, "After"))
+        """
+        let blocks = try read(document: document, numbering: flatDecimalNumbering)
+        XCTAssertEqual(blocks, [
+            .listItem(level: 0, ordered: true, spans: [Span(text: "Before")], marker: "1."),
+            .table(rows: [
+                [Cell(blocks: [.listItem(level: 0, ordered: true, spans: [Span(text: "In cell")], marker: "2.")])],
+            ], headerRows: 0),
+            .listItem(level: 0, ordered: true, spans: [Span(text: "After")], marker: "3."),
+        ])
+    }
+
+    func testBulletedListInsideTableCellKeepsBullets() throws {
+        let document = "<w:tbl><w:tr>\(tc(numberedItem("8", 0, "Bullet item")))</w:tr></w:tbl>"
+        let blocks = try read(document: document, numbering: bulletNumbering)
+        XCTAssertEqual(blocks, [.table(rows: [
+            [Cell(blocks: [.listItem(level: 0, ordered: false, spans: [Span(text: "Bullet item")])])],
+        ], headerRows: 0)])
+    }
+
+    /// Text, then a numbered list item, then an image, all inside ONE cell — must keep all three, in
+    /// the order the source wrote them, exactly like a paragraph carrying its own trailing picture
+    /// does at the body level (`parseParagraph`'s doc comment).
+    func testMixedContentInTableCellKeepsTextListAndImageInSourceOrder() throws {
+        let cellXML = para("Intro") + numberedItem("7", 0, "Listed")
+            + "<w:p><w:r>\(drawing(cx: 914_400, cy: 914_400, embed: "rId1"))</w:r></w:p>"
+        let zip = buildDocx(
+            document: doc("<w:tbl><w:tr>\(tc(cellXML))</w:tr></w:tbl>"), numbering: flatDecimalNumbering,
+            rels: rels([(id: "rId1", target: "media/image1.png", external: false)]))
+        let blocks = try DocxReader.read(try ZipArchive(data: zip))
+        XCTAssertEqual(blocks, [.table(rows: [
+            [Cell(blocks: [
+                .paragraph(spans: [Span(text: "Intro")]),
+                .listItem(level: 0, ordered: true, spans: [Span(text: "Listed")], marker: "1."),
+                .image(id: "word/media/image1.png", size: CGSize(width: 72, height: 72)),
+            ])],
+        ], headerRows: 0)])
+    }
+
+    /// The vertical-merge continuation rule (invariant: a `continue` cell's content is DISCARDED,
+    /// never rendered) must hold even when that discarded content is an image, not text — a naive
+    /// fix that only special-cased spans could resurrect a picture from a stale merge remnant.
+    func testMergeContinuationCellWithAnImageStillContributesNothing() throws {
+        let document = """
+        <w:tbl>
+          <w:tr>\(tc("<w:tcPr><w:vMerge w:val=\"restart\"/></w:tcPr>\(para("Top"))"))</w:tr>
+          <w:tr>\(tc("<w:tcPr><w:vMerge/></w:tcPr><w:p><w:r>\(drawing(cx: 914_400, cy: 914_400, embed: "rId1"))</w:r></w:p>"))</w:tr>
+        </w:tbl>
+        """
+        let zip = buildDocx(document: doc(document), rels: rels([(id: "rId1", target: "media/image1.png", external: false)]))
+        let blocks = try DocxReader.read(try ZipArchive(data: zip))
+        XCTAssertEqual(blocks, [.table(rows: [
+            [Cell(spans: [Span(text: "Top")], rowSpan: 2)],
+            [],
+        ], headerRows: 0)])
+    }
+
+    /// A cell whose only content is Word's own placeholder `<w:p></w:p>` must produce no block at
+    /// all — `Cell(blocks: [])`, never a phantom `.paragraph(spans: [])`.
+    func testEmptyCellProducesNoPhantomBlock() throws {
+        let blocks = try read(document: "<w:tbl><w:tr>\(tc("<w:p></w:p>"))</w:tr></w:tbl>")
+        XCTAssertEqual(blocks, [.table(rows: [[Cell(blocks: [])]], headerRows: 0)])
     }
 
     /// A `<w:tbl>` nested directly inside a `<w:tc>` — `Cell` has no case for a nested `.table`

@@ -125,6 +125,41 @@ final class OfficeDocumentTests: XCTestCase {
         return buildZip([("word/document.xml", Data(document.utf8))])
     }
 
+    /// S8 invariant 29: an image inside a table cell (gap-list row 6) must reach `doc.officeBlocks`
+    /// through the SAME real dispatch table `fixtureDocxWithTable()` above already proves for plain
+    /// cell text — not only through `DocxReaderTests`, which calls `DocxReader.read` directly.
+    private func fixtureDocxWithTableImage() -> Data {
+        let document = """
+        <?xml version="1.0" encoding="UTF-8"?><w:document><w:body>
+          <w:tbl><w:tr><w:tc><w:p><w:r>
+            <w:drawing><wp:inline><wp:extent cx="914400" cy="914400"/>
+              <a:graphic><a:graphicData><pic:pic><pic:blipFill><a:blip r:embed="rId1"/></pic:blipFill></pic:pic></a:graphicData></a:graphic>
+            </wp:inline></w:drawing>
+          </w:r></w:p></w:tc></w:tr></w:tbl>
+        </w:body></w:document>
+        """
+        let rels = "<Relationships xmlns=\"x\"><Relationship Id=\"rId1\" Type=\"x\" Target=\"media/image1.png\"/></Relationships>"
+        return buildZip([
+            ("word/document.xml", Data(document.utf8)),
+            ("word/_rels/document.xml.rels", Data(rels.utf8)),
+        ])
+    }
+
+    private func fixtureOdtWithTableImage() -> Data {
+        let content = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <office:document-content>
+          <office:body><office:text>
+            <table:table><table:table-row><table:table-cell>
+              <text:p><draw:frame svg:width="72pt" svg:height="72pt">
+              <draw:image xlink:href="Pictures/photo.png"/></draw:frame></text:p>
+            </table:table-cell></table:table-row></table:table>
+          </office:text></office:body>
+        </office:document-content>
+        """
+        return buildZip([("content.xml", Data(content.utf8)), ("Pictures/photo.png", Data([0x01]))])
+    }
+
     /// Opens a fixture office document through the real document/window pipeline, mirroring how
     /// `SpliceRenderTests.open` drives markdown/plain-text. `ext`/`uti` select which office format
     /// the fixture pretends to be, exactly the two pieces of information `MarkdownDocument` itself
@@ -184,6 +219,25 @@ final class OfficeDocumentTests: XCTestCase {
         let (_, wc) = try openOffice(fixtureDocxWithTable())
         let storage = try XCTUnwrap(wc.textStorageRef)
         XCTAssertTrue(storage.string.contains("Cell A"))
+    }
+
+    /// S8 invariant 29 (docx): an image inside a table cell must reach `doc.officeBlocks` through
+    /// `MarkdownDocument.read` itself, not only `DocxReader.read` called directly.
+    func testTableCellImageReachesOfficeBlocksThroughTheFullReadPathDocx() throws {
+        let (doc, _) = try openOffice(fixtureDocxWithTableImage())
+        guard case .table(let rows, _) = doc.officeBlocks.first else { return XCTFail("expected a table block") }
+        let cellBlocks = rows.first?.first?.blocks ?? []
+        XCTAssertTrue(cellBlocks.contains { if case .image = $0 { return true }; return false },
+                      "the cell's image must survive the full read path, not just DocxReader.read directly")
+    }
+
+    /// S8 invariant 29 (odt): same guard, `OdtReader` side.
+    func testTableCellImageReachesOfficeBlocksThroughTheFullReadPathOdt() throws {
+        let (doc, _) = try openOffice(fixtureOdtWithTableImage(), ext: "odt", uti: "org.oasis-open.opendocument.text")
+        guard case .table(let rows, _) = doc.officeBlocks.first else { return XCTFail("expected a table block") }
+        let cellBlocks = rows.first?.first?.blocks ?? []
+        XCTAssertTrue(cellBlocks.contains { if case .image = $0 { return true }; return false },
+                      "the cell's image must survive the full read path, not just OdtReader.read directly")
     }
 
     func testMalformedArchiveThrowsRatherThanProducingAnEmptyDocument() {
