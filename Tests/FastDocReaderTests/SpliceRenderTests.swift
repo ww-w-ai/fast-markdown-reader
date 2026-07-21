@@ -1,6 +1,6 @@
 import XCTest
 import AppKit
-@testable import FastMDReader
+@testable import FastDocReader
 
 /// A spliced re-render must be INDISTINGUISHABLE from re-rendering the whole document. If the two
 /// ever differ, the screen quietly stops matching the file — the worst kind of bug in a reader,

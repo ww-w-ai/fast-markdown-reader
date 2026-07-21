@@ -1,5 +1,5 @@
 import XCTest
-@testable import FastMDReader
+@testable import FastDocReader
 
 /// The files a reader gets handed come from Windows and Linux too. Each case here is a file shape
 /// that used to arrive as a wall of replacement characters, plus the round-trip that keeps an edit

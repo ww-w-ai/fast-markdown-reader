@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build a distributable FastMDReader.app: release build -> Developer ID signature with
+# Build a distributable FastDocReader.app: release build -> Developer ID signature with
 # hardened runtime -> Apple notarization -> stapled ticket -> Gatekeeper verification.
 # The output runs on any arm64 Mac without a quarantine prompt.
 #
@@ -20,8 +20,8 @@ KEYCHAIN_DIR="${KEYCHAIN_DIR:-$HOME/Documents/DEV/ww-w-ai/.keychains}"
 : "${IDENTITY:?set IDENTITY (e.g. 'Developer ID Application: <Team> (<TEAMID>)') — see docs/NOTARIZATION.md}"
 : "${NOTARY_PROFILE:?set NOTARY_PROFILE (notarytool keychain profile name)}"
 PROFILE="$NOTARY_PROFILE"
-APP="FastMDReader.app"
-ZIP="FastMDReader.zip"
+APP="FastDocReader.app"
+ZIP="FastDocReader.zip"
 
 echo "==> Building release"
 # DIST_IDENTITY keeps the real bundle identifier: a local build otherwise gets a .dev suffix so it
@@ -30,7 +30,7 @@ DIST_IDENTITY=1 ./Scripts/make-app.sh release
 
 # Verify it rather than trust the flag — shipping a .dev identifier would be a broken update for
 # every existing user, and the symptom (their app "forgetting" everything) appears only after install.
-BUILT_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' FastMDReader.app/Contents/Info.plist)"
+BUILT_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' FastDocReader.app/Contents/Info.plist)"
 if [[ "$BUILT_ID" == *.dev ]]; then
   echo "REFUSING TO SHIP: bundle identifier is $BUILT_ID — DIST_IDENTITY did not take effect." >&2
   exit 1

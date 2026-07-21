@@ -1,5 +1,5 @@
 import XCTest
-@testable import FastMDReader
+@testable import FastDocReader
 
 /// `OdtReader` is pure: build an `.odt`-shaped ZIP by hand (stored entries only), hand it to
 /// `ZipArchive`, then `OdtReader.read`, and assert on the `[OfficeBlock]` that comes back. Same

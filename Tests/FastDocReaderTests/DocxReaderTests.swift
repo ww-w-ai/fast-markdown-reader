@@ -1,5 +1,5 @@
 import XCTest
-@testable import FastMDReader
+@testable import FastDocReader
 
 /// `DocxReader` is pure: build a `.docx`-shaped ZIP by hand (stored entries only — no need to
 /// deflate to exercise the reader), hand it to `ZipArchive`, then `DocxReader.read`, and assert

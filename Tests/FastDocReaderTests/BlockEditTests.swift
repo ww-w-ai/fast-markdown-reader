@@ -1,5 +1,5 @@
 import XCTest
-@testable import FastMDReader
+@testable import FastDocReader
 
 /// BlockEdit is pure source arithmetic, so it can be tested without a window: build the spans by
 /// hand, apply the returned (range, replacement), and assert on the resulting FILE text — which is

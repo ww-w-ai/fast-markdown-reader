@@ -1,6 +1,6 @@
 import XCTest
 import AppKit
-@testable import FastMDReader
+@testable import FastDocReader
 
 /// End-to-end latency of ONE block edit, driven through the real document + window controller
 /// rather than the pure-Swift pieces — the earlier breakdown measured render and layout in

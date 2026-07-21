@@ -1,6 +1,6 @@
 import XCTest
 import AppKit
-@testable import FastMDReader
+@testable import FastDocReader
 
 /// S5 (office image pixels): `OfficeTextBuilder` reserves the exact area at BUILD time (proven in
 /// `OfficeTextBuilderTests`); this file is about the LOAD side — `MarkdownDocument.reconcileMedia`

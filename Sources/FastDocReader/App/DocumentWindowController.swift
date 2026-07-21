@@ -86,6 +86,8 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         contentVC.view = scrollView
         splitVC.addSplitViewItem(sidebarItem)
         splitVC.addSplitViewItem(NSSplitViewItem(viewController: contentVC))
+        // Old name kept on purpose after the rename — a defaults key for the remembered sidebar
+        // width, not a visible identifier. See the matching note on the window frame autosave.
         splitVC.splitView.autosaveName = "FastMDReaderSidebar"
         outline.onSelect = { [weak self] charIndex in self?.goToOutlineEntry(charIndex) }
         window.contentViewController = splitVC

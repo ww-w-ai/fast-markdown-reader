@@ -1,5 +1,5 @@
 import XCTest
-@testable import FastMDReader
+@testable import FastDocReader
 
 final class SmokeTests: XCTestCase {
     func testAppTargetLinks() {

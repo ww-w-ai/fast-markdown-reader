@@ -1,6 +1,6 @@
 import XCTest
 import AppKit
-@testable import FastMDReader
+@testable import FastDocReader
 
 /// Splicing only the edited part into the screen rests on ONE assumption: rendering a block's
 /// source by itself produces the same thing as that block's slice of a full render. If it doesn't,

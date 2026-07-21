@@ -32,6 +32,24 @@ enum DocumentTypes {
         return .plainText
     }
 
+    /// The ONE place that decides which parser owns which office extension. `MarkdownDocument`'s
+    /// `read(from:)` and `reloadDocument` both call this rather than hard-coding a reader —
+    /// hard-coding `DocxReader` at each call site is exactly how `.odt` shipped unreachable: it was
+    /// registered here and in Info.plist (making the file reachable to the APP), but every read
+    /// path still said `DocxReader.read` unconditionally (nothing made the bytes reachable to
+    /// `OdtReader`). An extension that's in `officeExtensions` but has no case below is a
+    /// programmer error, not a malformed file — it throws rather than silently guessing Word.
+    static func readOffice(_ archive: ZipArchive, extension ext: String) throws -> [OfficeBlock] {
+        switch ext.lowercased() {
+        case "docx": return try DocxReader.read(archive)
+        case "odt": return try OdtReader.read(archive)
+        default:
+            throw NSError(domain: "ai.ww-w.fast-md-reader", code: 3, userInfo: [
+                NSLocalizedDescriptionKey: "\".\(ext)\" is registered as an office format but has no reader.",
+            ])
+        }
+    }
+
     /// Content types for the Open panel's filter.
     static var openPanelTypes: [UTType] {
         var types: [UTType] = []

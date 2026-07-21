@@ -1,5 +1,5 @@
 import XCTest
-@testable import FastMDReader
+@testable import FastDocReader
 
 final class FontSizeStoreTests: XCTestCase {
     override func setUp() { UserDefaults.standard.removeObject(forKey: "baseFontSize") }

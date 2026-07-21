@@ -12,11 +12,11 @@ fi
 
 CONFIG="${1:-debug}"
 swift build -c "$CONFIG"
-BIN="$(swift build -c "$CONFIG" --show-bin-path)/FastMDReader"
-APP="FastMDReader.app"
+BIN="$(swift build -c "$CONFIG" --show-bin-path)/FastDocReader"
+APP="FastDocReader.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "$BIN" "$APP/Contents/MacOS/FastMDReader"
+cp "$BIN" "$APP/Contents/MacOS/FastDocReader"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
 
 # A local build gets its OWN bundle identifier, so it cannot touch the installed app's state.
@@ -35,8 +35,8 @@ if [[ -z "${DIST_IDENTITY:-}" ]]; then
   PB=/usr/libexec/PlistBuddy
   REAL_ID="$($PB -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist")"
   $PB -c "Set :CFBundleIdentifier ${REAL_ID}.dev" "$APP/Contents/Info.plist"
-  $PB -c "Set :CFBundleName FastMD (Dev)" "$APP/Contents/Info.plist"
-  $PB -c "Set :CFBundleDisplayName Fast Markdown Reader (Dev)" "$APP/Contents/Info.plist"
+  $PB -c "Set :CFBundleName FastDoc (Dev)" "$APP/Contents/Info.plist"
+  $PB -c "Set :CFBundleDisplayName Fast Doc Reader (Dev)" "$APP/Contents/Info.plist"
   echo "    identifier: ${REAL_ID}.dev  (local build — separate from any installed release)"
 else
   echo "    identifier: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist")  (DISTRIBUTION)"
@@ -53,11 +53,11 @@ cp -R licenses "$APP/Contents/Resources/"
 # build people actually download (Scripts/notarize.sh).
 #
 # SANDBOX=1 signs with the sandbox to exercise the folder-grant path. It uses
-# FastMDReader.entitlements — the same sandbox as the store, but WITHOUT the App Store identifiers:
+# FastDocReader.entitlements — the same sandbox as the store, but WITHOUT the App Store identifiers:
 # a build carrying those refuses to launch outside the store ("Launchd job spawn failed"), so the
 # real App Store shape can only be tested by installing from the store.
 if [[ -n "${SANDBOX:-}" ]]; then
-  codesign --force --sign - --entitlements Resources/FastMDReader.entitlements "$APP"
+  codesign --force --sign - --entitlements Resources/FastDocReader.entitlements "$APP"
   echo "Built $APP (SANDBOXED — local sandbox test shape)"
 else
   codesign --force --sign - "$APP"

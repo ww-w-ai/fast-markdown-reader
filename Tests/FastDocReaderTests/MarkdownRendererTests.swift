@@ -1,6 +1,6 @@
 import XCTest
 import AppKit
-@testable import FastMDReader
+@testable import FastDocReader
 
 final class MarkdownRendererTests: XCTestCase {
     private func render(_ md: String) -> NSAttributedString {

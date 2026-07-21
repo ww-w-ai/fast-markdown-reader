@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleDisplayName</key>
-	<string>Fast Markdown Reader</string>
+	<string>Fast Doc Reader</string>
 	<key>CFBundleDocumentTypes</key>
 	<array>
 		<dict>
@@ -19,7 +19,7 @@
 				<string>public.markdown</string>
 			</array>
 			<key>NSDocumentClass</key>
-			<string>FastMDReader.MarkdownDocument</string>
+			<string>FastDocReader.MarkdownDocument</string>
 		</dict>
 		<dict>
 			<key>CFBundleTypeName</key>
@@ -36,7 +36,7 @@
 				<string>public.log</string>
 			</array>
 			<key>NSDocumentClass</key>
-			<string>FastMDReader.MarkdownDocument</string>
+			<string>FastDocReader.MarkdownDocument</string>
 		</dict>
 		<dict>
 			<key>CFBundleTypeName</key>
@@ -50,7 +50,7 @@
 				<string>org.openxmlformats.wordprocessingml.document</string>
 			</array>
 			<key>NSDocumentClass</key>
-			<string>FastMDReader.MarkdownDocument</string>
+			<string>FastDocReader.MarkdownDocument</string>
 		</dict>
 		<dict>
 			<key>CFBundleTypeName</key>
@@ -64,17 +64,17 @@
 				<string>org.oasis-open.opendocument.text</string>
 			</array>
 			<key>NSDocumentClass</key>
-			<string>FastMDReader.MarkdownDocument</string>
+			<string>FastDocReader.MarkdownDocument</string>
 		</dict>
 	</array>
 	<key>CFBundleExecutable</key>
-	<string>FastMDReader</string>
+	<string>FastDocReader</string>
 	<key>CFBundleIconFile</key>
 	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
 	<string>ai.ww-w.fast-md-reader</string>
 	<key>CFBundleName</key>
-	<string>Fast Markdown Reader</string>
+	<string>Fast Doc Reader</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>

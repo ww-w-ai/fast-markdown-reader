@@ -1,6 +1,6 @@
 import XCTest
 import AppKit
-@testable import FastMDReader
+@testable import FastDocReader
 
 /// Verifies the block → markdown-source mapping (MDAttr.srcRange) that block-level editing relies
 /// on: a rendered block's srcRange must point at the exact source lines of that block, so an edit

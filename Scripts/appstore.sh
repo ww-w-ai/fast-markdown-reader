@@ -27,8 +27,8 @@ KEYCHAIN_DIR="${KEYCHAIN_DIR:-$HOME/Documents/DEV/ww-w-ai/.keychains}"
 
 KEYCHAIN="${SIGNING_KEYCHAIN:-$KEYCHAIN_DIR/ww-w-signing.keychain-db}"
 PROFILE="$PROVISION_PROFILE"
-APP="FastMDReader.app"
-PKG="FastMDReader.pkg"
+APP="FastDocReader.app"
+PKG="FastDocReader.pkg"
 
 export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
 cd "$(dirname "$0")/.."
@@ -67,7 +67,7 @@ echo "==> Signing with Apple Distribution (App Store entitlements)"
 # Hardened runtime is not required for the store (the sandbox is), and --deep is deprecated —
 # the bundle is a single binary anyway.
 codesign --force --timestamp --keychain "$KEYCHAIN" \
-  --entitlements Resources/FastMDReader-mas.entitlements \
+  --entitlements Resources/FastDocReader-mas.entitlements \
   --sign "$APP_IDENTITY" "$APP"
 codesign --verify --strict --verbose=2 "$APP"
 

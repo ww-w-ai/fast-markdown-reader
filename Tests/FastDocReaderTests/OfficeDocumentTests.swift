@@ -1,11 +1,17 @@
 import XCTest
 import AppKit
-@testable import FastMDReader
+@testable import FastDocReader
 
-/// S4: the wire-up from `.docx` bytes to an open, read-only window. `DocxReader`/`ZipArchive`/
-/// `OfficeTextBuilder` are already proven pure elsewhere (`DocxReaderTests`, `ZipArchiveTests`) —
-/// this file is about `MarkdownDocument`/`DocumentTypes` routing them correctly and the edit
-/// surface staying shut, the same shape `SpliceRenderTests` uses to drive a document directly.
+/// S4: the wire-up from office bytes (`.docx`, `.odt`) to an open, read-only window.
+/// `DocxReader`/`OdtReader`/`ZipArchive`/`OfficeTextBuilder` are already proven pure elsewhere
+/// (`DocxReaderTests`, `OdtReaderTests`, `ZipArchiveTests`) — this file is about
+/// `MarkdownDocument`/`DocumentTypes` routing them correctly and the edit surface staying shut,
+/// the same shape `SpliceRenderTests` uses to drive a document directly. `DocumentTypes.readOffice`
+/// is the seam this file exists to guard: `.odt` once shipped registered (reachable to the app,
+/// `DocumentTypes.kind`/Info.plist both correct) but unreachable to its own parser, because every
+/// call site still hard-coded `DocxReader.read` — a bug every `OdtReaderTests` case, which calls
+/// `OdtReader.read` directly, was structurally unable to catch. These tests go through
+/// `MarkdownDocument.read(from:ofType:)` itself for that reason.
 final class OfficeDocumentTests: XCTestCase {
     // MARK: Fixture construction — a real (stored-only) ZIP, built in memory (same shape as
     // `DocxReaderTests`, duplicated here so this file stays a self-contained unit).
@@ -89,12 +95,32 @@ final class OfficeDocumentTests: XCTestCase {
         ])
     }
 
-    /// Opens a fixture `.docx` through the real document/window pipeline, mirroring how
-    /// `SpliceRenderTests.open` drives markdown/plain-text.
-    private func openOffice(_ data: Data) throws -> (MarkdownDocument, DocumentWindowController) {
+    /// A minimal real `.odt` body — a heading and a paragraph, enough to prove `OdtReader` (not
+    /// `DocxReader`) parsed it: feeding this `content.xml` to `DocxReader` (which looks for
+    /// `word/document.xml`'s `w:document`/`w:body`) finds nothing and throws, so a dispatch bug
+    /// that routes `.odt` through `DocxReader` fails this fixture rather than silently mis-parsing it.
+    private func fixtureOdt() -> Data {
+        let content = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <office:document-content>
+          <office:body><office:text>
+            <text:h text:outline-level="1">ODT Title</text:h>
+            <text:p>ODT body text.</text:p>
+          </office:text></office:body>
+        </office:document-content>
+        """
+        return buildZip([("content.xml", Data(content.utf8))])
+    }
+
+    /// Opens a fixture office document through the real document/window pipeline, mirroring how
+    /// `SpliceRenderTests.open` drives markdown/plain-text. `ext`/`uti` select which office format
+    /// the fixture pretends to be, exactly the two pieces of information `MarkdownDocument` itself
+    /// has to work with (a file extension on disk, a UTI from the system) — using `docx` for both
+    /// wherever the extension didn't matter for a given test would silently exercise only one path.
+    private func openOffice(_ data: Data, ext: String = "docx", uti: String = "org.openxmlformats.wordprocessingml.document") throws -> (MarkdownDocument, DocumentWindowController) {
         let doc = MarkdownDocument()
-        doc.fileURL = URL(fileURLWithPath: "/tmp/fmd-office-fixture-\(UUID().uuidString).docx")
-        try doc.read(from: data, ofType: "org.openxmlformats.wordprocessingml.document")
+        doc.fileURL = URL(fileURLWithPath: "/tmp/fmd-office-fixture-\(UUID().uuidString).\(ext)")
+        try doc.read(from: data, ofType: uti)
         doc.makeWindowControllers()
         let wc = try XCTUnwrap(doc.windowControllers.first as? DocumentWindowController)
         wc.window?.setFrame(NSRect(x: 0, y: 0, width: 800, height: 600), display: false)
@@ -142,6 +168,40 @@ final class OfficeDocumentTests: XCTestCase {
         doc.fileURL = URL(fileURLWithPath: "/tmp/fmd-office-garbage.docx")
         XCTAssertThrowsError(try doc.read(from: Data([0x00, 0x01, 0x02, 0x03]),
                                           ofType: "org.openxmlformats.wordprocessingml.document"))
+    }
+
+    // MARK: `.odt` reaches its OWN reader through the real document/window pipeline — the
+    // regression this file exists for. Before this fix, `read(from:)` and `reloadDocument` both
+    // hard-coded `DocxReader.read`, so `.odt` was registered (reachable to the app) but never
+    // reachable to `OdtReader` — every `OdtReaderTests` case, calling `OdtReader.read` directly,
+    // was green throughout and proved nothing about this seam.
+
+    func testReadingOdtFixtureThroughMarkdownDocumentGoesThroughOdtReaderNotDocxReader() throws {
+        let (doc, wc) = try openOffice(fixtureOdt(), ext: "odt", uti: "org.oasis-open.opendocument.text")
+        XCTAssertEqual(doc.kind, .office)
+        let storage = try XCTUnwrap(wc.textStorageRef)
+        XCTAssertTrue(storage.string.contains("ODT Title"))
+        XCTAssertTrue(storage.string.contains("ODT body text."))
+        XCTAssertEqual(headingLevels(storage), [1])
+    }
+
+    func testMalformedOdtArchiveThrowsRatherThanFallingBackToDocxParsing() {
+        let doc = MarkdownDocument()
+        doc.fileURL = URL(fileURLWithPath: "/tmp/fmd-office-garbage.odt")
+        XCTAssertThrowsError(try doc.read(from: Data([0x00, 0x01, 0x02, 0x03]),
+                                          ofType: "org.oasis-open.opendocument.text"))
+    }
+
+    /// The dispatch table itself, one level below the full document pipeline: each registered
+    /// office extension must reach its OWN parser, and an extension with no registered parser must
+    /// throw rather than silently falling through to `DocxReader` (the exact shape of bug this
+    /// whole file guards against, isolated to the one function responsible for the routing).
+    func testDocumentTypesReadOfficeRoutesEachExtensionToItsOwnReaderAndRejectsUnhandledOnes() throws {
+        let docxBlocks = try DocumentTypes.readOffice(try ZipArchive(data: fixtureDocx()), extension: "docx")
+        XCTAssertFalse(docxBlocks.isEmpty)
+        let odtBlocks = try DocumentTypes.readOffice(try ZipArchive(data: fixtureOdt()), extension: "odt")
+        XCTAssertFalse(odtBlocks.isEmpty)
+        XCTAssertThrowsError(try DocumentTypes.readOffice(try ZipArchive(data: fixtureDocx()), extension: "rtf"))
     }
 
     // MARK: Re-render, not a cached string

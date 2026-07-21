@@ -1,6 +1,6 @@
 import XCTest
 import AppKit
-@testable import FastMDReader
+@testable import FastDocReader
 
 /// The whole point of this viewer is staying light and opening long documents fast.
 /// These guard that the pure render path scales and stays correct at size.

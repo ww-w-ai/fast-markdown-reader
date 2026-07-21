@@ -1,6 +1,6 @@
 import XCTest
 import Compression
-@testable import FastMDReader
+@testable import FastDocReader
 
 /// `ZipArchive` is pure: build the container's bytes by hand, hand them to it, and assert on what
 /// comes back — no fixture files on disk, no window, no document (same shape as `BlockEditTests`).

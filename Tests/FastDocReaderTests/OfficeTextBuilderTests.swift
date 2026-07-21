@@ -1,6 +1,6 @@
 import XCTest
 import AppKit
-@testable import FastMDReader
+@testable import FastDocReader
 
 final class OfficeTextBuilderTests: XCTestCase {
     private let theme = RenderTheme.current(size: 16)

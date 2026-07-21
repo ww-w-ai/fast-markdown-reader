@@ -408,8 +408,8 @@ COPY . .
 RUN swift build -c release   # comment
 
 FROM debian:bookworm-slim
-COPY --from=build /src/.build/release/FastMDReader /usr/local/bin/
-ENTRYPOINT ["FastMDReader"]
+COPY --from=build /src/.build/release/FastDocReader /usr/local/bin/
+ENTRYPOINT ["FastDocReader"]
 ```
 
 ### Makefile

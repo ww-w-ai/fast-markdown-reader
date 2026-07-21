@@ -84,7 +84,8 @@ final class MarkdownDocument: NSDocument {
             return
         }
         let archive = try ZipArchive(data: data)
-        setOfficeContent(blocks: try DocxReader.read(archive), archive: archive)
+        let ext = fileURL?.pathExtension ?? untitledExtension ?? ""
+        setOfficeContent(blocks: try DocumentTypes.readOffice(archive, extension: ext), archive: archive)
     }
 
     /// The office-document seam `read(from:)` and `reloadDocument` both go through: the parser's
@@ -102,6 +103,10 @@ final class MarkdownDocument: NSDocument {
     override func makeWindowControllers() {
         let wc = DocumentWindowController()
         addWindowController(wc)
+        // Deliberately still the OLD name after the FastDocReader rename: this string is a
+        // defaults KEY holding the user's saved window frame, not an identifier anyone sees.
+        // Renaming it orphans every existing user's remembered window size and position for no
+        // gain — the same reasoning that keeps the bundle identifier `ai.ww-w.fast-md-reader`.
         wc.window?.setFrameAutosaveName("FastMDReaderDoc")
         // Record the file in Open Recent. Auto-recording wasn't firing for our open paths, so note
         // it explicitly (idempotent — the controller de-dupes).
@@ -131,7 +136,8 @@ final class MarkdownDocument: NSDocument {
                 // Re-parse the archive, same as the initial read — never through the text-decode
                 // path (invariant: an office document's bytes are never handed to
                 // `TextEncodingDetector`).
-                if let archive = try? ZipArchive(data: data), let blocks = try? DocxReader.read(archive) {
+                let ext = fileURL?.pathExtension ?? untitledExtension ?? ""
+                if let archive = try? ZipArchive(data: data), let blocks = try? DocumentTypes.readOffice(archive, extension: ext) {
                     setOfficeContent(blocks: blocks, archive: archive)
                 }
             } else {
