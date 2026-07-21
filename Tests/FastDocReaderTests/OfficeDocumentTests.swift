@@ -355,6 +355,39 @@ final class OfficeDocumentTests: XCTestCase {
         _ = (try XCTUnwrap(docxWc.textStorageRef), try XCTUnwrap(odtWc.textStorageRef))
     }
 
+    // MARK: S5 — clause numbering, INVARIANT 29 (through `MarkdownDocument`, not `DocxReader` directly)
+
+    /// `w:lvlText="%1.%2"` with level 1 decimal / level 2 lowerLetter — the exact "1.a" shape a
+    /// real multi-level clause list uses. Read through `MarkdownDocument.read(from:ofType:)`, the
+    /// application's own path (INVARIANT 29: a unit test on `DocxReader` alone cannot prove this is
+    /// REACHED by the app), and asserted on the rendered text a reader actually sees on screen.
+    private let clauseNumbering = """
+    <?xml version="1.0" encoding="UTF-8"?><w:numbering>
+      <w:abstractNum w:abstractNumId="9">
+        <w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl>
+        <w:lvl w:ilvl="1"><w:numFmt w:val="lowerLetter"/><w:lvlText w:val="%1.%2"/></w:lvl>
+      </w:abstractNum>
+      <w:num w:numId="9"><w:abstractNumId w:val="9"/></w:num>
+    </w:numbering>
+    """
+
+    func testClauseNumberingRendersThroughMarkdownDocument() throws {
+        let document = """
+        <?xml version="1.0" encoding="UTF-8"?><w:document><w:body>
+          <w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="9"/></w:numPr></w:pPr><w:r><w:t>First clause.</w:t></w:r></w:p>
+          <w:p><w:pPr><w:numPr><w:ilvl w:val="1"/><w:numId w:val="9"/></w:numPr></w:pPr><w:r><w:t>Sub-clause.</w:t></w:r></w:p>
+        </w:body></w:document>
+        """
+        let zip = buildZip([
+            ("word/document.xml", Data(document.utf8)),
+            ("word/numbering.xml", Data(clauseNumbering.utf8)),
+        ])
+        let (_, wc) = try openOffice(zip)
+        let storage = try XCTUnwrap(wc.textStorageRef)
+        XCTAssertTrue(storage.string.contains("1.\tFirst clause."))
+        XCTAssertTrue(storage.string.contains("1.a\tSub-clause."))
+    }
+
     func testOfficeExtensionsAgreeWithInfoPlistDocumentTypes() throws {
         let repoRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()

@@ -842,7 +842,7 @@ final class OdtReaderTests: XCTestCase {
         let blocks = try DocumentTypes.readOffice(archive, extension: "odt")
         let allText = blocks.flatMap { block -> [String] in
             switch block {
-            case .paragraph(let spans), .heading(_, let spans), .listItem(_, _, let spans): return spans.map(\.text)
+            case .paragraph(let spans), .heading(_, let spans), .listItem(_, _, let spans, _): return spans.map(\.text)
             case .table, .image: return []
             }
         }.joined()

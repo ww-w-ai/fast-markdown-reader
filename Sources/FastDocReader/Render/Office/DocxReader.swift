@@ -49,13 +49,20 @@ enum DocxReader {
         // would display.
         let (footnoteNumberById, endnoteNumberById, citationOrder) = numberNoteReferences(in: body)
         let notes = NoteNumbering(footnote: footnoteNumberById, endnote: endnoteNumberById)
+        // ONE numbering-counter state for the whole read() call — body, then footnotes, then
+        // endnotes, all walked from here in that order — because a numId's counters belong to the
+        // numId, not to which of those three regions a paragraph happens to sit in (see
+        // `ListNumberingState`).
+        let listState = ListNumberingState()
         let bodyBlocks = parseBody(
-            body, styleInfo: styleInfo, numbering: numbering, relationships: relationships, notes: notes)
+            body, styleInfo: styleInfo, numbering: numbering, relationships: relationships, notes: notes,
+            listState: listState)
         let footnoteBodies = parseNoteBodies(from: archive, part: "word/footnotes.xml", noteElementName: "w:footnote")
         let endnoteBodies = parseNoteBodies(from: archive, part: "word/endnotes.xml", noteElementName: "w:endnote")
         let noteBlocks = collectNoteBlocks(
             citationOrder: citationOrder, footnoteBodies: footnoteBodies, endnoteBodies: endnoteBodies,
-            styleInfo: styleInfo, numbering: numbering, relationships: relationships, notes: notes)
+            styleInfo: styleInfo, numbering: numbering, relationships: relationships, notes: notes,
+            listState: listState)
         return bodyBlocks + noteBlocks
     }
 
@@ -142,7 +149,7 @@ enum DocxReader {
     private static func collectNoteBlocks(
         citationOrder: [(kind: NoteKind, id: String, number: Int)], footnoteBodies: [String: XMLNode],
         endnoteBodies: [String: XMLNode], styleInfo: StyleInfo, numbering: NumberingInfo,
-        relationships: Relationships, notes: NoteNumbering
+        relationships: Relationships, notes: NoteNumbering, listState: ListNumberingState
     ) -> [OfficeBlock] {
         citationOrder.flatMap { entry -> [OfficeBlock] in
             let noteElement = entry.kind == .footnote ? footnoteBodies[entry.id] : endnoteBodies[entry.id]
@@ -150,7 +157,7 @@ enum DocxReader {
             var blocks = noteElement.children.flatMap {
                 parseBodyChild(
                     $0, styleInfo: styleInfo, numbering: numbering, relationships: relationships,
-                    notes: notes)
+                    notes: notes, listState: listState)
             }
             // Never fabricated — this is the SAME marker text emitted at the citation point
             // (`collectSpans`'s `w:footnoteReference`/`w:endnoteReference` case), so a reader can
@@ -174,7 +181,8 @@ enum DocxReader {
         switch block {
         case .paragraph(let spans): return .paragraph(spans: [marker] + spans)
         case .heading(let level, let spans): return .heading(level: level, spans: [marker] + spans)
-        case .listItem(let level, let ordered, let spans): return .listItem(level: level, ordered: ordered, spans: [marker] + spans)
+        case .listItem(let level, let ordered, let spans, let itemMarker):
+            return .listItem(level: level, ordered: ordered, spans: [marker] + spans, marker: itemMarker)
         case .table, .image: return nil
         }
     }
@@ -262,16 +270,44 @@ enum DocxReader {
         return min(level + 1, 6)
     }
 
-    // MARK: numbering.xml — numId → abstractNumId → level → numFmt
+    // MARK: numbering.xml — numId → abstractNumId → level → format/text/start, with per-numId overrides
+
+    /// One level's numbering definition, whether it came from `w:abstractNum` directly or replaced
+    /// wholesale by a `w:num`'s `w:lvlOverride/w:lvl` (same element shape either way — see
+    /// `parseLevel`). `lvlText` is the raw `"%1.%2."`-style pattern this level substitutes counters
+    /// into; `nil` when the source never declared one (rare, but not an error — `numberedListInfo`
+    /// falls back to `OfficeTextBuilder`'s own counting in that case, same as an unresolvable
+    /// numId). `start` defaults to 1 — Word omits `w:start` whenever a level simply starts there.
+    private struct AbstractLevel {
+        var numFmt: String
+        var lvlText: String?
+        var start: Int
+        /// Word's "legal numbering" toggle (`w:isLgl`): when set, EVERY substituted sub-level in
+        /// this level's `lvlText` displays as plain Arabic digits regardless of that sub-level's
+        /// OWN `w:numFmt` — the convention real contracts use so `1.a.i` still shows as `1.1.1`.
+        var isLgl: Bool
+    }
+
+    /// A single level's per-numId override, from `w:num/w:lvlOverride`: `startOverride` resets
+    /// where that level's counter begins (`w:startOverride`), `lvlReplacement` replaces the WHOLE
+    /// level definition for this numId only (`w:lvlOverride/w:lvl`) — Word allows either, both, or
+    /// neither on the same `w:lvlOverride` element.
+    private struct NumOverride {
+        var startOverride: Int?
+        var lvlReplacement: AbstractLevel?
+    }
 
     private struct NumberingInfo {
         var abstractNumIdByNumId: [String: String] = [:]
-        var levelFormatsByAbstractNumId: [String: [Int: String]] = [:]
+        var abstractLevelsById: [String: [Int: AbstractLevel]] = [:]
+        var numIdLevelOverrides: [String: [Int: NumOverride]] = [:]
     }
 
-    /// Read only as far as telling a bullet from a number apart — the mapping a real list needs
-    /// to be classified, not to be rendered (`OfficeTextBuilder` derives the actual "1. 2. 3."
-    /// numbers from `level` + `ordered` alone; this reader never counts list items).
+    /// Parses BOTH `w:abstractNum` (the shared level definitions) and each `w:num`'s own
+    /// `w:lvlOverride`s (a per-list exception to those shared definitions — a start value reset,
+    /// or an entirely different level) — reading only `w:numFmt` as the old version of this
+    /// function did would tell a bullet from a number apart but throws away everything
+    /// `numberedListInfo` now needs to compute the actual marker text and honour overrides.
     private static func parseNumbering(from archive: ZipArchive) -> NumberingInfo {
         guard archive.contains("word/numbering.xml"),
               let data = try? archive.data(for: "word/numbering.xml"),
@@ -282,19 +318,32 @@ enum DocxReader {
             switch child.name {
             case "w:abstractNum":
                 guard let abstractId = child.attributes["w:abstractNumId"] else { continue }
-                var levels: [Int: String] = [:]
+                var levels: [Int: AbstractLevel] = [:]
                 for lvl in child.children where lvl.name == "w:lvl" {
-                    guard let ilvlString = lvl.attributes["w:ilvl"], let ilvl = Int(ilvlString),
-                          let fmt = lvl.child("w:numFmt")?.attributes["w:val"]
-                    else { continue }
-                    levels[ilvl] = fmt
+                    guard let ilvlString = lvl.attributes["w:ilvl"], let ilvl = Int(ilvlString) else { continue }
+                    if let level = parseLevel(lvl) { levels[ilvl] = level }
                 }
-                info.levelFormatsByAbstractNumId[abstractId] = levels
+                info.abstractLevelsById[abstractId] = levels
             case "w:num":
                 guard let numId = child.attributes["w:numId"],
                       let abstractRef = child.child("w:abstractNumId")?.attributes["w:val"]
                 else { continue }
                 info.abstractNumIdByNumId[numId] = abstractRef
+                var overrides: [Int: NumOverride] = [:]
+                for lvlOverride in child.children where lvlOverride.name == "w:lvlOverride" {
+                    guard let ilvlString = lvlOverride.attributes["w:ilvl"], let ilvl = Int(ilvlString) else { continue }
+                    var override = NumOverride()
+                    if let startVal = lvlOverride.child("w:startOverride")?.attributes["w:val"], let start = Int(startVal) {
+                        override.startOverride = start
+                    }
+                    if let lvlNode = lvlOverride.child("w:lvl") {
+                        override.lvlReplacement = parseLevel(lvlNode)
+                    }
+                    if override.startOverride != nil || override.lvlReplacement != nil {
+                        overrides[ilvl] = override
+                    }
+                }
+                if !overrides.isEmpty { info.numIdLevelOverrides[numId] = overrides }
             default:
                 continue
             }
@@ -302,15 +351,176 @@ enum DocxReader {
         return info
     }
 
-    /// Unresolvable input — no `numbering.xml` in the archive, or a `numId`/level it doesn't
-    /// mention — defaults to unordered (a bullet), never ordered: an unnumbered document is a
-    /// faithful reading, a fabricated "1. 2. 3." on plain bullets is not.
-    private static func isOrdered(numId: String?, ilvl: Int, info: NumberingInfo) -> Bool {
-        guard let numId,
-              let abstractId = info.abstractNumIdByNumId[numId],
-              let fmt = info.levelFormatsByAbstractNumId[abstractId]?[ilvl]
-        else { return false }
-        return fmt != "bullet"
+    /// A level missing `w:numFmt` entirely is not returned — there is nothing to classify it by,
+    /// and the caller's existing "unresolvable" fallback (never fabricate a number) already covers
+    /// that. `w:start`'s absence means 1, not "no start" — Word only writes the element when the
+    /// level starts somewhere else.
+    private static func parseLevel(_ lvl: XMLNode) -> AbstractLevel? {
+        guard let fmt = lvl.child("w:numFmt")?.attributes["w:val"] else { return nil }
+        let lvlText = lvl.child("w:lvlText")?.attributes["w:val"]
+        let start = lvl.child("w:start")?.attributes["w:val"].flatMap(Int.init) ?? 1
+        return AbstractLevel(numFmt: fmt, lvlText: lvlText, start: start, isLgl: lvl.child("w:isLgl") != nil)
+    }
+
+    /// Resolves one `(numId, ilvl)` to its effective definition: the abstract level, with any
+    /// `w:lvlOverride` for THIS numId layered on top (a full replacement first, since Word treats
+    /// `w:lvlOverride/w:lvl` as swapping the entire level; then `w:startOverride`, which can apply
+    /// even without a replacement — resetting where a shared, unmodified level starts for just
+    /// this one list). `nil` when the numId itself doesn't resolve to any abstract definition, or
+    /// that abstract definition never declared this level at all.
+    private static func resolvedLevel(numId: String, ilvl: Int, info: NumberingInfo) -> AbstractLevel? {
+        guard let abstractId = info.abstractNumIdByNumId[numId] else { return nil }
+        var level = info.abstractLevelsById[abstractId]?[ilvl]
+        if let override = info.numIdLevelOverrides[numId]?[ilvl] {
+            if let replacement = override.lvlReplacement { level = replacement }
+            if let startOverride = override.startOverride { level?.start = startOverride }
+        }
+        return level
+    }
+
+    /// Per-`(numId, level)` running counts — a numbering definition's counters belong to the numId
+    /// (Word continues them across whatever body content intervenes between two paragraphs that
+    /// share one), never to where in the document a paragraph happens to sit, so this is a
+    /// REFERENCE shared across the whole `read()` call (body, then footnotes, then endnotes, all
+    /// walked from one `read()`) rather than a value threaded through every function's parameters
+    /// with `inout`.
+    private struct ListCounterKey: Hashable { let numId: String; let level: Int }
+    private final class ListNumberingState { var counters: [ListCounterKey: Int] = [:] }
+
+    /// Clears every counter for this numId at `level` and DEEPER — used both when a
+    /// shallower-or-equal ordered item breaks a deeper run (deeper only: `from: ilvl + 1`) and
+    /// when a `bullet`/`none` item at `ilvl` breaks any ordered run AT that level too (self and
+    /// deeper: `from: ilvl`). Scoped to `numId` alone — an unrelated list sharing the same `ilvl`
+    /// must never see its counters disturbed by this one.
+    private static func clearCounters(numId: String, from level: Int, state: ListNumberingState) {
+        for key in state.counters.keys where key.numId == numId && key.level >= level {
+            state.counters.removeValue(forKey: key)
+        }
+    }
+
+    /// The reader's own resolved rendering info for one numbered paragraph: `ordered` still drives
+    /// `OfficeTextBuilder`'s indentation/bullet fallback (see `OfficeBlock.listItem`), `marker` is
+    /// this item's pre-formatted display text when the source's numbering resolves that far. The
+    /// OUTER `nil` means `numId="0"` — Word's own sentinel for "this paragraph carries `w:numPr`
+    /// but is explicitly NOT numbered" — the caller must emit a plain `.paragraph`, never a
+    /// `.listItem`, for that case.
+    private static func numberedListInfo(
+        numId: String?, ilvl: Int, info: NumberingInfo, state: ListNumberingState
+    ) -> (ordered: Bool, marker: String?)? {
+        guard let numId else { return (false, nil) }
+        guard numId != "0" else { return nil }
+        // Unresolvable numId, or a level the abstract definition never declared — today's
+        // pre-sprint fallback: never fabricate a number, but the paragraph is still a list item
+        // (same reasoning the removed `isOrdered` carried).
+        guard let level = resolvedLevel(numId: numId, ilvl: ilvl, info: info) else { return (false, nil) }
+        switch level.numFmt {
+        case "bullet":
+            clearCounters(numId: numId, from: ilvl, state: state)
+            return (false, nil)
+        case "none":
+            // A real numbering level that simply displays nothing — distinct from `bullet`
+            // (which `OfficeTextBuilder` draws its own glyph for): passing `""` (not `nil`) tells
+            // the builder "render this marker verbatim", i.e. nothing, rather than falling back to
+            // a bullet glyph the source never asked for.
+            clearCounters(numId: numId, from: ilvl, state: state)
+            return (false, "")
+        default:
+            break
+        }
+        clearCounters(numId: numId, from: ilvl + 1, state: state)
+        let key = ListCounterKey(numId: numId, level: ilvl)
+        let next = (state.counters[key] ?? (level.start - 1)) + 1
+        state.counters[key] = next
+        // No `w:lvlText` to substitute into — the level is still genuinely ordered, but this
+        // reader has no way to compute display text for it; `nil` marker tells
+        // `OfficeTextBuilder` to fall back to its own simple "N." counting for this item, exactly
+        // as it did before this sprint.
+        guard let lvlText = level.lvlText else { return (true, nil) }
+        let marker = substituteLevelText(
+            lvlText, numId: numId, currentLevel: ilvl, currentValue: next, isLgl: level.isLgl,
+            info: info, state: state)
+        return (true, marker)
+    }
+
+    /// Substitutes every `%1`…`%9` token in `lvlText` with that level's counter, formatted by
+    /// EITHER that level's own `w:numFmt` (the common case — e.g. `%1` decimal, `%2` letters) OR,
+    /// when the CURRENT level is `w:isLgl`, always as decimal (Word's legal-numbering override —
+    /// see `AbstractLevel.isLgl`). The level being substituted (`refLevel`) is read from the
+    /// counter STATE when it's the current level (the value just incremented by the caller) or
+    /// when a shallower level has already been visited; a level never yet reached in this walk
+    /// falls back to its own declared `start` — a document whose `lvlText` references a level
+    /// that hasn't appeared yet is unusual, but showing that level's start value beats showing
+    /// nothing.
+    private static func substituteLevelText(
+        _ lvlText: String, numId: String, currentLevel: Int, currentValue: Int, isLgl: Bool,
+        info: NumberingInfo, state: ListNumberingState
+    ) -> String {
+        var result = lvlText
+        for k in 1...9 {
+            let token = "%\(k)"
+            guard result.contains(token) else { continue }
+            let refLevel = k - 1
+            let value: Int
+            if refLevel == currentLevel {
+                value = currentValue
+            } else if let existing = state.counters[ListCounterKey(numId: numId, level: refLevel)] {
+                value = existing
+            } else {
+                value = resolvedLevel(numId: numId, ilvl: refLevel, info: info)?.start ?? 1
+            }
+            let format = isLgl ? "decimal" : (resolvedLevel(numId: numId, ilvl: refLevel, info: info)?.numFmt ?? "decimal")
+            result = result.replacingOccurrences(of: token, with: formatNumber(value, format: format))
+        }
+        return result
+    }
+
+    /// Formats one counter value per Word's `w:numFmt`. Only the formats the sprint brief lists as
+    /// actually occurring in real documents get their own case; anything else — an exotic or
+    /// future format this reader doesn't specifically know — falls back to plain decimal rather
+    /// than throwing or producing no text: a wrong-LOOKING number is honest about "something is
+    /// numbered here", a missing one is not (the same posture `w:sym`'s ▯ placeholder takes for an
+    /// unmappable glyph).
+    private static func formatNumber(_ n: Int, format: String) -> String {
+        switch format {
+        case "decimalZero": return n >= 0 && n < 10 ? "0\(n)" : "\(n)"
+        case "upperRoman": return romanNumeral(n)
+        case "lowerRoman": return romanNumeral(n).lowercased()
+        case "upperLetter": return letterSequence(n).uppercased()
+        case "lowerLetter": return letterSequence(n)
+        default: return "\(n)"
+        }
+    }
+
+    private static func romanNumeral(_ n: Int) -> String {
+        guard n > 0 else { return "\(n)" }
+        let values: [(Int, String)] = [
+            (1000, "M"), (900, "CM"), (500, "D"), (400, "CD"), (100, "C"), (90, "XC"),
+            (50, "L"), (40, "XL"), (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I"),
+        ]
+        var remainder = n
+        var result = ""
+        for (value, symbol) in values {
+            while remainder >= value {
+                result += symbol
+                remainder -= value
+            }
+        }
+        return result
+    }
+
+    /// Spreadsheet-column-style base-26 letters (1→a, 26→z, 27→aa, 28→ab, …) — Word's own
+    /// `lowerLetter`/`upperLetter` numbering scheme. Lowercase; `formatNumber` uppercases it for
+    /// `upperLetter`.
+    private static func letterSequence(_ n: Int) -> String {
+        guard n > 0 else { return "\(n)" }
+        var remainder = n
+        var letters = ""
+        while remainder > 0 {
+            let rem = (remainder - 1) % 26
+            letters = String(UnicodeScalar(UInt8(97 + rem))) + letters
+            remainder = (remainder - 1) / 26
+        }
+        return letters
     }
 
     // MARK: word/_rels/document.xml.rels — relationship id → target
@@ -364,7 +574,7 @@ enum DocxReader {
     /// has any (`w:txbxContent`), and nothing at all if it has neither picture nor text.
     private static func collectDrawingBlocks(
         in node: XMLNode, styleInfo: StyleInfo, numbering: NumberingInfo, relationships: Relationships,
-        notes: NoteNumbering
+        notes: NoteNumbering, listState: ListNumberingState
     ) -> [OfficeBlock] {
         var blocks: [OfficeBlock] = []
         func walk(_ node: XMLNode) {
@@ -381,7 +591,7 @@ enum DocxReader {
                     } else {
                         blocks.append(contentsOf: textBoxBlocks(
                             in: child, styleInfo: styleInfo, numbering: numbering,
-                            relationships: relationships, notes: notes))
+                            relationships: relationships, notes: notes, listState: listState))
                     }
                 case "w:pict":
                     if let block = imageBlock(fromPict: child, relationships: relationships) {
@@ -389,7 +599,7 @@ enum DocxReader {
                     } else {
                         blocks.append(contentsOf: textBoxBlocks(
                             in: child, styleInfo: styleInfo, numbering: numbering,
-                            relationships: relationships, notes: notes))
+                            relationships: relationships, notes: notes, listState: listState))
                     }
                 default:
                     walk(child)
@@ -410,14 +620,14 @@ enum DocxReader {
     /// does not apply to shape decoration.
     private static func textBoxBlocks(
         in node: XMLNode, styleInfo: StyleInfo, numbering: NumberingInfo, relationships: Relationships,
-        notes: NoteNumbering
+        notes: NoteNumbering, listState: ListNumberingState
     ) -> [OfficeBlock] {
         var blocks: [OfficeBlock] = []
         for txbx in node.allDescendants("w:txbxContent") {
             for p in txbx.children where p.name == "w:p" {
                 let paragraphBlocks = parseParagraph(
                     p, styleInfo: styleInfo, numbering: numbering, relationships: relationships,
-                    notes: notes)
+                    notes: notes, listState: listState)
                 blocks.append(contentsOf: paragraphBlocks.filter { !isEmptyTextBlock($0) })
             }
         }
@@ -429,7 +639,7 @@ enum DocxReader {
     /// table block is never "empty" in this sense and always passes through.
     private static func isEmptyTextBlock(_ block: OfficeBlock) -> Bool {
         switch block {
-        case .paragraph(let spans), .heading(_, let spans), .listItem(_, _, let spans):
+        case .paragraph(let spans), .heading(_, let spans), .listItem(_, _, let spans, _):
             return spans.isEmpty
         case .table, .image:
             return false
@@ -618,11 +828,12 @@ enum DocxReader {
 
     private static func parseBody(
         _ body: XMLNode, styleInfo: StyleInfo, numbering: NumberingInfo, relationships: Relationships,
-        notes: NoteNumbering
+        notes: NoteNumbering, listState: ListNumberingState
     ) -> [OfficeBlock] {
         body.children.flatMap {
             parseBodyChild(
-                $0, styleInfo: styleInfo, numbering: numbering, relationships: relationships, notes: notes)
+                $0, styleInfo: styleInfo, numbering: numbering, relationships: relationships, notes: notes,
+                listState: listState)
         }
     }
 
@@ -636,13 +847,13 @@ enum DocxReader {
     /// content. Anything else at this level (the body's own trailing `w:sectPr`) is not a block.
     private static func parseBodyChild(
         _ child: XMLNode, styleInfo: StyleInfo, numbering: NumberingInfo, relationships: Relationships,
-        notes: NoteNumbering
+        notes: NoteNumbering, listState: ListNumberingState
     ) -> [OfficeBlock] {
         switch child.name {
         case "w:p":
             return parseParagraph(
                 child, styleInfo: styleInfo, numbering: numbering, relationships: relationships,
-                notes: notes)
+                notes: notes, listState: listState)
         case "w:tbl":
             return [parseTable(child, relationships: relationships, notes: notes)]
         case "w:sdt":
@@ -650,7 +861,7 @@ enum DocxReader {
             return content.children.flatMap {
                 parseBodyChild(
                     $0, styleInfo: styleInfo, numbering: numbering, relationships: relationships,
-                    notes: notes)
+                    notes: notes, listState: listState)
             }
         default:
             return []
@@ -665,13 +876,13 @@ enum DocxReader {
     /// standing in for a picture.
     private static func parseParagraph(
         _ p: XMLNode, styleInfo: StyleInfo, numbering: NumberingInfo, relationships: Relationships,
-        notes: NoteNumbering
+        notes: NoteNumbering, listState: ListNumberingState
     ) -> [OfficeBlock] {
         let pPr = p.child("w:pPr")
         let spans = collectSpans(in: p, relationships: relationships, notes: notes)
         let drawingBlocks = collectDrawingBlocks(
             in: p, styleInfo: styleInfo, numbering: numbering, relationships: relationships,
-            notes: notes)
+            notes: notes, listState: listState)
         // Heading wins over list, even when the paragraph ALSO carries `w:numPr` — Word-authored
         // contracts routinely attach a multilevel list to their heading styles so "1. Definitions"
         // / "2.1 Interpretation" number themselves, and `outlineLvl` is the author's explicit
@@ -681,6 +892,10 @@ enum DocxReader {
         // this precedence would drop every clause heading in such a document out of the outline
         // sidebar — silently, since parsing still "succeeds". `outlineLvl 9` is still not a
         // heading (see `headingLevel`), so that case correctly falls through to `.listItem` below.
+        // A heading's own numPr counter is deliberately NOT advanced here — this reader doesn't
+        // render a heading's list-derived number into its text at all, so touching `listState`
+        // for it would only make an unrelated LATER list item at the same numId/level skip a
+        // value it never visibly used.
         let pStyleId = pPr?.child("w:pStyle")?.attributes["w:val"]
         let textBlock: OfficeBlock?
         let skipEmptyText = spans.isEmpty && !drawingBlocks.isEmpty
@@ -689,8 +904,15 @@ enum DocxReader {
         } else if let numPr = pPr?.child("w:numPr") {
             let ilvl = Int(numPr.child("w:ilvl")?.attributes["w:val"] ?? "") ?? 0
             let numId = numPr.child("w:numId")?.attributes["w:val"]
-            textBlock = skipEmptyText ? nil
-                : .listItem(level: ilvl, ordered: isOrdered(numId: numId, ilvl: ilvl, info: numbering), spans: spans)
+            // `numberedListInfo` returns `nil` only for Word's `numId="0"` sentinel — "carries
+            // `w:numPr` but is explicitly NOT numbered" — which reads as an ordinary paragraph,
+            // never a list item.
+            if let info = numberedListInfo(numId: numId, ilvl: ilvl, info: numbering, state: listState) {
+                textBlock = skipEmptyText ? nil
+                    : .listItem(level: ilvl, ordered: info.ordered, spans: spans, marker: info.marker)
+            } else {
+                textBlock = skipEmptyText ? nil : .paragraph(spans: spans)
+            }
         } else {
             textBlock = skipEmptyText ? nil : .paragraph(spans: spans)
         }

@@ -376,6 +376,199 @@ final class DocxReaderTests: XCTestCase {
         XCTAssertEqual(blocks, [.listItem(level: 0, ordered: false, spans: [Span(text: "Item")])])
     }
 
+    // MARK: S5 — clause and list numbering (the reader computes marker text)
+
+    /// `%1.` decimal at level 0, `%1.%2` decimal.lowerLetter at level 1 — the shape a real
+    /// multi-level clause numbering uses.
+    private let clauseNumbering = """
+    <w:numbering>
+      <w:abstractNum w:abstractNumId="1">
+        <w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl>
+        <w:lvl w:ilvl="1"><w:numFmt w:val="lowerLetter"/><w:lvlText w:val="%1.%2"/></w:lvl>
+      </w:abstractNum>
+      <w:num w:numId="7"><w:abstractNumId w:val="1"/></w:num>
+    </w:numbering>
+    """
+
+    private func numberedItem(_ numId: String, _ ilvl: Int, _ text: String) -> String {
+        "<w:p><w:pPr><w:numPr><w:ilvl w:val=\"\(ilvl)\"/><w:numId w:val=\"\(numId)\"/></w:numPr></w:pPr><w:r><w:t>\(text)</w:t></w:r></w:p>"
+    }
+
+    /// Mechanism: counters continue across an intervening PLAIN paragraph. A document with no
+    /// interruption at all would pass this same assertion for the wrong reason (nothing to reset
+    /// in the first place), so this specifically inserts a non-list paragraph between two level-0
+    /// items and asserts the second is still "2.", not "1." again.
+    func testCounterContinuesAcrossAnInterveningPlainParagraph() throws {
+        let blocks = try read(document: """
+        \(numberedItem("7", 0, "First"))
+        <w:p><w:r><w:t>Ordinary paragraph in between.</w:t></w:r></w:p>
+        \(numberedItem("7", 0, "Second"))
+        """, numbering: clauseNumbering)
+        XCTAssertEqual(blocks, [
+            .listItem(level: 0, ordered: true, spans: [Span(text: "First")], marker: "1."),
+            .paragraph(spans: [Span(text: "Ordinary paragraph in between.")]),
+            .listItem(level: 0, ordered: true, spans: [Span(text: "Second")], marker: "2."),
+        ])
+    }
+
+    /// Mechanism: a shallower item resets deeper levels; a deeper run does not disturb the
+    /// shallower counter (`1. / a. / b. / 2.`, mirroring the old builder-side rule now proven at
+    /// the numId granularity the reader itself uses).
+    func testShallowerItemResetsDeeperLevelsButDeeperRunDoesNotDisturbShallower() throws {
+        let blocks = try read(document: """
+        \(numberedItem("7", 0, "One"))
+        \(numberedItem("7", 1, "a"))
+        \(numberedItem("7", 1, "b"))
+        \(numberedItem("7", 0, "Two"))
+        \(numberedItem("7", 1, "restart"))
+        """, numbering: clauseNumbering)
+        XCTAssertEqual(blocks, [
+            .listItem(level: 0, ordered: true, spans: [Span(text: "One")], marker: "1."),
+            .listItem(level: 1, ordered: true, spans: [Span(text: "a")], marker: "1.a"),
+            .listItem(level: 1, ordered: true, spans: [Span(text: "b")], marker: "1.b"),
+            .listItem(level: 0, ordered: true, spans: [Span(text: "Two")], marker: "2."),
+            .listItem(level: 1, ordered: true, spans: [Span(text: "restart")], marker: "2.a"),
+        ])
+    }
+
+    /// Mechanism: `%1.%2.%3` with level 2 in letters (per its own `w:numFmt`), levels 1/3 decimal.
+    func testThreeLevelLvlTextSubstitutesEachLevelsOwnFormat() throws {
+        let numbering = """
+        <w:numbering>
+          <w:abstractNum w:abstractNumId="2">
+            <w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/><w:lvlText w:val="%1"/></w:lvl>
+            <w:lvl w:ilvl="1"><w:numFmt w:val="lowerLetter"/><w:lvlText w:val="%1.%2"/></w:lvl>
+            <w:lvl w:ilvl="2"><w:numFmt w:val="decimal"/><w:lvlText w:val="%1.%2.%3"/></w:lvl>
+          </w:abstractNum>
+          <w:num w:numId="3"><w:abstractNumId w:val="2"/></w:num>
+        </w:numbering>
+        """
+        let blocks = try read(document: """
+        \(numberedItem("3", 0, "One"))
+        \(numberedItem("3", 1, "a"))
+        \(numberedItem("3", 2, "deep"))
+        """, numbering: numbering)
+        XCTAssertEqual(blocks, [
+            .listItem(level: 0, ordered: true, spans: [Span(text: "One")], marker: "1"),
+            .listItem(level: 1, ordered: true, spans: [Span(text: "a")], marker: "1.a"),
+            .listItem(level: 2, ordered: true, spans: [Span(text: "deep")], marker: "1.a.1"),
+        ])
+    }
+
+    /// Mechanism: `w:startOverride` of 5 produces 5.
+    func testStartOverrideChangesTheFirstValueEmitted() throws {
+        let numbering = """
+        <w:numbering>
+          <w:abstractNum w:abstractNumId="1">
+            <w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl>
+          </w:abstractNum>
+          <w:num w:numId="8">
+            <w:abstractNumId w:val="1"/>
+            <w:lvlOverride w:ilvl="0"><w:startOverride w:val="5"/></w:lvlOverride>
+          </w:num>
+        </w:numbering>
+        """
+        let blocks = try read(document: numberedItem("8", 0, "Fifth"), numbering: numbering)
+        XCTAssertEqual(blocks, [.listItem(level: 0, ordered: true, spans: [Span(text: "Fifth")], marker: "5.")])
+    }
+
+    /// Mechanism: `w:lvlOverride/w:lvl` replaces the WHOLE level definition for this numId only —
+    /// here swapping decimal for upperRoman, which a shared-abstract-num lookup alone could never
+    /// produce.
+    func testLvlOverrideReplacingALevelDefinitionTakesEffect() throws {
+        let numbering = """
+        <w:numbering>
+          <w:abstractNum w:abstractNumId="1">
+            <w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl>
+          </w:abstractNum>
+          <w:num w:numId="8">
+            <w:abstractNumId w:val="1"/>
+            <w:lvlOverride w:ilvl="0">
+              <w:lvl w:ilvl="0"><w:numFmt w:val="upperRoman"/><w:lvlText w:val="%1."/></w:lvl>
+            </w:lvlOverride>
+          </w:num>
+        </w:numbering>
+        """
+        let blocks = try read(document: """
+        \(numberedItem("8", 0, "One"))
+        \(numberedItem("8", 0, "Two"))
+        """, numbering: numbering)
+        XCTAssertEqual(blocks, [
+            .listItem(level: 0, ordered: true, spans: [Span(text: "One")], marker: "I."),
+            .listItem(level: 0, ordered: true, spans: [Span(text: "Two")], marker: "II."),
+        ])
+    }
+
+    /// Mechanism: `numId="0"` is Word's sentinel for "not numbered at all" — a plain paragraph,
+    /// never a `.listItem`, regardless of whatever `word/numbering.xml` otherwise contains.
+    func testNumIdZeroProducesAPlainParagraphNotAListItem() throws {
+        let blocks = try read(document: numberedItem("0", 0, "Not a list"), numbering: clauseNumbering)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Not a list")])])
+    }
+
+    /// Mechanism: upper/lower Roman and upper/lower letter formats.
+    func testRomanAndLetterFormatsUpperAndLower() throws {
+        let numbering = """
+        <w:numbering>
+          <w:abstractNum w:abstractNumId="4">
+            <w:lvl w:ilvl="0"><w:numFmt w:val="upperRoman"/><w:lvlText w:val="%1."/></w:lvl>
+          </w:abstractNum>
+          <w:abstractNum w:abstractNumId="5">
+            <w:lvl w:ilvl="0"><w:numFmt w:val="lowerRoman"/><w:lvlText w:val="%1."/></w:lvl>
+          </w:abstractNum>
+          <w:abstractNum w:abstractNumId="6">
+            <w:lvl w:ilvl="0"><w:numFmt w:val="upperLetter"/><w:lvlText w:val="%1)"/></w:lvl>
+          </w:abstractNum>
+          <w:abstractNum w:abstractNumId="7">
+            <w:lvl w:ilvl="0"><w:numFmt w:val="lowerLetter"/><w:lvlText w:val="%1)"/></w:lvl>
+          </w:abstractNum>
+          <w:num w:numId="40"><w:abstractNumId w:val="4"/></w:num>
+          <w:num w:numId="50"><w:abstractNumId w:val="5"/></w:num>
+          <w:num w:numId="60"><w:abstractNumId w:val="6"/></w:num>
+          <w:num w:numId="70"><w:abstractNumId w:val="7"/></w:num>
+        </w:numbering>
+        """
+        // Four INDEPENDENT numIds, each incremented three times, so a run of 1/2/3 in each format
+        // is checked rather than just its first value.
+        let body = (1...3).map { numberedItem("40", 0, "R\($0)") }.joined()
+            + (1...3).map { numberedItem("50", 0, "r\($0)") }.joined()
+            + (1...3).map { numberedItem("60", 0, "L\($0)") }.joined()
+            + (1...3).map { numberedItem("70", 0, "l\($0)") }.joined()
+        let blocks = try read(document: body, numbering: numbering)
+        let markers = blocks.compactMap { block -> String? in
+            if case .listItem(_, _, _, let marker) = block { return marker }
+            return nil
+        }
+        XCTAssertEqual(markers, [
+            "I.", "II.", "III.",
+            "i.", "ii.", "iii.",
+            "A)", "B)", "C)",
+            "a)", "b)", "c)",
+        ])
+    }
+
+    /// Mechanism: an unknown `w:numFmt` falls back to decimal and still produces a number, rather
+    /// than throwing or leaving the marker blank.
+    func testUnknownNumFmtFallsBackToDecimal() throws {
+        let numbering = """
+        <w:numbering>
+          <w:abstractNum w:abstractNumId="1">
+            <w:lvl w:ilvl="0"><w:numFmt w:val="chineseCounting"/><w:lvlText w:val="%1."/></w:lvl>
+          </w:abstractNum>
+          <w:num w:numId="9"><w:abstractNumId w:val="1"/></w:num>
+        </w:numbering>
+        """
+        let blocks = try read(document: numberedItem("9", 0, "Item"), numbering: numbering)
+        XCTAssertEqual(blocks, [.listItem(level: 0, ordered: true, spans: [Span(text: "Item")], marker: "1.")])
+    }
+
+    /// Mechanism: an unresolvable numId (absent from `word/numbering.xml` entirely) still produces
+    /// today's pre-sprint fallback — unordered, no fabricated marker — never a made-up number.
+    func testUnresolvableNumIdStillFallsBackRatherThanFabricatingANumber() throws {
+        let blocks = try read(document: numberedItem("999", 0, "Item"), numbering: clauseNumbering)
+        XCTAssertEqual(blocks, [.listItem(level: 0, ordered: false, spans: [Span(text: "Item")])])
+    }
+
     // MARK: Tables
 
     func testTwoByTwoTableWithAnEmptyCellKeepsShapeAndReportsHeaderRow() throws {

@@ -146,8 +146,8 @@ enum OdtReader {
         switch block {
         case .paragraph(let spans): return .paragraph(spans: [marker, noteMarkerSeparator] + spans)
         case .heading(let level, let spans): return .heading(level: level, spans: [marker, noteMarkerSeparator] + spans)
-        case .listItem(let level, let ordered, let spans):
-            return .listItem(level: level, ordered: ordered, spans: [marker, noteMarkerSeparator] + spans)
+        case .listItem(let level, let ordered, let spans, let itemMarker):
+            return .listItem(level: level, ordered: ordered, spans: [marker, noteMarkerSeparator] + spans, marker: itemMarker)
         case .table, .image: return nil
         }
     }
@@ -223,6 +223,14 @@ enum OdtReader {
         guard let styleName, let ordered = listStyles[styleName]?[level] else { return false }
         return ordered
     }
+
+    /// This reader never supplies `OfficeBlock.listItem`'s `marker` — every `.listItem(...)` built
+    /// below leaves it at its default `nil`, an explicit decision, not an oversight: teaching an
+    /// ODF list style's number-format element (`text:list-level-style-number`'s own `style:num-
+    /// format`/`style:num-prefix`/`style:num-suffix`, ODF's rough equivalent of docx's `w:lvlText`)
+    /// the same restart/override semantics `DocxReader` now implements is out of this sprint's
+    /// scope. `OfficeTextBuilder`'s own counter-based fallback (unchanged) is what ODF lists still
+    /// render through, exactly as before this sprint.
 
     // MARK: Paragraph styles — style name → default-outline-level
 

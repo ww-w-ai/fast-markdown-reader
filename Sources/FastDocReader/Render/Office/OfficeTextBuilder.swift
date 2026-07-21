@@ -49,8 +49,8 @@ enum OfficeTextBuilder {
                 result.addAttribute(.paragraphStyle, value: bodyParagraphStyle(theme: theme),
                                      range: NSRange(location: start, length: result.length - start))
 
-            case let .listItem(level, ordered, spans):
-                appendListItem(level: level, ordered: ordered, spans: spans, into: result,
+            case let .listItem(level, ordered, spans, marker):
+                appendListItem(level: level, ordered: ordered, spans: spans, marker: marker, into: result,
                                 theme: theme, orderedCounters: &orderedCounters)
 
             case let .table(rows, headerRows):
@@ -187,28 +187,39 @@ enum OfficeTextBuilder {
 
     /// Renders one list item and updates the per-level numbering state.
     ///
-    /// Restart rule (the only stateful part of this file): any item at `level` clears the counters
-    /// of every level DEEPER than it — a shallower-or-equal item breaks a deeper level's run, so
-    /// that level restarts at 1 the next time it appears. A deeper level intervening does NOT
-    /// clear a shallower level's own counter, so `1. / a. / b. / 2.` keeps counting `1, 2` at the
-    /// outer level across the nested run. An UNORDERED item also clears its OWN level's counter,
-    /// so a bullet breaks an ordered run at that same level too.
-    private static func appendListItem(level: Int, ordered: Bool, spans: [Span],
+    /// Restart rule (the only stateful part of this file, and only when `marker` is `nil` — see
+    /// below): any item at `level` clears the counters of every level DEEPER than it —
+    /// a shallower-or-equal item breaks a deeper level's run, so that level restarts at 1 the next
+    /// time it appears. A deeper level intervening does NOT clear a shallower level's own counter,
+    /// so `1. / a. / b. / 2.` keeps counting `1, 2` at the outer level across the nested run. An
+    /// UNORDERED item also clears its OWN level's counter, so a bullet breaks an ordered run at
+    /// that same level too.
+    ///
+    /// `marker`, when supplied, is rendered VERBATIM and `orderedCounters` is left untouched —
+    /// see `OfficeBlock.listItem`'s doc comment for why only the reader can compute real numbering
+    /// text (continuation across paragraphs, `w:startOverride`, multi-level `%1.%2` formats). This
+    /// builder's own counters are a fallback for when the source couldn't supply that text, not a
+    /// second, competing numbering scheme — the two never mix for a single item.
+    private static func appendListItem(level: Int, ordered: Bool, spans: [Span], marker suppliedMarker: String?,
                                        into result: NSMutableAttributedString, theme: RenderTheme,
                                        orderedCounters: inout [Int: Int]) {
-        // Snapshot the keys first — removing while iterating `.keys` directly mutates the same
-        // storage the view is walking.
-        for deeper in orderedCounters.keys.filter({ $0 > level }) {
-            orderedCounters.removeValue(forKey: deeper)
-        }
         let marker: String
-        if ordered {
-            let n = (orderedCounters[level] ?? 0) + 1
-            orderedCounters[level] = n
-            marker = "\(n).\t"
+        if let suppliedMarker {
+            marker = suppliedMarker + "\t"
         } else {
-            orderedCounters.removeValue(forKey: level)
-            marker = bulletGlyph(level) + "\t"
+            // Snapshot the keys first — removing while iterating `.keys` directly mutates the same
+            // storage the view is walking.
+            for deeper in orderedCounters.keys.filter({ $0 > level }) {
+                orderedCounters.removeValue(forKey: deeper)
+            }
+            if ordered {
+                let n = (orderedCounters[level] ?? 0) + 1
+                orderedCounters[level] = n
+                marker = "\(n).\t"
+            } else {
+                orderedCounters.removeValue(forKey: level)
+                marker = bulletGlyph(level) + "\t"
+            }
         }
 
         let hang = theme.baseFontSize * 1.7

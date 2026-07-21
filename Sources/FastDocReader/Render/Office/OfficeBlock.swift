@@ -45,7 +45,23 @@ enum OfficeBlock: Equatable {
     /// `level` is a 0-based nesting depth. `ordered` selects "1. 2. 3." numbering — per level,
     /// restarting when a SHALLOWER level intervenes but continuing across a deeper nested run —
     /// vs a bullet. See `OfficeTextBuilder` for the exact restart rule.
-    case listItem(level: Int, ordered: Bool, spans: [Span])
+    ///
+    /// `marker` is the pre-computed display text for THIS item (e.g. `"1.2.3"`, `"iv."`, `"c)"`),
+    /// or `nil`. Only a format that can actually resolve real numbering — a numId that names a
+    /// concrete numbering definition, WITH an `w:lvlText` to substitute into — can honestly know
+    /// this text, and only the READER (`DocxReader`) has that information: a numbering definition
+    /// lives in a side part of the source file (`word/numbering.xml`), continues its counters
+    /// across intervening body paragraphs, and can be overridden per-list (`w:startOverride`,
+    /// `w:lvlOverride`) — none of which `OfficeTextBuilder` can see from one block in isolation.
+    /// `nil` means "the source's numbering couldn't be resolved to real text" (no numbering part,
+    /// an unresolvable numId, a level with no `w:lvlText`, ODF's list styles carrying no such
+    /// field at all) — the field is OPTIONAL rather than mandatory precisely so that case keeps
+    /// working: `OfficeTextBuilder` falls back to counting the item itself from `level`+`ordered`
+    /// alone, EXACTLY as it always has (never inventing a number the source didn't give a way to
+    /// compute — same principle as `image`'s reserved-but-unloaded size, applied to text instead
+    /// of pixels). `ordered`/`level` still drive indentation and the bullet glyph even when
+    /// `marker` is supplied — only the marker TEXT bypasses the builder's own counters.
+    case listItem(level: Int, ordered: Bool, spans: [Span], marker: String? = nil)
     /// Rows of ANCHOR cells only (`rows[row]` lists the cells that START in that row, left to
     /// right — a row's `count` is therefore the number of anchors in it, NOT the column count once
     /// any span is wider than 1; a parser reading `w:gridSpan`/`table:number-columns-spanned` must
