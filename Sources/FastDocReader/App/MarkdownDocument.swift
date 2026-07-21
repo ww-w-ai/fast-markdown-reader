@@ -517,9 +517,30 @@ final class MarkdownDocument: NSDocument {
     /// avoids having to prove they can never collide.
     private static let officeImageCache = NSCache<NSString, NSImage>()
 
+    /// How far a mermaid diagram is allowed to grow past its own natural size when reaching for the
+    /// column width. A cap on the target WIDTH (e.g. "floor at half the column") either undershoots
+    /// diagrams already close to the column, or — raised enough to fix that — blows a deliberately
+    /// tiny two-node diagram up into oversized fonts. Capping the FACTOR instead lets a mid-size
+    /// diagram (the common case) reach full column width while a genuinely tiny one stays close to
+    /// its own natural size, because its small natural size is itself what limits how far the
+    /// multiplier can take it. 2.5x chosen as a middle ground: generous enough to fix the common
+    /// 50–100%-of-column band, not so generous that a 3-node graph balloons past legibility.
+    static let mermaidEnlargeFactorCap: CGFloat = 2.5
+
+    /// Pure grow-toward-column decision for a mermaid diagram narrower than the column (the shrink
+    /// case — `naturalWidth >= colW` — is handled by the caller and never reaches here). No view/
+    /// layout state involved, so it is identical whether the attachment's pixels are currently loaded
+    /// or purged (invariant 1), and it re-derives the same answer on every call — safe to call fresh
+    /// on every resize/reflow (invariant 24) without caching or re-rendering.
+    static func mermaidTargetWidth(naturalWidth: CGFloat, colW: CGFloat) -> CGFloat {
+        min(colW, naturalWidth * mermaidEnlargeFactorCap)
+    }
+
     /// Column-fit a raw pixel size, honoring an explicit width (HTML/Pandoc/Obsidian) or shrinking
-    /// oversized images to the column width.
-    private func fittedSize(_ pixelSize: NSSize, _ storage: NSTextStorage, _ range: NSRange, maxWidth: CGFloat) -> NSSize {
+    /// oversized images to the column width. Internal (not private) so tests can drive it directly —
+    /// see `MermaidSizingTests` — the same pattern this codebase already uses for pure, view-free
+    /// math (`TextNavigator`, `BlockEdit`).
+    func fittedSize(_ pixelSize: NSSize, _ storage: NSTextStorage, _ range: NSRange, maxWidth: CGFloat) -> NSSize {
         let colW = maxWidth - 8
         var size = pixelSize
         guard size.width > 0 else { return size }
@@ -531,14 +552,17 @@ final class MarkdownDocument: NSDocument {
         } else if size.width > colW {
             targetW = colW
         } else if storage.attribute(MDAttr.mermaid, at: range.location, effectiveRange: nil) != nil,
-                  size.width < colW * 0.5 {
-            // A diagram's natural width is a mermaid layout artefact, not a size anyone chose: a
-            // three-box graph comes out tiny and unreadable beside full-width text. Floor it at half
-            // the column. It's vector art, so enlarging costs no sharpness.
+                  size.width < colW {
+            // A diagram's natural width is a mermaid layout artefact, not a size anyone chose:
+            // mermaid's `useMaxWidth: true` only ever SHRINKS a diagram to fit a narrower container,
+            // it never grows one to fill a wider one (docs/06-research/mermaid-sizing.md) — so every
+            // diagram below the column width, not just those under half of it, needs a grow rule
+            // here. It's vector art (WKPDFConfiguration/createPDF, see WebBlockRenderer), so
+            // enlarging costs no sharpness.
             //
             // Diagrams ONLY. An image's size IS authored (a 16px icon must stay a 16px icon), and a
-            // short formula stretched to half the page would look absurd.
-            targetW = colW * 0.5
+            // formula stretched to the column would look absurd.
+            targetW = MarkdownDocument.mermaidTargetWidth(naturalWidth: size.width, colW: colW)
         }
         if let targetW {
             let s = targetW / size.width
