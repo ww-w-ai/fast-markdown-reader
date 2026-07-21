@@ -320,6 +320,297 @@ final class DocxReaderTests: XCTestCase {
         ], headerRows: 0)])
     }
 
+    // MARK: Tables — merged cells (corpus-measured: 31 gridSpan / 16 vMerge in the TAGO guide,
+    // 13 of those 16 with no `w:val` at all)
+
+    private func tc(_ cellXML: String) -> String { "<w:tc>\(cellXML)</w:tc>" }
+    private func para(_ text: String) -> String { "<w:p><w:r><w:t>\(text)</w:t></w:r></w:p>" }
+
+    /// The #1 footgun, and the majority case in the real corpus: a bare `<w:vMerge/>` with no
+    /// `w:val` means CONTINUE, not restart. A reader that gets this backwards turns a real vertical
+    /// merge into two separate one-row cells and silently loses the span.
+    func testBareVMergeWithNoValContinuesTheMergeAbove() throws {
+        let blocks = try read(document: """
+        <w:tbl>
+          <w:tr>
+            \(tc("<w:tcPr><w:vMerge w:val=\"restart\"/></w:tcPr>\(para("Top"))"))
+            \(tc(para("B0")))
+          </w:tr>
+          <w:tr>
+            \(tc("<w:tcPr><w:vMerge/></w:tcPr>\(para(""))"))
+            \(tc(para("B1")))
+          </w:tr>
+        </w:tbl>
+        """)
+        XCTAssertEqual(blocks, [.table(rows: [
+            [Cell(spans: [Span(text: "Top")], rowSpan: 2), Cell(spans: [Span(text: "B0")])],
+            [Cell(spans: [Span(text: "B1")])],
+        ], headerRows: 0)])
+    }
+
+    /// Same as above but with an EXPLICIT `val="continue"` — the non-default spelling of the same
+    /// footgun, kept as its own test since a reader could special-case the missing-attribute form
+    /// and still mishandle this one.
+    func testExplicitValContinueAlsoContinuesTheMerge() throws {
+        let blocks = try read(document: """
+        <w:tbl>
+          <w:tr>\(tc("<w:tcPr><w:vMerge w:val=\"restart\"/></w:tcPr>\(para("Top"))"))</w:tr>
+          <w:tr>\(tc("<w:tcPr><w:vMerge w:val=\"continue\"/></w:tcPr>\(para(""))"))</w:tr>
+        </w:tbl>
+        """)
+        XCTAssertEqual(blocks, [.table(rows: [
+            [Cell(spans: [Span(text: "Top")], rowSpan: 2)],
+            [],
+        ], headerRows: 0)])
+    }
+
+    /// Word routinely leaves stale leftover paragraph text inside a `continue` cell from before the
+    /// merge existed — that text is dead and must never surface as a phantom extra line.
+    func testStaleContentInAContinueCellIsDiscardedNotRendered() throws {
+        let blocks = try read(document: """
+        <w:tbl>
+          <w:tr>\(tc("<w:tcPr><w:vMerge w:val=\"restart\"/></w:tcPr>\(para("Top"))"))</w:tr>
+          <w:tr>\(tc("<w:tcPr><w:vMerge/></w:tcPr>\(para("Leftover stale text"))"))</w:tr>
+        </w:tbl>
+        """)
+        XCTAssertEqual(blocks, [.table(rows: [
+            [Cell(spans: [Span(text: "Top")], rowSpan: 2)],
+            [],
+        ], headerRows: 0)])
+    }
+
+    /// A three-row chain: `restart` then two bare `continue`s must accumulate `rowSpan` to 3, not
+    /// reset or double-count partway through.
+    func testThreeRowVerticalMergeAccumulatesRowSpanAcrossTwoContinuations() throws {
+        let blocks = try read(document: """
+        <w:tbl>
+          <w:tr>\(tc("<w:tcPr><w:vMerge w:val=\"restart\"/></w:tcPr>\(para("Top"))"))</w:tr>
+          <w:tr>\(tc("<w:tcPr><w:vMerge/></w:tcPr>\(para(""))"))</w:tr>
+          <w:tr>\(tc("<w:tcPr><w:vMerge/></w:tcPr>\(para(""))"))</w:tr>
+        </w:tbl>
+        """)
+        XCTAssertEqual(blocks, [.table(rows: [
+            [Cell(spans: [Span(text: "Top")], rowSpan: 3)],
+            [],
+            [],
+        ], headerRows: 0)])
+    }
+
+    func testGridSpanSetsColSpanOnTheAnchorCell() throws {
+        let blocks = try read(document: """
+        <w:tbl>
+          <w:tr>\(tc("<w:tcPr><w:gridSpan w:val=\"3\"/></w:tcPr>\(para("Title band"))"))</w:tr>
+          <w:tr>\(tc(para("A")))\(tc(para("B")))\(tc(para("C")))</w:tr>
+        </w:tbl>
+        """)
+        XCTAssertEqual(blocks, [.table(rows: [
+            [Cell(spans: [Span(text: "Title band")], colSpan: 3)],
+            [Cell(spans: [Span(text: "A")]), Cell(spans: [Span(text: "B")]), Cell(spans: [Span(text: "C")])],
+        ], headerRows: 0)])
+    }
+
+    /// A merged 2×2 region: row N's anchor is BOTH `gridSpan`'d and `vMerge`'d, row N+1's matching
+    /// cell is a `gridSpan`'d `continue` — both the column-span and the row-span must land on the
+    /// SAME logical cell, and the covered 2-column-wide footprint in row N+1 must vanish entirely
+    /// (not leave one of its two columns behind as a phantom cell).
+    func testCombinedGridSpanAndVMergeAppliesBothSpansToTheSameCell() throws {
+        let blocks = try read(document: """
+        <w:tbl>
+          <w:tr>
+            \(tc("<w:tcPr><w:gridSpan w:val=\"2\"/><w:vMerge w:val=\"restart\"/></w:tcPr>\(para("Merged"))"))
+            \(tc(para("Side0")))
+          </w:tr>
+          <w:tr>
+            \(tc("<w:tcPr><w:gridSpan w:val=\"2\"/><w:vMerge/></w:tcPr>\(para(""))"))
+            \(tc(para("Side1")))
+          </w:tr>
+        </w:tbl>
+        """)
+        XCTAssertEqual(blocks, [.table(rows: [
+            [Cell(spans: [Span(text: "Merged")], rowSpan: 2, colSpan: 2), Cell(spans: [Span(text: "Side0")])],
+            [Cell(spans: [Span(text: "Side1")])],
+        ], headerRows: 0)])
+    }
+
+    /// A `continue` cell whose grid column has NO open merge above it (a malformed/hand-edited
+    /// document — there is no `restart` anywhere earlier at that column) must not be fabricated
+    /// into a normal cell of its own; it is simply dropped, same as a genuinely covered position.
+    func testContinueWithNoOpenMergeAboveIsDroppedNotFabricatedIntoANewCell() throws {
+        let blocks = try read(document: """
+        <w:tbl>
+          <w:tr>\(tc(para("A0")))</w:tr>
+          <w:tr>\(tc("<w:tcPr><w:vMerge/></w:tcPr>\(para("Orphaned"))"))</w:tr>
+        </w:tbl>
+        """)
+        XCTAssertEqual(blocks, [.table(rows: [
+            [Cell(spans: [Span(text: "A0")])],
+            [],
+        ], headerRows: 0)])
+    }
+
+    /// A content control inside a table cell — a very common Word form/template shape ("click
+    /// here to enter a value" inside a template row) — must not make that cell's text disappear.
+    /// This is the THIRD place `w:sdt` can wrap real content (body-level and inline-in-a-paragraph
+    /// are covered above); a table cell is a distinct code path and was the one this fix closes.
+    func testContentControlInsideATableCellIsUnwrappedNotDropped() throws {
+        let blocks = try read(document: """
+        <w:tbl><w:tr>\(tc("<w:sdt><w:sdtPr/><w:sdtContent>\(para("Filled in"))</w:sdtContent></w:sdt>"))</w:tr></w:tbl>
+        """)
+        XCTAssertEqual(blocks, [.table(rows: [[Cell(spans: [Span(text: "Filled in")])]], headerRows: 0)])
+    }
+
+    /// A `<w:tbl>` nested directly inside a `<w:tc>` — `Cell` has no case for a nested `.table`
+    /// block, so its text is FLATTENED into the containing cell's spans (a tab between the nested
+    /// table's cells, a newline after each of its non-empty rows) rather than silently dropped —
+    /// mirrors `OdtReader`'s identical handling of ODF's equivalent construct, and the same loose
+    /// "the words all survive somewhere" assertion style its test uses, since flattening does not
+    /// merge every span into one and pinning exact span boundaries would over-specify the point.
+    func testNestedTableInsideACellFlattensToTextRatherThanDisappearing() throws {
+        // Same shape as OdtReaderTests' equivalent: the outer cell's own paragraph ("Outer")
+        // alongside a nested table whose own cell says "Nested" — both must survive somewhere.
+        let cellContent = para("Outer") + "<w:tbl><w:tr>\(tc(para("Nested")))</w:tr></w:tbl>"
+        let blocks = try read(document: "<w:tbl><w:tr>\(tc(cellContent))</w:tr></w:tbl>")
+        guard case .table(let rows, _) = blocks.first else { return XCTFail("expected a table block") }
+        let allText = rows.flatMap { $0 }.flatMap { $0.spans }.map(\.text).joined()
+        XCTAssertTrue(allText.contains("Outer"), "the cell's own paragraph text must survive")
+        XCTAssertTrue(allText.contains("Nested"), "the nested table's text must survive, not disappear")
+    }
+
+    // MARK: Hyperlinks
+
+    func testHyperlinkResolvesRIdThroughRelationshipsToSpanLink() throws {
+        let zip = buildDocx(
+            document: doc("<w:p><w:hyperlink r:id=\"rId5\"><w:r><w:t>click here</w:t></w:r></w:hyperlink></w:p>"),
+            rels: rels([(id: "rId5", target: "https://example.com/", external: true)]))
+        let archive = try ZipArchive(data: zip)
+        let blocks = try DocxReader.read(archive)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "click here", link: "https://example.com/")])])
+    }
+
+    /// The relationship id doesn't resolve (edited/malformed document) — the text must survive;
+    /// only the link itself is allowed to go missing.
+    func testHyperlinkWithUnresolvableRelationshipKeepsTextButLeavesLinkNil() throws {
+        let blocks = try read(
+            document: "<w:p><w:hyperlink r:id=\"rIdMissing\"><w:r><w:t>text</w:t></w:r></w:hyperlink></w:p>",
+            rels: nil)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "text")])])
+    }
+
+    /// An internal same-document link (a cross-reference to a heading/bookmark) carries no `r:id`
+    /// at all — only `w:anchor` — and becomes a `#`-prefixed fragment.
+    func testInternalHyperlinkAnchorProducesAFragmentLink() throws {
+        let blocks = try read(
+            document: "<w:p><w:hyperlink w:anchor=\"_Toc1\"><w:r><w:t>See above</w:t></w:r></w:hyperlink></w:p>",
+            rels: nil)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "See above", link: "#_Toc1")])])
+    }
+
+    /// Text outside a hyperlink and text inside one must stay in separate spans even when every
+    /// OTHER formatting flag matches — merging them would make the link boundary invisible to the
+    /// renderer.
+    func testTextBeforeAndInsideAHyperlinkStaySeparateSpans() throws {
+        let zip = buildDocx(
+            document: doc("""
+            <w:p>
+              <w:r><w:t>See </w:t></w:r>
+              <w:hyperlink r:id="rId5"><w:r><w:t>this page</w:t></w:r></w:hyperlink>
+              <w:r><w:t> for details</w:t></w:r>
+            </w:p>
+            """),
+            rels: rels([(id: "rId5", target: "https://example.com/", external: true)]))
+        let archive = try ZipArchive(data: zip)
+        let blocks = try DocxReader.read(archive)
+        XCTAssertEqual(blocks, [.paragraph(spans: [
+            Span(text: "See "),
+            Span(text: "this page", link: "https://example.com/"),
+            Span(text: " for details"),
+        ])])
+    }
+
+    // MARK: Content controls (`w:sdt`) — unwrapped, never skipped
+
+    func testContentControlWrappingAParagraphIsUnwrappedNotSkipped() throws {
+        let blocks = try read(document: """
+        <w:sdt><w:sdtPr><w:alias w:val="Field"/></w:sdtPr><w:sdtContent>
+          <w:p><w:r><w:t>Inside a content control</w:t></w:r></w:p>
+        </w:sdtContent></w:sdt>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Inside a content control")])])
+    }
+
+    func testContentControlWrappingATableIsUnwrappedNotSkipped() throws {
+        let blocks = try read(document: """
+        <w:sdt><w:sdtContent>
+          <w:tbl><w:tr>\(tc(para("Cell")))</w:tr></w:tbl>
+        </w:sdtContent></w:sdt>
+        """)
+        XCTAssertEqual(blocks, [.table(rows: [[Cell(spans: [Span(text: "Cell")])]], headerRows: 0)])
+    }
+
+    func testNestedContentControlsAreUnwrappedAllTheWayDown() throws {
+        let blocks = try read(document: """
+        <w:sdt><w:sdtContent>
+          <w:sdt><w:sdtContent>
+            <w:p><w:r><w:t>Doubly wrapped</w:t></w:r></w:p>
+          </w:sdtContent></w:sdt>
+        </w:sdtContent></w:sdt>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Doubly wrapped")])])
+    }
+
+    /// An INLINE content control — `w:sdt` wrapping a run inside an ordinary paragraph, rather than
+    /// the whole paragraph — must be unwrapped transparently too: its text is recovered at all (the
+    /// content that must never disappear), and since it carries no formatting difference from the
+    /// text around it, it reassembles into the SAME single span exactly as identically-formatted
+    /// plain runs already do (see the five-runs test above) — that merge is what "transparently"
+    /// verifies here, not two separate spans surviving the wrapper.
+    func testInlineContentControlInsideAParagraphIsUnwrappedTransparently() throws {
+        let blocks = try read(document: """
+        <w:p>
+          <w:r><w:t>Name: </w:t></w:r>
+          <w:sdt><w:sdtPr/><w:sdtContent><w:r><w:t>Jane Doe</w:t></w:r></w:sdtContent></w:sdt>
+        </w:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Name: Jane Doe")])])
+    }
+
+    // MARK: w:sym — no w:t fallback, must never silently vanish
+
+    /// The placeholder carries no formatting difference from the plain text run before it, so it
+    /// reassembles into the SAME span (the point being tested is that the character survives at
+    /// all — not that it stays visually distinct from its neighbour).
+    func testSymCharacterEmitsAVisiblePlaceholderRatherThanDisappearing() throws {
+        let blocks = try read(document: """
+        <w:p><w:r><w:t>See </w:t></w:r><w:r><w:sym w:font="Wingdings" w:char="F0E0"/></w:r></w:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "See ▯")])])
+    }
+
+    // MARK: strikethrough / superscript / subscript
+
+    func testStrikethroughRunPropertyParses() throws {
+        let blocks = try read(document: "<w:p><w:r><w:rPr><w:strike/></w:rPr><w:t>Struck</w:t></w:r></w:p>")
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Struck", strikethrough: true)])])
+    }
+
+    func testExplicitlyDisabledStrikethroughIsNotStrikethrough() throws {
+        let blocks = try read(document: "<w:p><w:r><w:rPr><w:strike w:val=\"0\"/></w:rPr><w:t>NotStruck</w:t></w:r></w:p>")
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "NotStruck", strikethrough: false)])])
+    }
+
+    func testSuperscriptAndSubscriptViaVertAlign() throws {
+        let blocks = try read(document: """
+        <w:p>
+          <w:r><w:rPr><w:vertAlign w:val="superscript"/></w:rPr><w:t>sup</w:t></w:r>
+          <w:r><w:rPr><w:vertAlign w:val="subscript"/></w:rPr><w:t>sub</w:t></w:r>
+        </w:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [
+            Span(text: "sup", superscript: true),
+            Span(text: "sub", subscripted: true),
+        ])])
+    }
+
     // MARK: Images
 
     private func rels(_ pairs: [(id: String, target: String, external: Bool)]) -> String {

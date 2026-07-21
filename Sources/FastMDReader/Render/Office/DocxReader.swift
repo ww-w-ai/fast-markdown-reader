@@ -429,20 +429,36 @@ enum DocxReader {
     private static func parseBody(
         _ body: XMLNode, styleOutlineLevels: [String: Int], numbering: NumberingInfo, relationships: Relationships
     ) -> [OfficeBlock] {
-        var blocks: [OfficeBlock] = []
-        for child in body.children {
-            switch child.name {
-            case "w:p":
-                blocks.append(contentsOf: parseParagraph(
-                    child, styleOutlineLevels: styleOutlineLevels, numbering: numbering, relationships: relationships))
-            case "w:tbl":
-                blocks.append(parseTable(child))
-            default:
-                // e.g. the body's own trailing `w:sectPr` (page setup) — not a block.
-                continue
-            }
+        body.children.flatMap {
+            parseBodyChild($0, styleOutlineLevels: styleOutlineLevels, numbering: numbering, relationships: relationships)
         }
-        return blocks
+    }
+
+    /// A body child is normally `w:p` or `w:tbl`. `w:sdt` (a content control / structured document
+    /// tag) is UNWRAPPED here, never skipped — Word uses it to wrap a whole paragraph or table (a
+    /// "click here to enter text" field, a repeating-section template) inside `w:sdtContent`, and a
+    /// reader that treats the wrapper as opaque loses everything the author typed inside it, which
+    /// is exactly the class of bug this sprint exists to close. Recurses so a content control
+    /// nested inside another one is unwrapped all the way down; `w:sdtPr` (placeholder-text hints,
+    /// a lock setting, …) is deliberately never read — the only thing needed from `w:sdt` is its
+    /// content. Anything else at this level (the body's own trailing `w:sectPr`) is not a block.
+    private static func parseBodyChild(
+        _ child: XMLNode, styleOutlineLevels: [String: Int], numbering: NumberingInfo, relationships: Relationships
+    ) -> [OfficeBlock] {
+        switch child.name {
+        case "w:p":
+            return parseParagraph(
+                child, styleOutlineLevels: styleOutlineLevels, numbering: numbering, relationships: relationships)
+        case "w:tbl":
+            return [parseTable(child, relationships: relationships)]
+        case "w:sdt":
+            guard let content = child.child("w:sdtContent") else { return [] }
+            return content.children.flatMap {
+                parseBodyChild($0, styleOutlineLevels: styleOutlineLevels, numbering: numbering, relationships: relationships)
+            }
+        default:
+            return []
+        }
     }
 
     /// A paragraph normally contributes exactly one block, but one carrying an image contributes
@@ -455,7 +471,7 @@ enum DocxReader {
         _ p: XMLNode, styleOutlineLevels: [String: Int], numbering: NumberingInfo, relationships: Relationships
     ) -> [OfficeBlock] {
         let pPr = p.child("w:pPr")
-        let spans = collectSpans(in: p)
+        let spans = collectSpans(in: p, relationships: relationships)
         let drawingBlocks = collectDrawingBlocks(
             in: p, styleOutlineLevels: styleOutlineLevels, numbering: numbering, relationships: relationships)
         // Heading wins over list, even when the paragraph ALSO carries `w:numPr` — Word-authored
@@ -486,14 +502,73 @@ enum DocxReader {
         return blocks
     }
 
-    private static func parseTable(_ tbl: XMLNode) -> OfficeBlock {
+    /// A grid position a row's own `<w:tc>` sequence doesn't literally cover — because `w:tcPr`
+    /// carries an ANCHOR reference, not a grid coordinate — so this reader must derive each cell's
+    /// starting grid column itself: walking a row's `<w:tc>` elements left to right, accumulating
+    /// each one's own width (`w:gridSpan`, default 1) as it goes, is exactly that derivation. A
+    /// well-formed row's cells always sum to the table's full grid width (a vertically-continuing
+    /// cell still carries its own `<w:tc>` occupying its column, per spec), so this cumulative walk
+    /// lands on the correct column even when two rows have a different NUMBER of `<w:tc>` (a
+    /// horizontal merge changes how many `<w:tc>` a row needs without changing the grid it spans).
+    private static func parseTable(_ tbl: XMLNode, relationships: Relationships) -> OfficeBlock {
         let rowNodes = tbl.children.filter { $0.name == "w:tr" }
-        // Every cell is its own anchor at rowSpan/colSpan 1 — this sprint doesn't read
-        // `w:gridSpan`/`w:vMerge` yet (that's R2), so every position is present-and-visible, never
-        // covered by a merge.
-        let rows: [[Cell]] = rowNodes.map { row in
-            row.children.filter { $0.name == "w:tc" }.map { cell in
-                Cell(spans: cell.children.filter { $0.name == "w:p" }.flatMap { collectSpans(in: $0) })
+        var rows: [[Cell]] = []
+        // Grid column → where in `rows` its currently-open vertical-merge anchor lives, so a
+        // `continue` cell several rows down can find the top cell and extend ITS `rowSpan` instead
+        // of becoming a cell of its own.
+        var openMerge: [Int: (row: Int, cell: Int)] = [:]
+        for row in rowNodes {
+            var rowCells: [Cell] = []
+            var gridCol = 0
+            for tc in row.children where tc.name == "w:tc" {
+                let tcPr = tc.child("w:tcPr")
+                let colSpan = tcPr?.child("w:gridSpan")?.attributes["w:val"].flatMap(Int.init) ?? 1
+                let vMerge = tcPr?.child("w:vMerge")
+                // `w:vMerge` present with NO `w:val` — not `val="restart"` — is Word's default for
+                // "this cell continues the merge above", the #1 footgun measured on the real corpus
+                // (13 of 16 vertical merges omit `w:val` entirely). Reading a bare `<w:vMerge/>` as
+                // the start of a fresh merge is the single most common docx-reader bug there is.
+                let continuesMerge = vMerge != nil && vMerge?.attributes["w:val"] != "restart"
+                if continuesMerge {
+                    // This cell's own paragraphs are read (`tc.children` below, if ever needed) but
+                    // deliberately DISCARDED, never rendered — Word routinely leaves stale leftover
+                    // text in a continue cell from before the merge existed, and showing it would
+                    // draw a phantom extra line under a merged cell that visually has none. No cell
+                    // is emitted for this grid position at all — it is covered, not empty.
+                    if let anchor = openMerge[gridCol] {
+                        rows[anchor.row][anchor.cell].rowSpan += 1
+                    }
+                    // No open merge at this column (a malformed/edited document) — there is nothing
+                    // to extend, and a `continue` cell is never content of its own, so it is simply
+                    // dropped rather than fabricated into a normal cell.
+                } else {
+                    let spans = collectCellSpans(tc, relationships: relationships)
+                    rowCells.append(Cell(spans: spans, rowSpan: 1, colSpan: colSpan))
+                    if vMerge != nil {
+                        // `val="restart"` — the top of a genuine new vertical-merge chain; later
+                        // `continue` cells at this column extend THIS cell's `rowSpan`.
+                        openMerge[gridCol] = (rows.count, rowCells.count - 1)
+                    } else {
+                        // An ORDINARY cell with no `w:vMerge` element at all is not part of any
+                        // merge and can never be extended — it must not become continuable just
+                        // because a later (malformed) row has a stray `continue` at this column.
+                        // It also ends whatever chain was open here before it.
+                        openMerge.removeValue(forKey: gridCol)
+                    }
+                }
+                gridCol += colSpan
+            }
+            rows.append(rowCells)
+        }
+        // Defensive clamp: an anchor's `rowSpan` can never claim more rows than the table actually
+        // has left below it. This reader's own construction above can't overshoot (it only grows a
+        // `rowSpan` once per genuinely-encountered `continue` row, and there can never be more of
+        // those than real rows), but a malformed/hand-edited document is exactly the kind of input
+        // that must never be trusted to size itself — the same posture as never trusting a ZIP
+        // entry's declared size.
+        for r in rows.indices {
+            for c in rows[r].indices {
+                rows[r][c].rowSpan = min(rows[r][c].rowSpan, rowNodes.count - r)
             }
         }
         // Leading run only — a header row can never follow an ordinary one, and the source is
@@ -507,6 +582,55 @@ enum DocxReader {
         return .table(rows: rows, headerRows: headerRows)
     }
 
+    /// A cell's content: its own paragraphs, PLUS the two places a naive reader silently drops
+    /// real text from a `<w:tc>` — a `w:sdt` (content control) wrapping a paragraph (a form-field
+    /// cell in a template table is a very common Word shape), and a full nested `<w:tbl>`. `Cell`
+    /// has no case for a nested `.table` block, so a nested table's text is FLATTENED into spans
+    /// (`flattenNestedTable`) rather than dropped — the grid disappears, the words in it do not.
+    /// Deliberately mirrors `OdtReader.collectCellSpans`/`flattenNestedTable` exactly (same
+    /// separator convention: a tab between cells, a newline after each non-empty row), so the two
+    /// formats produce comparable output for the same shape rather than silently disagreeing.
+    private static func collectCellSpans(_ tc: XMLNode, relationships: Relationships) -> [Span] {
+        var spans: [Span] = []
+        for child in tc.children {
+            switch child.name {
+            case "w:p":
+                spans.append(contentsOf: collectSpans(in: child, relationships: relationships))
+            case "w:tbl":
+                spans.append(contentsOf: flattenNestedTable(child, relationships: relationships))
+            case "w:sdt":
+                if let content = child.child("w:sdtContent") {
+                    spans.append(contentsOf: collectCellSpans(content, relationships: relationships))
+                }
+            default:
+                continue
+            }
+        }
+        return spans
+    }
+
+    /// Flattens a nested table's cells into one run of spans — a tab between cells, a newline
+    /// after each non-empty row — so a reader glancing at the flattened text can still tell where
+    /// one cell ended and the next began, even though the grid itself is gone. Recurses through
+    /// `collectCellSpans`, so a table nested inside a nested table (and a content control inside
+    /// THAT) also survives — no depth cap is enforced; real documents don't go more than one or
+    /// two levels, per the research survey.
+    private static func flattenNestedTable(_ table: XMLNode, relationships: Relationships) -> [Span] {
+        var spans: [Span] = []
+        for row in table.children where row.name == "w:tr" {
+            var rowHasContent = false
+            for cell in row.children where cell.name == "w:tc" {
+                let cellSpans = collectCellSpans(cell, relationships: relationships)
+                guard !cellSpans.isEmpty else { continue }
+                if rowHasContent { spans.append(Span(text: "\t")) }
+                spans.append(contentsOf: cellSpans)
+                rowHasContent = true
+            }
+            if rowHasContent { spans.append(Span(text: "\n")) }
+        }
+        return spans
+    }
+
     /// Walks a paragraph (or a table cell's paragraph) collecting `w:r` runs into `Span`s,
     /// merging consecutive runs that carry identical formatting into one — Word fragments a
     /// single sentence into several runs constantly (a spell-check pass, a single character
@@ -514,43 +638,83 @@ enum DocxReader {
     /// into the rendered text as spurious style boundaries.
     ///
     /// Recursion is deliberately permissive: any wrapper this switch doesn't specifically name
-    /// (`w:ins`, `w:hyperlink`, `w:smartTag`, `w:customXml`, …) is descended into rather than
-    /// skipped, so a run's visible text is never lost just because Word wrapped it in something
-    /// unanticipated. Only elements known to carry NO renderable body text of their own are
+    /// (`w:ins`, `w:smartTag`, `w:customXml`, …) is descended into rather than skipped, so a
+    /// run's visible text is never lost just because Word wrapped it in something unanticipated.
+    /// Two wrappers get their OWN case rather than falling through to that generic descent:
+    /// `w:hyperlink` carries the link target as an ATTRIBUTE (`r:id`/`w:anchor`), which the generic
+    /// walk has nowhere to read, so every run underneath it is threaded through with that target;
+    /// `w:sdt` (an inline content control) is unwrapped into its `w:sdtContent` only, so its
+    /// `w:sdtPr` (placeholder-text hints, lock settings — never renderable content) is never
+    /// mistaken for one. Only elements known to carry NO renderable body text of their own are
     /// pruned: paragraph/run properties (formatting only), deleted-content wrappers, empty
     /// markers, and section properties.
-    private static func collectSpans(in node: XMLNode) -> [Span] {
+    private static func collectSpans(in node: XMLNode, relationships: Relationships) -> [Span] {
         var spans: [Span] = []
         func appendMerging(_ span: Span) {
             if let last = spans.last, last.bold == span.bold, last.italic == span.italic,
-               last.underline == span.underline, last.code == span.code {
+               last.underline == span.underline, last.code == span.code, last.link == span.link,
+               last.strikethrough == span.strikethrough, last.superscript == span.superscript,
+               last.subscripted == span.subscripted {
                 spans[spans.count - 1].text += span.text
             } else {
                 spans.append(span)
             }
         }
-        func walk(_ node: XMLNode) {
+        func walk(_ node: XMLNode, link: String?) {
             for child in node.children {
                 switch child.name {
                 case "w:pPr", "w:rPr", "w:del", "w:bookmarkStart", "w:bookmarkEnd", "w:proofErr",
                      "w:sectPr", "w:commentRangeStart", "w:commentRangeEnd", "w:commentReference":
                     continue
+                case "w:hyperlink":
+                    // A hyperlink whose target can't be resolved (no `r:id`/`w:anchor`, or a
+                    // relationship id absent from `document.xml.rels`) still keeps its text — only
+                    // the link itself is lost, never the content, so `target` falling through to
+                    // the OUTER `link` (usually nil) rather than being forced is deliberate.
+                    walk(child, link: hyperlinkTarget(child, relationships: relationships) ?? link)
+                case "w:sdt":
+                    if let content = child.child("w:sdtContent") { walk(content, link: link) }
                 case "w:r":
-                    if let span = buildSpan(from: child) { appendMerging(span) }
+                    if var span = buildSpan(from: child) {
+                        span.link = link
+                        appendMerging(span)
+                    }
                 default:
-                    walk(child)
+                    walk(child, link: link)
                 }
             }
         }
-        walk(node)
+        walk(node, link: nil)
         return spans
+    }
+
+    /// `r:id` resolves through the SAME relationship plumbing an embedded image's `r:embed` uses
+    /// (`word/_rels/document.xml.rels`) — Word's hyperlink relationships are conventionally
+    /// `TargetMode="External"`, so `Relationship.target` is already the raw URL, unmodified. An
+    /// internal same-document link (e.g. a cross-reference to a heading) carries no `r:id` at all,
+    /// only `w:anchor` naming a bookmark — turned into a `#`-prefixed fragment, the same convention
+    /// markdown links already use for in-document anchors.
+    private static func hyperlinkTarget(_ hyperlink: XMLNode, relationships: Relationships) -> String? {
+        if let rId = hyperlink.attributes["r:id"] {
+            return relationships.byId[rId]?.target
+        }
+        if let anchor = hyperlink.attributes["w:anchor"] {
+            return "#" + anchor
+        }
+        return nil
     }
 
     /// `w:t` text is concatenated verbatim, including any leading/trailing spaces — `xml:space`
     /// is a hint to XML WRITERS about whether to preserve whitespace-only nodes; a parser already
     /// reports the literal characters present, so there is nothing extra to honour here (and
     /// nothing here trims). `w:br`/`w:tab` are not text but stand for one, so they are turned
-    /// into `\n`/`\t` in place. A run producing no text at all (formatting-only, or an empty
+    /// into `\n`/`\t` in place. `w:sym` is a special-character reference (`w:font`+`w:char`, a
+    /// code point in that FONT's own private encoding, e.g. Wingdings) with no `w:t` fallback at
+    /// all — this reader has no way to map an arbitrary symbol-font code point to a real Unicode
+    /// glyph, but silently emitting nothing would make the author's character disappear entirely
+    /// (the one unforgivable failure this sprint exists to close), so it becomes a visible
+    /// placeholder (▯) instead — wrong glyph, but honestly marked as "something was here", never
+    /// mistaken for empty content. A run producing no text at all (formatting-only, or an empty
     /// bookmark anchor Word occasionally wraps in its own run) yields no span — the caller must
     /// never see a phantom empty one.
     private static func buildSpan(from run: XMLNode) -> Span? {
@@ -560,12 +724,17 @@ enum DocxReader {
             case "w:t": text += child.text
             case "w:br": text += "\n"
             case "w:tab": text += "\t"
+            case "w:sym": text += "▯"
             default: continue
             }
         }
         guard !text.isEmpty else { return nil }
         let rPr = run.child("w:rPr")
-        return Span(text: text, bold: isOn(rPr, "w:b"), italic: isOn(rPr, "w:i"), underline: isOn(rPr, "w:u"))
+        let vertAlign = rPr?.child("w:vertAlign")?.attributes["w:val"]
+        return Span(
+            text: text, bold: isOn(rPr, "w:b"), italic: isOn(rPr, "w:i"), underline: isOn(rPr, "w:u"),
+            strikethrough: isOn(rPr, "w:strike"), superscript: vertAlign == "superscript",
+            subscripted: vertAlign == "subscript")
     }
 
     /// A run-property toggle (`w:b`/`w:i`/`w:u`) is ON by its mere presence — UNLESS it carries
