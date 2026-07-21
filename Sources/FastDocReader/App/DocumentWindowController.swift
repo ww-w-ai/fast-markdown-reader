@@ -1,4 +1,5 @@
 import AppKit
+import UniformTypeIdentifiers
 
 final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTextViewDelegate,
                                      NSMenuItemValidation {
@@ -24,6 +25,13 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         return p
     }()
     private var sidebarItem: NSSplitViewItem!
+
+    // MARK: R5 — read-only badge + "Edit in <App>" (office documents only)
+    private let officeBadge = NSTextField(labelWithString: "Read-only")
+    private let editButton = NSButton(title: "", target: nil, action: nil)
+    private let editMenuButton = NSButton(title: "▾", target: nil, action: nil)
+    private var officeAccessoryHost: NSView!
+    private let externalEditorService = ExternalEditorService()
 
     convenience init() {
         let window = NSWindow(
@@ -100,6 +108,13 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         accessory.layoutAttribute = .leading
         accessory.view = sidebarButtonView()
         window.addTitlebarAccessoryViewController(accessory)
+        // R5: the read-only badge + edit-in-app button mirror invariant 26's leading accessory,
+        // just on the other side — `.trailing` puts it right of the title, not far-right (a
+        // toolbar item would land there regardless of identifier order; see invariant 26).
+        let officeAcc = NSTitlebarAccessoryViewController()
+        officeAcc.layoutAttribute = .trailing
+        officeAcc.view = officeAccessoryView()
+        window.addTitlebarAccessoryViewController(officeAcc)
         // NOT fullSizeContentView / titlebarAppearsTransparent. Tried, and wrong: it runs the
         // document up under the title bar so text scrolls through it. The title bar stays solid and
         // opaque, which is what Preview does too — the sidebar is a panel below it, not behind it.
@@ -320,6 +335,147 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         return host
     }
 
+    // MARK: R5 — read-only badge + edit-in-app button
+
+    private func officeAccessoryView() -> NSView {
+        officeBadge.font = .systemFont(ofSize: 11, weight: .semibold)
+        officeBadge.textColor = .white
+        officeBadge.alignment = .center
+        officeBadge.wantsLayer = true
+        officeBadge.layer?.backgroundColor = NSColor.systemRed.cgColor
+        officeBadge.layer?.cornerRadius = 6
+        officeBadge.translatesAutoresizingMaskIntoConstraints = false
+
+        editButton.bezelStyle = .texturedRounded
+        editButton.target = self
+        editButton.action = #selector(editButtonClicked(_:))
+        editButton.translatesAutoresizingMaskIntoConstraints = false
+
+        editMenuButton.bezelStyle = .texturedRounded
+        editMenuButton.target = self
+        editMenuButton.action = #selector(showEditMenu(_:))
+        editMenuButton.translatesAutoresizingMaskIntoConstraints = false
+
+        let host = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 28))
+        host.isHidden = true   // shown only once `updateOfficeAccessory` sees an office document
+        host.addSubview(officeBadge)
+        host.addSubview(editButton)
+        host.addSubview(editMenuButton)
+        NSLayoutConstraint.activate([
+            officeBadge.leadingAnchor.constraint(equalTo: host.leadingAnchor, constant: 6),
+            officeBadge.centerYAnchor.constraint(equalTo: host.centerYAnchor),
+            officeBadge.widthAnchor.constraint(greaterThanOrEqualToConstant: 62),
+            officeBadge.heightAnchor.constraint(equalToConstant: 18),
+
+            editButton.leadingAnchor.constraint(equalTo: officeBadge.trailingAnchor, constant: 8),
+            editButton.centerYAnchor.constraint(equalTo: host.centerYAnchor),
+            editButton.heightAnchor.constraint(equalToConstant: 22),
+
+            editMenuButton.leadingAnchor.constraint(equalTo: editButton.trailingAnchor, constant: 2),
+            editMenuButton.centerYAnchor.constraint(equalTo: host.centerYAnchor),
+            editMenuButton.widthAnchor.constraint(equalToConstant: 20),
+            editMenuButton.heightAnchor.constraint(equalToConstant: 22),
+            editMenuButton.trailingAnchor.constraint(equalTo: host.trailingAnchor, constant: -6),
+        ])
+        officeAccessoryHost = host
+        return host
+    }
+
+    /// Called from every render pass (`display(_:)`), same as `reloadOutline()` — the badge/button
+    /// must reflect the CURRENT document, not whatever was open when the window was built.
+    private func updateOfficeAccessory() {
+        guard let doc = document as? MarkdownDocument, doc.kind == .office else {
+            officeAccessoryHost.isHidden = true
+            return
+        }
+        officeAccessoryHost.isHidden = false
+        let ext = doc.fileURL?.pathExtension.lowercased() ?? ""
+        editButton.title = ExternalEditor.editLabel(for: externalEditorService.rememberedCandidate(forExtension: ext))
+    }
+
+    /// Body click (S7-6/S7-7): open directly if an app is remembered; otherwise there is nothing to
+    /// launch yet, so fall through to the same picker the arrow shows.
+    @objc private func editButtonClicked(_ sender: Any?) {
+        guard let (doc, ext) = officeDocumentContext() else { return }
+        if let app = externalEditorService.rememberedCandidate(forExtension: ext) {
+            openExternally(doc, with: app)
+        } else {
+            presentEditMenu(forExtension: ext, anchor: editButton)
+        }
+    }
+
+    @objc private func showEditMenu(_ sender: Any?) {
+        guard let (_, ext) = officeDocumentContext() else { return }
+        presentEditMenu(forExtension: ext, anchor: editMenuButton)
+    }
+
+    private func officeDocumentContext() -> (MarkdownDocument, String)? {
+        guard let doc = document as? MarkdownDocument, doc.kind == .office,
+              let url = doc.fileURL else { return nil }
+        return (doc, url.pathExtension.lowercased())
+    }
+
+    /// The arrow's menu: every candidate app (S7-3 already excludes us), a checkmark on whichever
+    /// one is currently remembered, then `Choose other app…`.
+    private func presentEditMenu(forExtension ext: String, anchor: NSView) {
+        let remembered = externalEditorService.rememberedCandidate(forExtension: ext)
+        let menu = NSMenu()
+        for app in externalEditorService.candidates(forExtension: ext) {
+            let item = NSMenuItem(title: app.displayName,
+                                  action: #selector(chooseCandidateFromMenu(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = app
+            item.state = (app.bundleIdentifier == remembered?.bundleIdentifier) ? .on : .off
+            menu.addItem(item)
+        }
+        if !menu.items.isEmpty { menu.addItem(.separator()) }
+        let other = NSMenuItem(title: "Choose Other App…",
+                               action: #selector(chooseOtherApp(_:)), keyEquivalent: "")
+        other.target = self
+        menu.addItem(other)
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: anchor.bounds.height + 4), in: anchor)
+    }
+
+    @objc private func chooseCandidateFromMenu(_ sender: NSMenuItem) {
+        guard let app = sender.representedObject as? ExternalEditor.AppCandidate,
+              let (doc, ext) = officeDocumentContext() else { return }
+        externalEditorService.remember(app, forExtension: ext)
+        editButton.title = ExternalEditor.editLabel(for: app)
+        openExternally(doc, with: app)
+    }
+
+    /// S7-6: `Choose other app…` — an `NSOpenPanel` restricted to `/Applications`. The user's own
+    /// selection grants access to that app regardless of what the sandbox otherwise allows.
+    @objc private func chooseOtherApp(_ sender: Any?) {
+        guard let (doc, ext) = officeDocumentContext() else { return }
+        let panel = NSOpenPanel()
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        panel.allowedContentTypes = [.application]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        guard panel.runModal() == .OK, let appURL = panel.url,
+              let app = externalEditorService.appCandidate(from: appURL) else { return }
+        externalEditorService.remember(app, forExtension: ext)
+        editButton.title = ExternalEditor.editLabel(for: app)
+        openExternally(doc, with: app)
+    }
+
+    /// S7-8/S7-9: hand the document to the chosen app. The sandbox hand-off itself was NOT
+    /// verified here — see the sprint report — so a failure surfaces as an alert rather than
+    /// being swallowed.
+    private func openExternally(_ doc: MarkdownDocument, with app: ExternalEditor.AppCandidate) {
+        guard let url = doc.fileURL else { return }
+        externalEditorService.open(url, with: app) { [weak self] error in
+            guard let error, let window = self?.window else { return }
+            let a = NSAlert()
+            a.alertStyle = .warning
+            a.messageText = "Couldn't open \(app.displayName)"
+            a.informativeText = error.localizedDescription
+            a.beginSheetModal(for: window)
+        }
+    }
+
     /// Grey the menu item out where a table of contents would be empty, rather than opening an empty
     /// panel and leaving the reader to work out why.
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
@@ -354,6 +510,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         textView.textStorage?.setAttributedString(attributed)
         textView.recomputeHeadingOffsets()
         reloadOutline()
+        updateOfficeAccessory()
         textView.resetCaret()
         window?.makeFirstResponder(textView)
         // Re-apply the column and place buttons after layout has established real sizes.
