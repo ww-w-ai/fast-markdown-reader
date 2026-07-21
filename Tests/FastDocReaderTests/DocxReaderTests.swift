@@ -1380,6 +1380,132 @@ final class DocxReaderTests: XCTestCase {
         XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Caption")])])
     }
 
+    // MARK: Charts / SmartArt (S9) — mc:Fallback picture recovery, and the placeholder frame
+    //
+    // Word wraps a chart/SmartArt `w:drawing` in `mc:AlternateContent`: `mc:Choice` holds the
+    // graphicFrame (`c:chart`/`dgm:relIds`) this reader has no vector renderer for, `mc:Fallback`
+    // holds an already-rendered VML picture of that very chart/diagram for an older reader. Since
+    // this reader never reached `mc:Fallback` before this sprint, both objects vanished with zero
+    // trace (gap-list rows 11/12) — these tests prove the fallback picture is now reached, and that
+    // the placeholder only appears when there is genuinely nothing else to show.
+
+    private func chartGraphicFrame(cx: Int, cy: Int) -> String {
+        """
+        <w:drawing><wp:inline><wp:extent cx="\(cx)" cy="\(cy)"/>
+          <a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart">
+            <c:chart r:id="rId99"/>
+          </a:graphicData></a:graphic>
+        </wp:inline></w:drawing>
+        """
+    }
+
+    private func smartArtGraphicFrame(cx: Int, cy: Int) -> String {
+        """
+        <w:drawing><wp:inline><wp:extent cx="\(cx)" cy="\(cy)"/>
+          <a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/diagram">
+            <dgm:relIds r:dm="rId10" r:lo="rId11" r:qs="rId12" r:cs="rId13"/>
+          </a:graphicData></a:graphic>
+        </wp:inline></w:drawing>
+        """
+    }
+
+    /// The win the sprint exists for: a chart's `mc:Choice` resolves to nothing (no `a:blip`, no
+    /// `w:txbxContent`), so the reader now reaches into `mc:Fallback` and recovers the picture Word
+    /// already rendered there — the user sees the actual chart, not an empty gap.
+    func testChartWithUsableVMLFallbackRendersThatPictureNotAPlaceholder() throws {
+        let blocks = try read(
+            document: """
+            <w:p><w:r><mc:AlternateContent>
+              <mc:Choice Requires="c">\(chartGraphicFrame(cx: 914_400, cy: 914_400))</mc:Choice>
+              <mc:Fallback>\(vmlPict(style: "width:180pt;height:90pt", rId: "rIdFallback"))</mc:Fallback>
+            </mc:AlternateContent></w:r></w:p>
+            """,
+            rels: rels([(id: "rIdFallback", target: "media/chart1.png", external: false)]))
+        XCTAssertEqual(blocks, [.image(id: "word/media/chart1.png", size: CGSize(width: 180, height: 90))])
+    }
+
+    /// Same recovery for SmartArt (`dgm:relIds`, no `c:chart`) — proves the fallback path isn't
+    /// chart-specific.
+    func testSmartArtWithUsableVMLFallbackRendersThatPictureNotAPlaceholder() throws {
+        let blocks = try read(
+            document: """
+            <w:p><w:r><mc:AlternateContent>
+              <mc:Choice Requires="dgm">\(smartArtGraphicFrame(cx: 914_400, cy: 914_400))</mc:Choice>
+              <mc:Fallback>\(vmlPict(style: "width:200pt;height:100pt", rId: "rIdFallback"))</mc:Fallback>
+            </mc:AlternateContent></w:r></w:p>
+            """,
+            rels: rels([(id: "rIdFallback", target: "media/diagram1.png", external: false)]))
+        XCTAssertEqual(blocks, [.image(id: "word/media/diagram1.png", size: CGSize(width: 200, height: 100))])
+    }
+
+    /// No `mc:Fallback` element at all — the placeholder is the only honest option, sized from the
+    /// SAME `wp:extent` a picture would have used, labelled for a reader ("Chart"), never the XML
+    /// element name.
+    func testChartWithNoFallbackAtAllProducesVisiblePlaceholderAtDeclaredSize() throws {
+        let blocks = try read(
+            document: "<w:p><w:r><mc:AlternateContent><mc:Choice Requires=\"c\">\(chartGraphicFrame(cx: 6_400_800, cy: 2_352_675))</mc:Choice></mc:AlternateContent></w:r></w:p>",
+            rels: nil)
+        XCTAssertEqual(blocks, [.unsupportedGraphic(label: "Chart", size: CGSize(width: 504, height: 185.25))])
+    }
+
+    /// `mc:Fallback` IS present but resolves to no picture (an unresolvable relationship id) — still
+    /// the placeholder, not a crash and not silence.
+    func testChartWithUnresolvableFallbackStillProducesPlaceholder() throws {
+        let blocks = try read(
+            document: """
+            <w:p><w:r><mc:AlternateContent>
+              <mc:Choice Requires="c">\(chartGraphicFrame(cx: 914_400, cy: 914_400))</mc:Choice>
+              <mc:Fallback></mc:Fallback>
+            </mc:AlternateContent></w:r></w:p>
+            """,
+            rels: nil)
+        XCTAssertEqual(blocks, [.unsupportedGraphic(label: "Chart", size: CGSize(width: 72, height: 72))])
+    }
+
+    /// A standalone chart graphicFrame with NO `mc:AlternateContent` wrapper at all (some producers
+    /// skip the legacy-fallback ceremony entirely) — there is no Fallback to try, so this is the
+    /// placeholder's only chance, reached through the plain `w:drawing` case, not the
+    /// `mc:AlternateContent` one.
+    func testStandaloneChartWithNoAlternateContentWrapperProducesPlaceholder() throws {
+        let blocks = try read(
+            document: "<w:p><w:r>\(chartGraphicFrame(cx: 914_400, cy: 914_400))</w:r></w:p>", rels: nil)
+        XCTAssertEqual(blocks, [.unsupportedGraphic(label: "Chart", size: CGSize(width: 72, height: 72))])
+    }
+
+    /// Regression: a PLAIN picture inside `mc:AlternateContent` (the pre-existing, most common
+    /// case) must still render exactly as before — Choice yields a real image, so the new
+    /// Fallback/placeholder machinery must never engage at all. Mirrors
+    /// `testAlternateContentEmitsOnlyTheChoiceImageNeverTheFallback` above; kept here too because
+    /// mutation testing this exact scenario is what proves the new three-way branch didn't regress
+    /// the two-way one it replaced.
+    func testPlainPictureInAlternateContentIsUnaffectedByTheNewChartFallbackLogic() throws {
+        let blocks = try read(
+            document: """
+            <w:p><w:r><mc:AlternateContent>
+              <mc:Choice Requires="wpg">\(drawing(cx: 914_400, cy: 914_400, embed: "rId8"))</mc:Choice>
+              <mc:Fallback>\(vmlPict(style: "width:72pt;height:72pt", rId: "rId8"))</mc:Fallback>
+            </mc:AlternateContent></w:r></w:p>
+            """,
+            rels: rels([(id: "rId8", target: "media/image1.png", external: false)]))
+        XCTAssertEqual(blocks, [.image(id: "word/media/image1.png", size: CGSize(width: 72, height: 72))])
+    }
+
+    /// Invariant 29: a chart-bearing document must be reachable through `MarkdownDocument`'s own
+    /// read path (`DocumentTypes.readOffice`), not merely through `DocxReader.read` called
+    /// directly — the same blindness invariant 29 already caught once for `.odt`.
+    func testChartFallbackPictureIsReachedThroughDocumentTypesReadOfficeNotJustDocxReaderDirectly() throws {
+        let document = doc("""
+        <w:p><w:r><mc:AlternateContent>
+          <mc:Choice Requires="c">\(chartGraphicFrame(cx: 914_400, cy: 914_400))</mc:Choice>
+          <mc:Fallback>\(vmlPict(style: "width:100pt;height:50pt", rId: "rIdFallback"))</mc:Fallback>
+        </mc:AlternateContent></w:r></w:p>
+        """)
+        let zip = buildDocx(document: document, rels: rels([(id: "rIdFallback", target: "media/chart1.png", external: false)]))
+        let archive = try ZipArchive(data: zip)
+        let blocks = try DocumentTypes.readOffice(archive, extension: "docx")
+        XCTAssertEqual(blocks, [.image(id: "word/media/chart1.png", size: CGSize(width: 100, height: 50))])
+    }
+
     func testVMLShapeWithUnparseableStyleEmitsNonZeroFallbackSizeNotZero() throws {
         let blocks = try read(
             document: "<w:p><w:r><w:pict><v:shape><v:imagedata r:id=\"rId10\"/></v:shape></w:pict></w:r></w:p>",

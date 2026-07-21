@@ -929,7 +929,7 @@ final class OdtReaderTests: XCTestCase {
         let allText = blocks.flatMap { block -> [String] in
             switch block {
             case .paragraph(let spans), .heading(_, let spans), .listItem(_, _, let spans, _): return spans.map(\.text)
-            case .table, .image: return []
+            case .table, .image, .unsupportedGraphic: return []
             }
         }.joined()
         XCTAssertTrue(allText.contains("Section text."))

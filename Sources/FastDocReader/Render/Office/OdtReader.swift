@@ -148,7 +148,7 @@ enum OdtReader {
         case .heading(let level, let spans): return .heading(level: level, spans: [marker, noteMarkerSeparator] + spans)
         case .listItem(let level, let ordered, let spans, let itemMarker):
             return .listItem(level: level, ordered: ordered, spans: [marker, noteMarkerSeparator] + spans, marker: itemMarker)
-        case .table, .image: return nil
+        case .table, .image, .unsupportedGraphic: return nil
         }
     }
 
@@ -490,7 +490,7 @@ enum OdtReader {
         switch block {
         case .paragraph(let spans), .heading(_, let spans), .listItem(_, _, let spans, _):
             return spans.isEmpty
-        case .table, .image:
+        case .table, .image, .unsupportedGraphic:
             return false
         }
     }

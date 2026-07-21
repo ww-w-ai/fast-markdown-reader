@@ -47,6 +47,7 @@ final class CorpusProbeTests: XCTestCase {
             case .listItem: listItems += 1
             case .table: tables += 1
             case .image: images += 1
+            case .unsupportedGraphic: images += 1  // chart/SmartArt placeholder — tallied with images, no dedicated bucket needed for this probe
             }
         }
     }

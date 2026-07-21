@@ -183,7 +183,7 @@ enum DocxReader {
         case .heading(let level, let spans): return .heading(level: level, spans: [marker] + spans)
         case .listItem(let level, let ordered, let spans, let itemMarker):
             return .listItem(level: level, ordered: ordered, spans: [marker] + spans, marker: itemMarker)
-        case .table, .image: return nil
+        case .table, .image, .unsupportedGraphic: return nil
         }
     }
 
@@ -571,27 +571,72 @@ enum DocxReader {
     /// an AutoShape/text-box group is common (a callout box, a decorative rule) and reserving
     /// image space with a broken-picture placeholder for one would tell the reader a picture
     /// failed to load when there never was one. Such a shape contributes its TEXT instead, if it
-    /// has any (`w:txbxContent`), and nothing at all if it has neither picture nor text.
+    /// has any (`w:txbxContent`); a chart or SmartArt diagram (no picture, no text either) gets
+    /// `graphicPlaceholderBlock` instead of nothing at all — but only when `allowGraphicPlaceholder`
+    /// says this is the right point in the walk to decide that (see below).
+    ///
+    /// `allowGraphicPlaceholder` exists because `mc:AlternateContent` needs three-way, not
+    /// two-way, resolution — `mc:Choice` handled normally when it renders SOMETHING; failing that,
+    /// `mc:Fallback` (Word's own already-rendered VML picture of the very chart/diagram `mc:Choice`
+    /// couldn't be drawn from — reachable for the first time by this sprint); only when NEITHER
+    /// yields anything does a placeholder get drawn. Recursing into `mc:Choice`/`mc:Fallback` with
+    /// `allowGraphicPlaceholder: false` lets this same function do the picture-then-text resolution
+    /// for each half without either one jumping ahead to a placeholder on its own — the
+    /// `mc:AlternateContent` case below is the ONLY place that decides "neither half gave us
+    /// anything, use the placeholder", exactly once per `mc:AlternateContent`, from the CHOICE
+    /// half's own declared size (Word always duplicates `wp:extent` onto both halves, but Choice is
+    /// the modern, up-to-date wrapper and is preferred for consistency with the "Choice wins" rule
+    /// everywhere else in this function).
     private static func collectDrawingBlocks(
         in node: XMLNode, styleInfo: StyleInfo, numbering: NumberingInfo, relationships: Relationships,
-        notes: NoteNumbering, listState: ListNumberingState
+        notes: NoteNumbering, listState: ListNumberingState, allowGraphicPlaceholder: Bool = true
     ) -> [OfficeBlock] {
         var blocks: [OfficeBlock] = []
         func walk(_ node: XMLNode) {
             for child in node.children {
                 switch child.name {
                 case "mc:AlternateContent":
-                    // `children.first` — if several `mc:Choice` were ever present, the first is
-                    // Word's own preferred rendering.
-                    if let choice = child.child("mc:Choice") { walk(choice) }
+                    guard let choice = child.child("mc:Choice") else { continue }
+                    let choiceBlocks = collectDrawingBlocks(
+                        in: choice, styleInfo: styleInfo, numbering: numbering, relationships: relationships,
+                        notes: notes, listState: listState, allowGraphicPlaceholder: false)
+                    if !choiceBlocks.isEmpty {
+                        blocks.append(contentsOf: choiceBlocks)
+                        continue
+                    }
+                    // Choice gave us nothing renderable (the chart/diagram case) — reach for the
+                    // Fallback Word left for exactly this situation: an older reader's rendering,
+                    // most often a `w:pict`/VML picture of the SAME chart/diagram, walked through
+                    // the identical "w:pict" case below (so its own picture-vs-text resolution,
+                    // and any relationship-id lookup, is reused unchanged, not reimplemented here).
+                    let fallbackBlocks = child.child("mc:Fallback").map {
+                        collectDrawingBlocks(
+                            in: $0, styleInfo: styleInfo, numbering: numbering, relationships: relationships,
+                            notes: notes, listState: listState, allowGraphicPlaceholder: false)
+                    } ?? []
+                    if !fallbackBlocks.isEmpty {
+                        blocks.append(contentsOf: fallbackBlocks)
+                    } else if allowGraphicPlaceholder,
+                              let drawing = choice.firstDescendant("w:drawing"),
+                              let placeholder = graphicPlaceholderBlock(for: drawing) {
+                        blocks.append(placeholder)
+                    }
                 case "w:drawing":
                     let pictures = imageBlocks(fromDrawing: child, relationships: relationships)
                     if !pictures.isEmpty {
                         blocks.append(contentsOf: pictures)
-                    } else {
-                        blocks.append(contentsOf: textBoxBlocks(
-                            in: child, styleInfo: styleInfo, numbering: numbering,
-                            relationships: relationships, notes: notes, listState: listState))
+                        continue
+                    }
+                    let text = textBoxBlocks(
+                        in: child, styleInfo: styleInfo, numbering: numbering,
+                        relationships: relationships, notes: notes, listState: listState)
+                    if !text.isEmpty {
+                        blocks.append(contentsOf: text)
+                    } else if allowGraphicPlaceholder, let placeholder = graphicPlaceholderBlock(for: child) {
+                        // A chart/diagram with no `mc:AlternateContent` wrapper at all (some
+                        // producers emit one without the legacy-fallback ceremony) — there is no
+                        // Fallback to try, so this is the placeholder's only chance to appear.
+                        blocks.append(placeholder)
                     }
                 case "w:pict":
                     if let block = imageBlock(fromPict: child, relationships: relationships) {
@@ -608,6 +653,40 @@ enum DocxReader {
         }
         walk(node)
         return blocks
+    }
+
+    /// Detects a `w:drawing` whose content is a chart or SmartArt diagram graphicFrame — DrawingML
+    /// this reader has no vector renderer for. Neither has an `a:blip` (a picture) nor a
+    /// `w:txbxContent` (typed caption text), so `imageBlocks`/`textBoxBlocks` both return empty and
+    /// — absent this — the whole object vanishes with no trace at all (gap-list rows 11/12: every
+    /// box, label and connector of a SmartArt diagram, or an entire embedded chart, silently gone).
+    ///
+    /// Detected by the DrawingML element the chart/diagram part is actually REFERENCED through —
+    /// `c:chart` (a chart's `r:id` back to `word/charts/chartN.xml`) or `dgm:relIds` (a SmartArt
+    /// diagram's `r:dm`/`r:lo`/`r:qs`/`r:cs` back to `word/diagrams/*.xml`) — never by
+    /// `a:graphicData`'s `uri` string, which is a full schema URL this reader would otherwise have
+    /// to string-match loosely for no real gain (the two element names are exact and unambiguous).
+    /// Returns `nil` for anything else — an AutoShape/connector group with no picture and no typed
+    /// text (already covered by `textBoxBlocks`'s own tests) is legitimately EMPTY, not a graphic
+    /// this reader failed to render; placeholder-ing it would misreport "something is missing here"
+    /// for a callout box the author genuinely left blank.
+    private static func graphicPlaceholderBlock(for drawing: XMLNode) -> OfficeBlock? {
+        let label: String
+        if drawing.firstDescendant("c:chart") != nil {
+            label = "Chart"
+        } else if drawing.firstDescendant("dgm:relIds") != nil {
+            label = "Diagram"
+        } else {
+            return nil
+        }
+        // Same element, same units, same conversion `imageBlocks` reads its own picture sizing
+        // from — a chart/diagram graphicFrame carries `wp:extent` on the identical
+        // `wp:inline`/`wp:anchor` wrapper a picture would.
+        guard let extent = drawing.firstDescendant("wp:extent"),
+              let cx = extent.attributes["cx"].flatMap(Double.init),
+              let cy = extent.attributes["cy"].flatMap(Double.init)
+        else { return nil }
+        return .unsupportedGraphic(label: label, size: CGSize(width: emuToPoints(cx), height: emuToPoints(cy)))
     }
 
     /// A shape's caption/callout text lives in `w:txbxContent` (one or more, nested arbitrarily
@@ -641,7 +720,7 @@ enum DocxReader {
         switch block {
         case .paragraph(let spans), .heading(_, let spans), .listItem(_, _, let spans, _):
             return spans.isEmpty
-        case .table, .image:
+        case .table, .image, .unsupportedGraphic:
             return false
         }
     }

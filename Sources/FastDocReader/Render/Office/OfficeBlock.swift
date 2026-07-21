@@ -103,4 +103,18 @@ enum OfficeBlock: Equatable {
     /// a not-yet-loaded markdown image (invariant 1: reserved size must never depend on whether
     /// pixels are loaded).
     case image(id: String, size: CGSize)
+    /// A chart or SmartArt diagram: DrawingML content this reader has no vector renderer for and
+    /// for which no already-rendered `mc:Fallback` picture could be recovered either (see
+    /// `DocxReader.graphicPlaceholderBlock`). Deliberately its OWN case rather than reusing
+    /// `.image` with a synthetic id: an `.image` id names something `MarkdownDocument`'s async
+    /// loader is expected to go find pixels FOR (an archive entry, a folder-grant path, or — when
+    /// that lookup fails — the SAME generic "broken image" icon a corrupt picture reference gets).
+    /// This case is different in kind, not just in degree: there was never any picture to look up
+    /// in the first place, so showing the broken-image icon would misreport a decoding failure
+    /// that didn't happen. `label` is the pre-formatted, reader-facing word to draw in the frame
+    /// ("Chart", "Diagram" — never an XML element name); `size` is the drawing's own declared area
+    /// (`wp:extent`, EMU-converted exactly like `.image`'s size), reserved up front and never
+    /// revised — there is no later pixel arrival to protect invariant 1 against here, since unlike
+    /// `.image` this case's rendering is synthesized once, fully, at build time.
+    case unsupportedGraphic(label: String, size: CGSize)
 }

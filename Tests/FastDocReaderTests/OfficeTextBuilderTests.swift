@@ -571,6 +571,51 @@ final class OfficeTextBuilderTests: XCTestCase {
         XCTAssertEqual(cell?.reservedSize, declared)
     }
 
+    // MARK: Chart/SmartArt placeholder frame (S9)
+
+    /// Invariant 1's equivalent for this case: unlike `.image`, there is no later pixel arrival at
+    /// all — the frame is drawn ONCE, right here, so `attachment.image` must be non-nil IMMEDIATELY
+    /// (never `nil`-then-loaded), and `.bounds` (what this case's layout size is actually read
+    /// from — see `appendUnsupportedGraphic`'s doc comment on why NOT `SizedAttachmentCell`) must
+    /// match the declared size exactly, read TWICE to prove nothing here can revise it later.
+    func testUnsupportedGraphicReservesExactSizeWithPixelsAlreadyPresent() throws {
+        let size = CGSize(width: 300, height: 150)
+        let out = build([.unsupportedGraphic(label: "Chart", size: size)])
+        var found: NSTextAttachment?
+        out.enumerateAttribute(.attachment, in: NSRange(location: 0, length: out.length)) { value, _, _ in
+            if let att = value as? NSTextAttachment { found = att }
+        }
+        let attachment = try XCTUnwrap(found)
+        XCTAssertNotNil(attachment.image, "the frame is synthesized at build time — never nil, never loaded later")
+        XCTAssertEqual(attachment.bounds.size, size)
+        XCTAssertEqual(attachment.bounds.size, size, "reading it a second time must yield the identical size")
+    }
+
+    /// The declared area still respects column-fitting, exactly like `.image` — a wide chart must
+    /// not overflow the reading column.
+    func testUnsupportedGraphicWiderThanColumnScalesDownProportionally() throws {
+        let declared = CGSize(width: 2000, height: 1000)
+        let out = OfficeTextBuilder.build([.unsupportedGraphic(label: "Diagram", size: declared)],
+                                          theme: theme, columnWidth: 700)
+        let bounds = out.attribute(.attachment, at: 0, effectiveRange: nil)
+            .flatMap { ($0 as? NSTextAttachment)?.bounds.size }
+        XCTAssertEqual(bounds?.width ?? 0, 700, accuracy: 0.5)
+        XCTAssertEqual(bounds?.height ?? 0, 350, accuracy: 0.5)
+    }
+
+    /// `MDAttr.image` (the id an office image's async pixel loader keys off of, see
+    /// `MarkdownDocument.reconcileMedia`) must NOT be attached to this block — there is no id here
+    /// for that loader to look up, and letting it try would be reaching for pixels that were never
+    /// going to arrive.
+    func testUnsupportedGraphicCarriesNoMDAttrImageID() {
+        let out = build([.unsupportedGraphic(label: "Chart", size: CGSize(width: 100, height: 50))])
+        var sawImageAttr = false
+        out.enumerateAttribute(MDAttr.image, in: NSRange(location: 0, length: out.length)) { value, _, _ in
+            if value != nil { sawImageAttr = true }
+        }
+        XCTAssertFalse(sawImageAttr)
+    }
+
     // MARK: Cells hold blocks now (S7)
 
     /// The regression guard the sprint brief calls out by name: a cell built the OLD way

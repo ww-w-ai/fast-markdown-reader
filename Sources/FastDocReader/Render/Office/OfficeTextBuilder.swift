@@ -58,6 +58,9 @@ enum OfficeTextBuilder {
 
             case let .image(id, size):
                 appendImage(id: id, size: size, columnWidth: columnWidth, into: result)
+
+            case let .unsupportedGraphic(label, size):
+                appendUnsupportedGraphic(label: label, size: size, columnWidth: columnWidth, into: result)
             }
             tagBlock(from: start)
         }
@@ -301,6 +304,11 @@ enum OfficeTextBuilder {
                 if result.length > 0, result.string.hasSuffix("\n") {
                     result.deleteCharacters(in: NSRange(location: result.length - 1, length: 1))
                 }
+            case let .unsupportedGraphic(label, size):
+                appendUnsupportedGraphic(label: label, size: size, columnWidth: .greatestFiniteMagnitude, into: result)
+                if result.length > 0, result.string.hasSuffix("\n") {
+                    result.deleteCharacters(in: NSRange(location: result.length - 1, length: 1))
+                }
             }
             if index < blocks.count - 1 {
                 result.append(NSAttributedString(string: "\n", attributes: [.font: baseFont]))
@@ -360,6 +368,45 @@ enum OfficeTextBuilder {
         let ph = NSMutableAttributedString(attachment: att)
         ph.addAttribute(MDAttr.image, value: id, range: NSRange(location: 0, length: ph.length))
         result.append(ph)
+        result.append(NSAttributedString(string: "\n"))
+    }
+
+    /// A chart/SmartArt this reader could not resolve to any picture at all — reserves the SAME
+    /// declared+column-fitted area `appendImage` would, drawn as a bordered, labelled frame
+    /// SYNTHESIZED RIGHT HERE rather than left for `MarkdownDocument.reconcileMedia` to fill in
+    /// later. Deliberately NOT built through `SizedAttachmentCell` the way `appendImage`'s
+    /// reserved-but-unloaded state is (measured: `NSTextAttachment` drops a custom
+    /// `attachmentCell` the moment `.image` is set — AppKit switches to its own bounds-based
+    /// image layout at that point, the SAME mechanism `reconcileMedia`'s "pixels already loaded,
+    /// just repaint" branch relies on) — so sizing here comes from `.bounds` alone, set once,
+    /// alongside an `.image` that is never nil to begin with. Invariant 1 (reserved size must
+    /// never depend on whether pixels are loaded) holds trivially: there is no "not yet loaded"
+    /// state for this case at all, so nothing here can ever revise `.bounds` after the fact.
+    /// `label` renders verbatim — the caller (`DocxReader`) already turned it into a word a reader
+    /// understands ("Chart", "Diagram"), never an XML element name.
+    private static func appendUnsupportedGraphic(label: String, size: CGSize, columnWidth: CGFloat,
+                                                  into result: NSMutableAttributedString) {
+        let fitted = fittedOfficeSize(size, columnWidth: columnWidth)
+        let frame = NSImage(size: fitted, flipped: false) { rect in
+            Palette.codeCardBg.setFill()
+            rect.fill()
+            Palette.codeCardBorder.setStroke()
+            NSBezierPath(rect: rect.insetBy(dx: 0.5, dy: 0.5)).stroke()
+            let text = "[\(label)]" as NSString
+            let fontSize = max(9, min(14, rect.height * 0.18))
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: fontSize),
+                .foregroundColor: Palette.secondary,
+            ]
+            let textSize = text.size(withAttributes: attrs)
+            let origin = NSPoint(x: (rect.width - textSize.width) / 2, y: (rect.height - textSize.height) / 2)
+            text.draw(at: origin, withAttributes: attrs)
+            return true
+        }
+        let att = NSTextAttachment()
+        att.bounds = NSRect(origin: .zero, size: fitted)
+        att.image = frame
+        result.append(NSAttributedString(attachment: att))
         result.append(NSAttributedString(string: "\n"))
     }
 }
