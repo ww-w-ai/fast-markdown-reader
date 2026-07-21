@@ -10,3 +10,5 @@ DerivedData/
 # ignored since the repo went public, but only commit-log/ ever was — the rest was merely untracked,
 # which is one `git add .` away from being public. Ignore the folder, as documented.
 docs/
+# Sprint orchestration state — a working file for the run in progress, not a repo artifact.
+.ww-w-ai/
