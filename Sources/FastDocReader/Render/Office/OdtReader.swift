@@ -278,6 +278,10 @@ enum OdtReader {
                         child, make: { .paragraph(spans: $0) }, textStyles: textStyles, archive: archive, notes: notes))
                 }
             case "text:hidden-paragraph":
+                // Verified against OASIS ODF 1.3 schema (element text:hidden-paragraph):
+                // text:condition is REQUIRED, text:is-hidden is OPTIONAL (text:boolean), content
+                // model is mixed content (same as text:p — spans directly, no wrapped text:p
+                // child). We deliberately do not evaluate text:condition (see below).
                 // ODF's PARAGRAPH-level "show under a condition" field — same content model as
                 // `text:p` (spec: same child elements). `text:is-hidden` is the file's OWN
                 // LAST-COMPUTED display state; this reader never evaluates `text:condition`
@@ -695,6 +699,9 @@ enum OdtReader {
                     markerStyle.superscript = true
                     appendMerging(marker, markerStyle, link)
                 case "text:hidden-text":
+                    // Verified against OASIS ODF 1.3 schema (element text:hidden-text):
+                    // text:condition and text:string-value are REQUIRED, text:is-hidden is
+                    // OPTIONAL (text:boolean) — used as an empty field in practice.
                     // ODF's RUN-level "show under a condition" field. Unlike `text:hidden-paragraph`
                     // (which wraps ordinary content), this is an EMPTY field element — its display
                     // text is CACHED in `text:string-value` (ODF's standard "field caches its last-
@@ -705,6 +712,10 @@ enum OdtReader {
                         appendMerging(child.attributes["text:string-value"] ?? "", style, link)
                     }
                 case "text:conditional-text":
+                    // Verified against OASIS ODF 1.3 schema (element text:conditional-text):
+                    // text:condition, text:string-value-if-true, text:string-value-if-false are
+                    // REQUIRED; text:current-value is OPTIONAL (text:boolean) — used as an empty
+                    // field in practice.
                     // ODF's "one of two alternative texts, selected by a formula" field — also an
                     // EMPTY element. `text:current-value` records which branch the formula last
                     // evaluated to; this reader trusts that recorded state rather than evaluating
