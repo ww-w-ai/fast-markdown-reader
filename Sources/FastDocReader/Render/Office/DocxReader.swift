@@ -1,5 +1,6 @@
 import Foundation
 import CoreGraphics
+import AppKit
 
 /// `.docx` bytes → `[OfficeBlock]`. Word's own container is three XML parts inside the ZIP
 /// `ZipArchive` already knows how to open: `word/document.xml` (the body, required), and two
@@ -36,7 +37,8 @@ enum DocxReader {
         guard let documentRoot = try? buildTree(archive.data(for: "word/document.xml")) else {
             throw ReadError.malformedXML("word/document.xml")
         }
-        let styleInfo = parseStyles(from: archive)
+        let themeColors = parseThemeColors(from: archive)
+        let styleInfo = parseStyles(from: archive, themeColors: themeColors)
         let numbering = parseNumbering(from: archive)
         let relationships = parseRelationships(from: archive)
         guard let body = documentRoot.child("w:body") else { return [] }
@@ -64,6 +66,26 @@ enum DocxReader {
             styleInfo: styleInfo, numbering: numbering, relationships: relationships, notes: notes,
             listState: listState)
         return bodyBlocks + noteBlocks
+    }
+
+    /// The source document's own default BODY run size, in points — `word/styles.xml`'s
+    /// `w:docDefaults/w:rPrDefault/w:rPr/w:sz` (HALF-points), or Word's own fallback of 11pt when
+    /// the document declares none at all (no `word/styles.xml`, no `w:docDefaults`, or no `w:sz`
+    /// inside it). This is the OTHER half of `OfficeTextBuilder.build`'s font-size model — see its
+    /// `documentDefaultFontSize` parameter's own doc — and today ONLY exposes the real value; wiring
+    /// it into that call is `MarkdownDocument.setOfficeContent`'s/`DocumentTypes.readOffice`'s job,
+    /// both outside this sprint's exclusive file scope (`DocxReader.swift`/`DocxReaderTests.swift`
+    /// only) — see this sprint's return report. Deliberately a SEPARATE entry point rather than a
+    /// change to `read`'s own return type: `read`'s `[OfficeBlock]` shape is depended on by
+    /// `DocumentTypes.readOffice` and `MarkdownDocument`, neither of which this sprint may touch.
+    static func documentDefaultFontSize(from archive: ZipArchive) -> CGFloat {
+        guard archive.contains("word/styles.xml"),
+              let data = try? archive.data(for: "word/styles.xml"),
+              let root = try? buildTree(data),
+              let szVal = root.child("w:docDefaults")?.child("w:rPrDefault")?.child("w:rPr")?.child("w:sz")?.attributes["w:val"],
+              let half = Double(szVal)
+        else { return 11 }
+        return CGFloat(half / 2)
     }
 
     // MARK: Footnotes / endnotes
@@ -196,6 +218,27 @@ enum DocxReader {
     /// something like 제목 1, but a style's ID is NOT localized: a Korean, Japanese or German Word
     /// install still writes `w:styleId="Heading2"` even though the NAME it shows the user differs.
     /// That is what makes mechanism (b) below safe to use — matching the id, never the name.
+    /// A style's own run formatting — `w:rPr` on a `w:style`, resolved to the SAME literal shape
+    /// `Span` itself carries (colour already resolved against the theme, size already in points),
+    /// so `resolvedColor`/`resolvedFontSize`/… never have to re-resolve anything once they find an
+    /// entry here. `nil` per field means that field, specifically, wasn't set at this style — the
+    /// caller's chain walk keeps climbing `basedOn` for THAT field alone, not the whole struct.
+    private struct RunStyleProps {
+        var color: NSColor?
+        var highlight: NSColor?
+        var fontSize: CGFloat?
+        var fontName: String?
+    }
+
+    /// A style's own paragraph formatting relevant to this sprint — `w:jc`/`w:tabs` off a
+    /// `w:style`'s `w:pPr`. `tabStops == nil` means this style declared none (keep climbing);
+    /// an EXPLICIT empty list never occurs from `parseTabStops` (see its own doc), so there is no
+    /// "explicitly no tabs" state to lose by using `nil` for both meanings.
+    private struct ParaStyleProps {
+        var alignment: NSTextAlignment?
+        var tabStops: [CGFloat]?
+    }
+
     private struct StyleInfo {
         /// styleId → its OWN declared `w:outlineLvl`, only for styles that declare one at all
         /// (most custom styles, and many built-in `HeadingN` styles that instead rely on their id —
@@ -203,17 +246,39 @@ enum DocxReader {
         var outlineLevels: [String: Int] = [:]
         /// styleId → the styleId it's `w:basedOn`, for styles that declare one.
         var basedOn: [String: String] = [:]
+        /// styleId → its own `w:rPr`, only for styles that set at least one of the four fields.
+        var runProps: [String: RunStyleProps] = [:]
+        /// styleId → its own `w:pPr`'s `w:jc`/`w:tabs`, only for styles that set at least one.
+        var paraProps: [String: ParaStyleProps] = [:]
+        /// The document's theme colour scheme (`word/theme/theme1.xml`), keyed by scheme slot name
+        /// (`"dk1"`, `"accent1"`, …) — carried ON `StyleInfo` rather than threaded as its own
+        /// parameter through every function that already takes `styleInfo`, since every one of
+        /// those call sites needs it for exactly the same reason (resolving a run's `w:themeColor`)
+        /// this struct's OWN `runProps` were already resolved against it. Empty when
+        /// `word/theme/theme1.xml` is absent or malformed — every theme-colour lookup then simply
+        /// misses, degrading to "no colour" (`resolvedColorElement`), never a crash.
+        var themeColors: [String: NSColor] = [:]
     }
 
-    /// Reads both signals `resolvedOutlineLevel` needs: a style's own explicit `w:outlineLvl` (if
-    /// any), and its `w:basedOn` parent (if any) — everything else about the style is irrelevant
-    /// here. A style declaring neither is simply absent from both maps.
-    private static func parseStyles(from archive: ZipArchive) -> StyleInfo {
+    /// Reads every per-style signal this reader now resolves through the `w:basedOn` chain:
+    /// `resolvedOutlineLevel`'s pair (`w:outlineLvl`, `w:basedOn`), plus this sprint's own run
+    /// (`RunStyleProps`) and paragraph (`ParaStyleProps`) formatting. `themeColors` is resolved
+    /// ONCE by the caller (`read`) and passed in so a style's own `w:color/@w:themeColor` resolves
+    /// to the same literal every direct-run lookup does. A style declaring none of these is simply
+    /// absent from every map — `resolvedOutlineLevel`'s existing "not a heading" reading, and the
+    /// new resolvers' "keep climbing" reading, both already treat absence that way.
+    private static func parseStyles(from archive: ZipArchive, themeColors: [String: NSColor]) -> StyleInfo {
+        // `themeColors` must survive even when `word/styles.xml` itself is absent — a direct RUN
+        // can carry a `w:themeColor` with no style involved at all, and that lookup goes through
+        // THIS `StyleInfo`'s `themeColors` field (see `buildSpan`). An early `StyleInfo()` here,
+        // discarding the parameter, was a real bug this sprint caught: it silently dropped every
+        // theme colour in any document with no styles part.
+        var info = StyleInfo()
+        info.themeColors = themeColors
         guard archive.contains("word/styles.xml"),
               let data = try? archive.data(for: "word/styles.xml"),
               let root = try? buildTree(data)
-        else { return StyleInfo() }
-        var info = StyleInfo()
+        else { return info }
         for style in root.children where style.name == "w:style" {
             guard let id = style.attributes["w:styleId"] else { continue }
             if let val = style.child("w:pPr")?.child("w:outlineLvl")?.attributes["w:val"], let level = Int(val) {
@@ -222,8 +287,252 @@ enum DocxReader {
             if let parent = style.child("w:basedOn")?.attributes["w:val"] {
                 info.basedOn[id] = parent
             }
+            let runProps = parseRunStyleProps(style.child("w:rPr"), themeColors: themeColors)
+            if runProps.color != nil || runProps.highlight != nil || runProps.fontSize != nil || runProps.fontName != nil {
+                info.runProps[id] = runProps
+            }
+            let paraProps = parseParaStyleProps(style.child("w:pPr"))
+            if paraProps.alignment != nil || paraProps.tabStops != nil {
+                info.paraProps[id] = paraProps
+            }
         }
         return info
+    }
+
+    /// One style's (or one run's own) `w:rPr`, reduced to the four fields this sprint resolves —
+    /// shared by `parseStyles` (a style's `w:rPr`) and `buildSpan` (a run's direct `w:rPr`), so a
+    /// literal-colour hex, a themeColor reference, a half-point size and an `w:rFonts` choice are
+    /// each read exactly once, the same way, regardless of which level of the chain they came from.
+    private static func parseRunStyleProps(_ rPr: XMLNode?, themeColors: [String: NSColor]) -> RunStyleProps {
+        var props = RunStyleProps()
+        props.color = resolvedColorElement(rPr?.child("w:color"), themeColors: themeColors)
+        if let val = rPr?.child("w:highlight")?.attributes["w:val"] {
+            props.highlight = highlightColor(named: val)
+        }
+        if let szVal = rPr?.child("w:sz")?.attributes["w:val"], let half = Double(szVal) {
+            props.fontSize = CGFloat(half / 2)
+        }
+        // `w:rFonts` carries separate attributes for Latin (`w:ascii`), East Asian (`w:eastAsia`),
+        // complex-script (`w:cs`) and a "high ANSI" fallback (`w:hAnsi`) text — Word substitutes
+        // whichever applies per RUN OF CHARACTERS within the same text, something this reader's
+        // single `Span.fontName` has no room to express. `w:ascii` is read as the representative
+        // choice: it is the font Word itself falls back to for any character its other three
+        // attributes don't specifically claim, i.e. the document's "default" declared font, and by
+        // far the most common case (plain Latin body text) has ONLY `w:ascii`/`w:hAnsi` set to the
+        // same value anyway. `w:hAnsi` is the fallback when `w:ascii` is absent (Word requires at
+        // least one of the two on any `w:rFonts` that names a Latin font at all).
+        if let rFonts = rPr?.child("w:rFonts") {
+            props.fontName = rFonts.attributes["w:ascii"] ?? rFonts.attributes["w:hAnsi"]
+        }
+        return props
+    }
+
+    /// One style's (or one paragraph's own) `w:pPr`, reduced to `w:jc`/`w:tabs` — shared by
+    /// `parseStyles` and `parseParagraph`'s direct-`pPr` read, the same way `parseRunStyleProps` is.
+    private static func parseParaStyleProps(_ pPr: XMLNode?) -> ParaStyleProps {
+        var props = ParaStyleProps()
+        if let val = pPr?.child("w:jc")?.attributes["w:val"] {
+            props.alignment = alignmentFromJc(val)
+        }
+        if let tabsNode = pPr?.child("w:tabs") {
+            let stops = parseTabStops(tabsNode)
+            if !stops.isEmpty { props.tabStops = stops }
+        }
+        return props
+    }
+
+    /// `w:jc`'s values per ECMA-376 §17.18.44 (`ST_Jc`): `"both"`/`"distribute"` are Word's two
+    /// justify-both-edges variants (this reader doesn't distinguish letter-spacing distribution
+    /// from ordinary justification — `NSTextAlignment` has no third option), `"start"`/`"end"` are
+    /// the writing-direction-relative synonyms for `"left"`/`"right"` newer Word versions also
+    /// emit. Anything else (`"center"` aside, every value here) that ISN'T one of these seven is
+    /// left unresolved (`nil`) — the paragraph then falls back to whatever `rtl`/the theme's own
+    /// default decides, exactly as an absent `w:jc` already does.
+    private static func alignmentFromJc(_ val: String) -> NSTextAlignment? {
+        switch val {
+        case "left", "start": return .left
+        case "right", "end": return .right
+        case "center": return .center
+        case "both", "distribute": return .justified
+        default: return nil
+        }
+    }
+
+    /// `w:tabs`'s own `w:tab` children, each `w:pos` in TWIPS (Word's unit here, 20ths of a point —
+    /// the SAME unit `w:tblW`/`w:tcW` use, see `cellWidth`) converted to points. A `w:val="clear"`
+    /// entry REMOVES an inherited stop at that position rather than adding one of its own — this
+    /// reader has no per-position merge against an ancestor's stops to remove FROM (an inherited
+    /// list is taken or left whole, never spliced — see `ParaStyleProps`'s doc), so a `clear` entry
+    /// is simply skipped rather than emitted as a phantom stop at that position. A `w:tab` missing
+    /// `w:pos` entirely (malformed) is skipped the same way — there is no position to place it at.
+    private static func parseTabStops(_ tabsNode: XMLNode) -> [CGFloat] {
+        tabsNode.children.compactMap { tab -> CGFloat? in
+            guard tab.name == "w:tab", tab.attributes["w:val"] != "clear" else { return nil }
+            guard let posStr = tab.attributes["w:pos"], let pos = Double(posStr) else { return nil }
+            return CGFloat(pos / 20)
+        }
+    }
+
+    /// Walks a style's `w:basedOn` chain (cycle-guarded exactly like `resolvedOutlineLevel`, whose
+    /// walk this generalizes) trying `resolve` at each style in turn: the NEAREST style that has an
+    /// answer wins, and a style with no answer for THIS property is transparent — the walk keeps
+    /// climbing past it rather than stopping. This is what makes "direct run wins over style, style
+    /// wins over its ancestors" hold per-PROPERTY, not per-style: a style can set `w:sz` and leave
+    /// colour to ITS ancestor, and this walk still finds the ancestor's colour.
+    private static func walkStyleChain<T>(_ pStyleId: String?, styleInfo: StyleInfo, resolve: (String) -> T?) -> T? {
+        guard var currentId = pStyleId else { return nil }
+        var visited = Set<String>()
+        while true {
+            guard !visited.contains(currentId) else { return nil }
+            visited.insert(currentId)
+            if let value = resolve(currentId) { return value }
+            guard let parent = styleInfo.basedOn[currentId] else { return nil }
+            currentId = parent
+        }
+    }
+
+    private static func resolvedColor(pStyleId: String?, styleInfo: StyleInfo) -> NSColor? {
+        walkStyleChain(pStyleId, styleInfo: styleInfo) { styleInfo.runProps[$0]?.color }
+    }
+
+    private static func resolvedHighlight(pStyleId: String?, styleInfo: StyleInfo) -> NSColor? {
+        walkStyleChain(pStyleId, styleInfo: styleInfo) { styleInfo.runProps[$0]?.highlight }
+    }
+
+    private static func resolvedFontSize(pStyleId: String?, styleInfo: StyleInfo) -> CGFloat? {
+        walkStyleChain(pStyleId, styleInfo: styleInfo) { styleInfo.runProps[$0]?.fontSize }
+    }
+
+    private static func resolvedFontName(pStyleId: String?, styleInfo: StyleInfo) -> String? {
+        walkStyleChain(pStyleId, styleInfo: styleInfo) { styleInfo.runProps[$0]?.fontName }
+    }
+
+    private static func resolvedAlignment(pStyleId: String?, styleInfo: StyleInfo) -> NSTextAlignment? {
+        walkStyleChain(pStyleId, styleInfo: styleInfo) { styleInfo.paraProps[$0]?.alignment }
+    }
+
+    private static func resolvedTabStops(pStyleId: String?, styleInfo: StyleInfo) -> [CGFloat]? {
+        walkStyleChain(pStyleId, styleInfo: styleInfo) { styleInfo.paraProps[$0]?.tabStops }
+    }
+
+    // MARK: word/theme/theme1.xml — theme colour scheme
+
+    /// `word/theme/theme1.xml`'s `a:clrScheme` names twelve fixed slots (`a:dk1`, `a:lt1`, `a:dk2`,
+    /// `a:lt2`, `a:accent1`…`a:accent6`, `a:hlink`, `a:folHlink`), each holding either a literal
+    /// `a:srgbClr/@val` or a `a:sysClr` (a named system colour, e.g. `"windowText"`) whose
+    /// `@lastClr` attribute is Office's own cached literal RGB for it — read here exactly like
+    /// `a:srgbClr`'s `val`, since that cached value is what Word itself actually painted with.
+    /// Absent or malformed (no `word/theme/theme1.xml` at all, or one without `a:clrScheme`)
+    /// degrades to an empty table, never a crash — every `w:themeColor` lookup against it then
+    /// simply misses, same as a document with no theme colours ever declared.
+    private static func parseThemeColors(from archive: ZipArchive) -> [String: NSColor] {
+        guard archive.contains("word/theme/theme1.xml"),
+              let data = try? archive.data(for: "word/theme/theme1.xml"),
+              let root = try? buildTree(data),
+              let clrScheme = root.firstDescendant("a:clrScheme")
+        else { return [:] }
+        var colors: [String: NSColor] = [:]
+        for slot in clrScheme.children where slot.name.hasPrefix("a:") {
+            let key = String(slot.name.dropFirst(2))
+            if let hex = slot.child("a:srgbClr")?.attributes["val"], let color = colorFromHex(hex) {
+                colors[key] = color
+            } else if let hex = slot.child("a:sysClr")?.attributes["lastClr"], let color = colorFromHex(hex) {
+                colors[key] = color
+            }
+        }
+        return colors
+    }
+
+    /// `w:themeColor`'s enumeration (ECMA-376 §17.18.98, `ST_ThemeColor`) names TEN colour roles —
+    /// `"dark1"`/`"light1"`/`"dark2"`/`"light2"` AND the semantically-named `"text1"`/
+    /// `"background1"`/`"text2"`/`"background2"` are two spellings for the SAME four scheme slots
+    /// (`dk1`/`lt1`/`dk2`/`lt2`) — plus `"accent1"`…`"accent6"` (spelled identically to their
+    /// scheme slot names, so no translation needed) and `"hyperlink"`/`"followedHyperlink"` (the
+    /// scheme's `hlink`/`folHlink`, abbreviated). `nil` for anything else (there is nothing else in
+    /// the enumeration, but a malformed document could carry a stray value) — the caller then finds
+    /// no colour, same as a `w:themeColor` slot the theme part itself never defined.
+    private static func themeSlotName(for themeColor: String) -> String? {
+        switch themeColor {
+        case "dark1", "text1": return "dk1"
+        case "light1", "background1": return "lt1"
+        case "dark2", "text2": return "dk2"
+        case "light2", "background2": return "lt2"
+        case "accent1", "accent2", "accent3", "accent4", "accent5", "accent6": return themeColor
+        case "hyperlink": return "hlink"
+        case "followedHyperlink": return "folHlink"
+        default: return nil
+        }
+    }
+
+    /// A `w:color` element (a run's own `w:rPr/w:color`, or a style's), resolved to a literal —
+    /// EITHER its literal `w:val` hex, OR — measured at 10% of the real corpus, a mechanism worth
+    /// doing properly rather than approximating — a `w:themeColor` reference resolved against
+    /// `themeColors`. `w:val="auto"` (Word's own "let the reader decide" sentinel) and an
+    /// unresolvable `w:themeColor` (an unrecognized slot name, or a theme part that doesn't define
+    /// it) both mean exactly what no `w:color` at all means — `nil`, "the theme's own text colour
+    /// decides" — never a fabricated black. `w:themeColor` wins when BOTH are present (Word always
+    /// writes a literal `w:val` alongside a `w:themeColor` as an older-reader fallback — the two are
+    /// never in real conflict, but the theme reference is the author's actual intent).
+    ///
+    /// `w:themeTint`/`w:themeShade` (a lightened/darkened variant of the resolved slot) are read off
+    /// the element by callers that want them but DELIBERATELY IGNORED here — see this sprint's
+    /// return report. Applying them correctly is a luminance-space transform (ECMA-376's own
+    /// algorithm operates in HSL, not a flat per-channel blend), and getting that wrong would be
+    /// worse than the brief's own explicitly offered fallback: resolve the base slot colour, as
+    /// authored, and leave it there.
+    private static func resolvedColorElement(_ colorNode: XMLNode?, themeColors: [String: NSColor]) -> NSColor? {
+        guard let colorNode else { return nil }
+        if let themeColor = colorNode.attributes["w:themeColor"], let slot = themeSlotName(for: themeColor) {
+            if let resolved = themeColors[slot] { return resolved }
+        }
+        guard let val = colorNode.attributes["w:val"], val.lowercased() != "auto" else { return nil }
+        return colorFromHex(val)
+    }
+
+    /// `w:highlight`'s value (ECMA-376 §17.18.40, `ST_HighlightColor`) is a NAME from a fixed
+    /// 17-entry enumeration, not a hex value — unlike `w:color`/`w:shd`, which are always literal
+    /// or theme-relative. The sixteen real colours' RGB equivalents below are the standard values
+    /// every Open XML implementation (Word itself, the published Open XML SDK enumeration) assigns
+    /// to these exact names — read FROM the spec's own enumeration semantics, not copied out of
+    /// another project's lookup table (this project's licence rule forbids that; see
+    /// `mappedSymbolCharacter`'s doc for the same reasoning applied to `w:sym`). `"none"` and
+    /// anything unrecognized both return `nil` — no highlight — never a guessed colour.
+    private static func highlightColor(named name: String) -> NSColor? {
+        let hex: String?
+        switch name {
+        case "black": hex = "000000"
+        case "blue": hex = "0000FF"
+        case "cyan": hex = "00FFFF"
+        case "darkBlue": hex = "00008B"
+        case "darkCyan": hex = "008B8B"
+        case "darkGray": hex = "A9A9A9"
+        case "darkGreen": hex = "006400"
+        case "darkMagenta": hex = "8B008B"
+        case "darkRed": hex = "8B0000"
+        case "darkYellow": hex = "808000"
+        case "green": hex = "00FF00"
+        case "lightGray": hex = "D3D3D3"
+        case "magenta": hex = "FF00FF"
+        case "red": hex = "FF0000"
+        case "white": hex = "FFFFFF"
+        case "yellow": hex = "FFFF00"
+        default: hex = nil // "none", or anything unrecognized.
+        }
+        return hex.flatMap(colorFromHex)
+    }
+
+    /// A bare 6-digit `RRGGBB` hex string (docx never emits alpha in `w:val`/`w:fill`/`@lastClr`) →
+    /// `NSColor`. `nil` for anything that isn't exactly 6 hex digits (a malformed document, or —
+    /// for `w:fill` specifically — the literal string `"auto"`, already filtered by every caller
+    /// before it reaches here).
+    private static func colorFromHex(_ hex: String) -> NSColor? {
+        var digits = hex
+        if digits.hasPrefix("#") { digits.removeFirst() }
+        guard digits.count == 6, let value = UInt32(digits, radix: 16) else { return nil }
+        return NSColor(
+            srgbRed: CGFloat((value >> 16) & 0xFF) / 255,
+            green: CGFloat((value >> 8) & 0xFF) / 255,
+            blue: CGFloat(value & 0xFF) / 255, alpha: 1)
     }
 
     /// Mechanism (b): a built-in heading style's id IS its heading level — `Heading1`…`Heading9`,
@@ -985,7 +1294,26 @@ enum DocxReader {
         // ALSO needs the basedOn chain to reach it is a real possibility this reader doesn't yet
         // resolve — narrower than "wrong", but worth stating rather than silently assuming.
         let rtl = isOn(pPr, "w:bidi")
-        let spans = collectSpans(in: p, relationships: relationships, notes: notes)
+        // `pStyleId` is read here for `alignment`/`tabStops`' style-chain fallback below; `collectSpans`
+        // reads its own copy off `p`'s `w:pPr` directly (see its doc) rather than receiving it as a
+        // parameter, but it is the SAME value — both read the identical `w:pPr/w:pStyle` off the
+        // identical paragraph node.
+        let pStyleIdForAlignment = pPr?.child("w:pStyle")?.attributes["w:val"]
+        // An EXPLICIT `w:jc` on this paragraph always wins; failing that, the style chain (S13's
+        // `basedOn` walk, reused via `resolvedAlignment`) — never a hardcoded `.left`. This is what
+        // must win over `rtl`'s own implicit edge (see `OfficeBlock`'s doc): `OfficeTextBuilder`
+        // already gives an explicit `alignment` that precedence, so resolving it correctly here is
+        // the whole of this reader's part of that contract.
+        let alignment = pPr?.child("w:jc")?.attributes["w:val"].flatMap(alignmentFromJc)
+            ?? resolvedAlignment(pStyleId: pStyleIdForAlignment, styleInfo: styleInfo)
+        let tabStops: [CGFloat] = {
+            if let tabsNode = pPr?.child("w:tabs") {
+                let stops = parseTabStops(tabsNode)
+                if !stops.isEmpty { return stops }
+            }
+            return resolvedTabStops(pStyleId: pStyleIdForAlignment, styleInfo: styleInfo) ?? []
+        }()
+        let spans = collectSpans(in: p, styleInfo: styleInfo, relationships: relationships, notes: notes)
         let drawingBlocks = collectDrawingBlocks(
             in: p, styleInfo: styleInfo, numbering: numbering, relationships: relationships,
             notes: notes, listState: listState)
@@ -1012,7 +1340,8 @@ enum DocxReader {
         let textBlock: OfficeBlock?
         let skipEmptyText = spans.isEmpty && (!drawingBlocks.isEmpty || !formulaBlocks.isEmpty)
         if let level = headingLevel(pPr: pPr, pStyleId: pStyleId, styleInfo: styleInfo) {
-            textBlock = skipEmptyText ? nil : .heading(level: level, spans: spans, rtl: rtl)
+            textBlock = skipEmptyText ? nil
+                : .heading(level: level, spans: spans, rtl: rtl, alignment: alignment, tabStops: tabStops)
         } else if let numPr = pPr?.child("w:numPr") {
             let ilvl = Int(numPr.child("w:ilvl")?.attributes["w:val"] ?? "") ?? 0
             let numId = numPr.child("w:numId")?.attributes["w:val"]
@@ -1021,12 +1350,15 @@ enum DocxReader {
             // never a list item.
             if let info = numberedListInfo(numId: numId, ilvl: ilvl, info: numbering, state: listState) {
                 textBlock = skipEmptyText ? nil
-                    : .listItem(level: ilvl, ordered: info.ordered, spans: spans, marker: info.marker, rtl: rtl)
+                    : .listItem(level: ilvl, ordered: info.ordered, spans: spans, marker: info.marker, rtl: rtl,
+                                alignment: alignment, tabStops: tabStops)
             } else {
-                textBlock = skipEmptyText ? nil : .paragraph(spans: spans, rtl: rtl)
+                textBlock = skipEmptyText ? nil
+                    : .paragraph(spans: spans, rtl: rtl, alignment: alignment, tabStops: tabStops)
             }
         } else {
-            textBlock = skipEmptyText ? nil : .paragraph(spans: spans, rtl: rtl)
+            textBlock = skipEmptyText ? nil
+                : .paragraph(spans: spans, rtl: rtl, alignment: alignment, tabStops: tabStops)
         }
         var blocks: [OfficeBlock] = []
         if let textBlock { blocks.append(textBlock) }
@@ -1122,7 +1454,11 @@ enum DocxReader {
                     let blocks = collectCellBlocks(
                         tc, styleInfo: styleInfo, numbering: numbering, relationships: relationships, notes: notes,
                         listState: listState)
-                    rowCells.append(Cell(blocks: blocks, rowSpan: 1, colSpan: colSpan))
+                    let (borderColor, borderWidth) = cellBorder(tcPr)
+                    rowCells.append(Cell(
+                        blocks: blocks, rowSpan: 1, colSpan: colSpan,
+                        backgroundColor: cellShading(tcPr), borderColor: borderColor, borderWidth: borderWidth,
+                        width: cellWidth(tcPr)))
                     if vMerge != nil {
                         // `val="restart"` — the top of a genuine new vertical-merge chain; later
                         // `continue` cells at this column extend THIS cell's `rowSpan`.
@@ -1161,6 +1497,54 @@ enum DocxReader {
         return .table(rows: rows, headerRows: headerRows)
     }
 
+    /// A cell's own shading — `w:tcPr/w:shd/@w:fill`, a literal hex colour, or the string
+    /// `"auto"`, Word's own "no fill" sentinel (the overwhelmingly common case — most cells carry
+    /// an explicit `w:shd` with `fill="auto"` even when the author never touched shading at all,
+    /// since Word writes it as part of the cell's resolved formatting). `"auto"` reads as `nil` —
+    /// unshaded — exactly like an absent `w:shd` entirely, never as a fabricated colour.
+    private static func cellShading(_ tcPr: XMLNode?) -> NSColor? {
+        guard let fill = tcPr?.child("w:shd")?.attributes["w:fill"], fill.lowercased() != "auto" else { return nil }
+        return colorFromHex(fill)
+    }
+
+    /// A cell's border, reduced to the ONE colour/width `Cell` has room for (see its own doc: a
+    /// real per-edge model is out of this sprint's scope) — the first of `w:tcBorders`' four edges,
+    /// checked top/left/bottom/right, that is actually drawn (`w:val` present and neither `"nil"`
+    /// nor `"none"`, OOXML's two ways of saying "no border on this edge"). Real tables overwhelmingly
+    /// border all four edges identically, so "the first drawn edge" and "the cell's border" agree in
+    /// practice; a cell with genuinely mixed edges loses that distinction, honestly, rather than
+    /// this reader inventing a fifth field nothing here would fill in consistently. `w:sz` is in
+    /// EIGHTHS of a point (ECMA-376 §17.4.66) — divided by 8, not 2 (that's `w:sz`'s OTHER unit,
+    /// half-points, used for run/paragraph mark sizes — the two `w:sz` attributes are unrelated
+    /// despite sharing a name). `w:color="auto"` resolves to `nil` (theme decides), same as
+    /// `w:fill`'s identical sentinel above.
+    private static func cellBorder(_ tcPr: XMLNode?) -> (color: NSColor?, width: CGFloat?) {
+        guard let borders = tcPr?.child("w:tcBorders") else { return (nil, nil) }
+        for edge in ["w:top", "w:left", "w:bottom", "w:right"] {
+            guard let e = borders.child(edge), let val = e.attributes["w:val"], val != "nil", val != "none" else { continue }
+            let color = e.attributes["w:color"].flatMap { $0.lowercased() == "auto" ? nil : colorFromHex($0) }
+            let width = e.attributes["w:sz"].flatMap(Double.init).map { CGFloat($0 / 8) }
+            return (color, width)
+        }
+        return (nil, nil)
+    }
+
+    /// A cell's own declared column width — `w:tcPr/w:tcW`, whose `@w:type` names which of THREE
+    /// unit systems `@w:w` is in (ECMA-376 §17.4.90, `ST_TblWidth`): `"dxa"` (twentieths of a
+    /// point — the SAME twips `parseTabStops` converts), `"pct"` (fiftieths of a percent of the
+    /// table's available width) or `"auto"` (no declared width at all, Word sizes the column
+    /// itself). Only `"dxa"` is handled — it is both the common case in practice and the only one
+    /// this reader can convert to an ABSOLUTE point value from the cell's own markup alone; `"pct"`
+    /// would need the table's own resolved available width (from `w:tblPr/w:tblW` and the page's
+    /// margins) to turn a percentage into points, which is real work this sprint's brief scopes
+    /// out — skipped here, honestly, rather than guessed at. A `w:tcW` with no `@w:type` at all
+    /// defaults to `"dxa"` per the same clause, which is why `nil`/`"dxa"` are treated alike.
+    private static func cellWidth(_ tcPr: XMLNode?) -> CGFloat? {
+        guard let tcW = tcPr?.child("w:tcW"), let wStr = tcW.attributes["w:w"], let value = Double(wStr) else { return nil }
+        guard tcW.attributes["w:type"] == nil || tcW.attributes["w:type"] == "dxa" else { return nil }
+        return CGFloat(value / 20)
+    }
+
     /// A cell's content, built from the SAME per-block classification `parseParagraph` gives the
     /// body — a paragraph, a heading, a list item, an image — rather than a second, cell-only walk
     /// that only ever knew how to collect plain text. This is what closes gap-list rows 6 and 7:
@@ -1197,7 +1581,7 @@ enum DocxReader {
                     child, styleInfo: styleInfo, numbering: numbering, relationships: relationships, notes: notes,
                     listState: listState))
             case "w:tbl":
-                let spans = flattenNestedTable(child, relationships: relationships, notes: notes)
+                let spans = flattenNestedTable(child, styleInfo: styleInfo, relationships: relationships, notes: notes)
                 if !spans.isEmpty { blocks.append(.paragraph(spans: spans)) }
             case "w:sdt":
                 if let content = child.child("w:sdtContent") {
@@ -1216,17 +1600,17 @@ enum DocxReader {
     /// which deliberately squashes a nested table's grid down to text (`Cell` has no room for a
     /// second, real nested `.table` block). `collectCellBlocks` above is what a table's OWN cells
     /// go through now; this stays exactly as it was for the flatten-only path.
-    private static func collectCellSpans(_ tc: XMLNode, relationships: Relationships, notes: NoteNumbering) -> [Span] {
+    private static func collectCellSpans(_ tc: XMLNode, styleInfo: StyleInfo, relationships: Relationships, notes: NoteNumbering) -> [Span] {
         var spans: [Span] = []
         for child in tc.children {
             switch child.name {
             case "w:p":
-                spans.append(contentsOf: collectSpans(in: child, relationships: relationships, notes: notes))
+                spans.append(contentsOf: collectSpans(in: child, styleInfo: styleInfo, relationships: relationships, notes: notes))
             case "w:tbl":
-                spans.append(contentsOf: flattenNestedTable(child, relationships: relationships, notes: notes))
+                spans.append(contentsOf: flattenNestedTable(child, styleInfo: styleInfo, relationships: relationships, notes: notes))
             case "w:sdt":
                 if let content = child.child("w:sdtContent") {
-                    spans.append(contentsOf: collectCellSpans(content, relationships: relationships, notes: notes))
+                    spans.append(contentsOf: collectCellSpans(content, styleInfo: styleInfo, relationships: relationships, notes: notes))
                 }
             default:
                 continue
@@ -1241,12 +1625,12 @@ enum DocxReader {
     /// `collectCellSpans`, so a table nested inside a nested table (and a content control inside
     /// THAT) also survives — no depth cap is enforced; real documents don't go more than one or
     /// two levels, per the research survey.
-    private static func flattenNestedTable(_ table: XMLNode, relationships: Relationships, notes: NoteNumbering) -> [Span] {
+    private static func flattenNestedTable(_ table: XMLNode, styleInfo: StyleInfo, relationships: Relationships, notes: NoteNumbering) -> [Span] {
         var spans: [Span] = []
         for row in table.children where row.name == "w:tr" {
             var rowHasContent = false
             for cell in row.children where cell.name == "w:tc" {
-                let cellSpans = collectCellSpans(cell, relationships: relationships, notes: notes)
+                let cellSpans = collectCellSpans(cell, styleInfo: styleInfo, relationships: relationships, notes: notes)
                 guard !cellSpans.isEmpty else { continue }
                 if rowHasContent { spans.append(Span(text: "\t")) }
                 spans.append(contentsOf: cellSpans)
@@ -1274,7 +1658,13 @@ enum DocxReader {
     /// mistaken for one. Only elements known to carry NO renderable body text of their own are
     /// pruned: paragraph/run properties (formatting only), deleted-content wrappers, empty
     /// markers, and section properties.
-    private static func collectSpans(in node: XMLNode, relationships: Relationships, notes: NoteNumbering) -> [Span] {
+    private static func collectSpans(in node: XMLNode, styleInfo: StyleInfo, relationships: Relationships, notes: NoteNumbering) -> [Span] {
+        // The paragraph's own style id, read off THIS node's `w:pPr` directly — every caller passes
+        // the paragraph (`w:p`) itself as `node` (`parseParagraph`, `collectCellSpans`'s `w:p` case),
+        // never a sub-element, so this is the same `w:pPr/w:pStyle` `parseParagraph` itself reads for
+        // `headingLevel`/`alignment` — read again here rather than threaded as a separate parameter,
+        // since every call site already has `node` in hand and nothing else about that lookup varies.
+        let pStyleId = node.child("w:pPr")?.child("w:pStyle")?.attributes["w:val"]
         var spans: [Span] = []
         // Names collected from `w:bookmarkStart` since the last span was emitted, waiting for the
         // next real content to attach to (a bookmark almost always wraps its target rather than
@@ -1385,7 +1775,7 @@ enum DocxReader {
                             continue
                         }
                     }
-                    if var span = buildSpan(from: child) {
+                    if var span = buildSpan(from: child, styleInfo: styleInfo, pStyleId: pStyleId) {
                         span.link = link
                         appendMerging(span)
                     }
@@ -1464,7 +1854,7 @@ enum DocxReader {
         }
     }
 
-    private static func buildSpan(from run: XMLNode) -> Span? {
+    private static func buildSpan(from run: XMLNode, styleInfo: StyleInfo, pStyleId: String?) -> Span? {
         var text = ""
         for child in run.children {
             switch child.name {
@@ -1494,10 +1884,24 @@ enum DocxReader {
         // with confidence from a run alone, so it is left unhandled rather than guessed at.
         if isOn(rPr, "w:vanish") { return nil }
         let vertAlign = rPr?.child("w:vertAlign")?.attributes["w:val"]
+        // Direct run properties WIN over the paragraph's style chain — read straight off THIS run's
+        // own `w:rPr` first, and only consult `resolvedColor`/`resolvedHighlight`/`resolvedFontSize`/
+        // `resolvedFontName` (the `basedOn`-chain walk, S13's reused mechanism) when this run didn't
+        // say. `styleInfo.themeColors` is threaded through `resolvedColorElement` so a THEME colour
+        // on a direct run resolves to the identical literal a style-level one would.
+        let directColor = resolvedColorElement(rPr?.child("w:color"), themeColors: styleInfo.themeColors)
+        let color = directColor ?? resolvedColor(pStyleId: pStyleId, styleInfo: styleInfo)
+        let directHighlight = rPr?.child("w:highlight")?.attributes["w:val"].flatMap(highlightColor(named:))
+        let highlight = directHighlight ?? resolvedHighlight(pStyleId: pStyleId, styleInfo: styleInfo)
+        let directFontSize: CGFloat? = rPr?.child("w:sz")?.attributes["w:val"].flatMap(Double.init).map { CGFloat($0 / 2) }
+        let fontSize = directFontSize ?? resolvedFontSize(pStyleId: pStyleId, styleInfo: styleInfo)
+        let directFontName = rPr?.child("w:rFonts").flatMap { $0.attributes["w:ascii"] ?? $0.attributes["w:hAnsi"] }
+        let fontName = directFontName ?? resolvedFontName(pStyleId: pStyleId, styleInfo: styleInfo)
         return Span(
             text: text, bold: isOn(rPr, "w:b"), italic: isOn(rPr, "w:i"), underline: isOn(rPr, "w:u"),
             strikethrough: isOn(rPr, "w:strike"), superscript: vertAlign == "superscript",
-            subscripted: vertAlign == "subscript", rtl: isOn(rPr, "w:rtl"))
+            subscripted: vertAlign == "subscript", rtl: isOn(rPr, "w:rtl"),
+            textColor: color, highlightColor: highlight, fontSize: fontSize, fontName: fontName)
     }
 
     /// A run-property toggle (`w:b`/`w:i`/`w:u`) is ON by its mere presence — UNLESS it carries

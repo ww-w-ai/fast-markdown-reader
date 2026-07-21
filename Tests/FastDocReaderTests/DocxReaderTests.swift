@@ -1,4 +1,5 @@
 import XCTest
+import AppKit
 @testable import FastDocReader
 
 /// `DocxReader` is pure: build a `.docx`-shaped ZIP by hand (stored entries only — no need to
@@ -20,7 +21,8 @@ final class DocxReaderTests: XCTestCase {
     /// at all omits the `.rels` part too — several tests below exercise both).
     private func buildDocx(
         document: String, styles: String? = nil, numbering: String? = nil, rels: String? = nil,
-        footnotes: String? = nil, endnotes: String? = nil, media: [(name: String, bytes: [UInt8])] = []
+        footnotes: String? = nil, endnotes: String? = nil, theme: String? = nil,
+        media: [(name: String, bytes: [UInt8])] = []
     ) -> Data {
         var entries: [(String, Data)] = [("word/document.xml", Data(document.utf8))]
         if let styles { entries.append(("word/styles.xml", Data(styles.utf8))) }
@@ -28,9 +30,34 @@ final class DocxReaderTests: XCTestCase {
         if let rels { entries.append(("word/_rels/document.xml.rels", Data(rels.utf8))) }
         if let footnotes { entries.append(("word/footnotes.xml", Data(footnotes.utf8))) }
         if let endnotes { entries.append(("word/endnotes.xml", Data(endnotes.utf8))) }
+        if let theme { entries.append(("word/theme/theme1.xml", Data(theme.utf8))) }
         for (name, bytes) in media { entries.append(("word/media/" + name, Data(bytes))) }
         return buildZip(entries)
     }
+
+    /// A minimal, real-shaped `a:clrScheme` — enough of `word/theme/theme1.xml` for
+    /// `DocxReader`'s theme-colour resolution tests without a full Office-authored theme part.
+    private let sampleTheme = """
+    <?xml version="1.0" encoding="UTF-8"?>
+    <a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+      <a:themeElements>
+        <a:clrScheme name="Office">
+          <a:dk1><a:sysClr val="windowText" lastClr="000000"/></a:dk1>
+          <a:lt1><a:sysClr val="window" lastClr="FFFFFF"/></a:lt1>
+          <a:dk2><a:srgbClr val="1F497D"/></a:dk2>
+          <a:lt2><a:srgbClr val="EEECE1"/></a:lt2>
+          <a:accent1><a:srgbClr val="4F81BD"/></a:accent1>
+          <a:accent2><a:srgbClr val="C0504D"/></a:accent2>
+          <a:accent3><a:srgbClr val="9BBB59"/></a:accent3>
+          <a:accent4><a:srgbClr val="8064A2"/></a:accent4>
+          <a:accent5><a:srgbClr val="4BACC6"/></a:accent5>
+          <a:accent6><a:srgbClr val="F79646"/></a:accent6>
+          <a:hlink><a:srgbClr val="0000FF"/></a:hlink>
+          <a:folHlink><a:srgbClr val="800080"/></a:folHlink>
+        </a:clrScheme>
+      </a:themeElements>
+    </a:theme>
+    """
 
     private func buildZip(_ entries: [(name: String, content: Data)]) -> Data {
         struct Prepared { let nameBytes: [UInt8]; let content: Data; let localOffset: Int }
@@ -101,6 +128,22 @@ final class DocxReaderTests: XCTestCase {
         let zip = buildDocx(document: doc(document), rels: rels, media: media)
         let archive = try ZipArchive(data: zip)
         return try DocxReader.read(archive)
+    }
+
+    private func read(document: String, styles: String?, theme: String?) throws -> [OfficeBlock] {
+        let zip = buildDocx(document: doc(document), styles: styles, theme: theme)
+        let archive = try ZipArchive(data: zip)
+        return try DocxReader.read(archive)
+    }
+
+    /// A bare 6-digit hex → `NSColor`, matching `DocxReader.colorFromHex`'s own reading — used by
+    /// tests to assert an expected literal without reaching into that private function.
+    private func rgb(_ hex: String) -> NSColor {
+        var digits = hex
+        if digits.hasPrefix("#") { digits.removeFirst() }
+        let value = UInt32(digits, radix: 16)!
+        return NSColor(srgbRed: CGFloat((value >> 16) & 0xFF) / 255, green: CGFloat((value >> 8) & 0xFF) / 255,
+                        blue: CGFloat(value & 0xFF) / 255, alpha: 1)
     }
 
     // MARK: Run reassembly
@@ -2066,5 +2109,261 @@ final class DocxReaderTests: XCTestCase {
     func testBareStandaloneOMathWithoutParaWrapperStillDegradesToText() throws {
         let blocks = try read(document: "<w:p><m:oMath>\(run("y"))</m:oMath></w:p>")
         XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "y")])])
+    }
+
+    // MARK: S14 — run colour, highlight, size, font family; paragraph alignment/tabs; cell
+    // shading/borders/width; document default body size; style inheritance.
+
+    /// A document with none of this sprint's new signals must render exactly as it did before it —
+    /// every new `Span`/`Cell` field stays at its own default (`nil`).
+    func testUnstyledDocumentSetsNoneOfThisSprintsNewFieldsAtAll() throws {
+        let blocks = try read(document: "<w:p><w:r><w:t>Plain</w:t></w:r></w:p>")
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Plain")])])
+    }
+
+    // MARK: w:color — literal, auto, theme
+
+    func testRunColorLiteralHexIsReadAsTheLiteralColor() throws {
+        let blocks = try read(document: "<w:p><w:r><w:rPr><w:color w:val=\"FF0000\"/></w:rPr><w:t>Red</w:t></w:r></w:p>")
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Red", textColor: rgb("FF0000"))])])
+    }
+
+    /// `w:val="auto"` is Word's OWN "let the reader decide" sentinel — it must resolve to `nil`
+    /// (the theme's own text colour), never to a fabricated black.
+    func testRunColorValAutoIsUnsetNotBlack() throws {
+        let blocks = try read(document: "<w:p><w:r><w:rPr><w:color w:val=\"auto\"/></w:rPr><w:t>Auto</w:t></w:r></w:p>")
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Auto")])])
+    }
+
+    func testThemeColorResolvesAgainstTheThemePartsLiteralValue() throws {
+        let blocks = try read(
+            document: "<w:p><w:r><w:rPr><w:color w:themeColor=\"accent1\"/></w:rPr><w:t>Theme</w:t></w:r></w:p>",
+            styles: nil, theme: sampleTheme)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Theme", textColor: rgb("4F81BD"))])])
+    }
+
+    /// `"text2"`/`"background1"` are the semantically-named spellings of the SAME `dk2`/`lt1` scheme
+    /// slots `"dark2"`/`"light1"` name — both must resolve to the identical literal.
+    func testThemeColorSemanticTextAndDarkSpellingsResolveToTheSameSlot() throws {
+        let semantic = try read(
+            document: "<w:p><w:r><w:rPr><w:color w:themeColor=\"text2\"/></w:rPr><w:t>T</w:t></w:r></w:p>",
+            styles: nil, theme: sampleTheme)
+        let literal = try read(
+            document: "<w:p><w:r><w:rPr><w:color w:themeColor=\"dark2\"/></w:rPr><w:t>T</w:t></w:r></w:p>",
+            styles: nil, theme: sampleTheme)
+        XCTAssertEqual(semantic, [.paragraph(spans: [Span(text: "T", textColor: rgb("1F497D"))])])
+        XCTAssertEqual(semantic, literal)
+    }
+
+    /// No `word/theme/theme1.xml` at all (most real documents never carry one) must degrade to no
+    /// colour, never crash and never fabricate one.
+    func testThemeColorWithNoThemePartPresentDegradesWithoutCrashing() throws {
+        let blocks = try read(document: "<w:p><w:r><w:rPr><w:color w:themeColor=\"accent1\"/></w:rPr><w:t>NoTheme</w:t></w:r></w:p>")
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "NoTheme")])])
+    }
+
+    // MARK: w:highlight — named colours, not hex
+
+    func testHighlightNamedColorResolvesToItsStandardRGB() throws {
+        let blocks = try read(document: "<w:p><w:r><w:rPr><w:highlight w:val=\"yellow\"/></w:rPr><w:t>Hi</w:t></w:r></w:p>")
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Hi", highlightColor: rgb("FFFF00"))])])
+    }
+
+    func testHighlightNoneMeansNoHighlight() throws {
+        let blocks = try read(document: "<w:p><w:r><w:rPr><w:highlight w:val=\"none\"/></w:rPr><w:t>Hi</w:t></w:r></w:p>")
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Hi")])])
+    }
+
+    // MARK: w:sz — half-points → points
+
+    func testHalfPointFontSizeConvertsToPoints() throws {
+        let blocks = try read(document: "<w:p><w:r><w:rPr><w:sz w:val=\"24\"/></w:rPr><w:t>Sized</w:t></w:r></w:p>")
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Sized", fontSize: 12)])])
+    }
+
+    // MARK: w:rFonts — w:ascii chosen, w:hAnsi fallback
+
+    func testRFontsAsciiIsChosenAsTheRunsFontFamily() throws {
+        let blocks = try read(document: """
+        <w:p><w:r><w:rPr><w:rFonts w:ascii="Georgia" w:hAnsi="Georgia" w:eastAsia="MS Mincho"/></w:rPr><w:t>Font</w:t></w:r></w:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Font", fontName: "Georgia")])])
+    }
+
+    func testRFontsFallsBackToHAnsiWhenAsciiIsAbsent() throws {
+        let blocks = try read(document: "<w:p><w:r><w:rPr><w:rFonts w:hAnsi=\"Calibri\"/></w:rPr><w:t>Font</w:t></w:r></w:p>")
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Font", fontName: "Calibri")])])
+    }
+
+    // MARK: w:docDefaults — the document's own default body size
+
+    func testDocumentDefaultFontSizeIsReadFromDocDefaults() throws {
+        let styles = "<w:styles><w:docDefaults><w:rPrDefault><w:rPr><w:sz w:val=\"20\"/></w:rPr></w:rPrDefault></w:docDefaults></w:styles>"
+        let zip = buildDocx(document: doc("<w:p><w:r><w:t>Body</w:t></w:r></w:p>"), styles: styles)
+        let archive = try ZipArchive(data: zip)
+        XCTAssertEqual(DocxReader.documentDefaultFontSize(from: archive), 10)
+    }
+
+    func testDocumentDefaultFontSizeFallsBackToElevenWhenNotDeclared() throws {
+        let zip = buildDocx(document: doc("<w:p><w:r><w:t>Body</w:t></w:r></w:p>"))
+        let archive = try ZipArchive(data: zip)
+        XCTAssertEqual(DocxReader.documentDefaultFontSize(from: archive), 11)
+    }
+
+    // MARK: w:jc — alignment, and winning over the rtl default
+
+    /// The reader must populate `alignment` even on an `rtl` paragraph — that is what lets
+    /// `OfficeTextBuilder` give an EXPLICIT alignment precedence over `rtl`'s own implicit edge
+    /// (see `OfficeBlock`'s doc on the two).
+    func testExplicitJcIsPopulatedAlongsideRtlSoItCanWinOverTheImplicitDefault() throws {
+        let blocks = try read(document: """
+        <w:p><w:pPr><w:bidi/><w:jc w:val="left"/></w:pPr><w:r><w:t>Text</w:t></w:r></w:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Text")], rtl: true, alignment: .left)])
+    }
+
+    func testJcBothMapsToJustifiedAlignment() throws {
+        let blocks = try read(document: "<w:p><w:pPr><w:jc w:val=\"both\"/></w:pPr><w:r><w:t>Text</w:t></w:r></w:p>")
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Text")], alignment: .justified)])
+    }
+
+    // MARK: w:tabs — twips → points, w:val="clear" skipped
+
+    func testTabStopsConvertTwipsToPoints() throws {
+        let blocks = try read(document: """
+        <w:p><w:pPr><w:tabs><w:tab w:val="left" w:pos="720"/><w:tab w:val="right" w:pos="1440"/></w:tabs></w:pPr><w:r><w:t>Tabbed</w:t></w:r></w:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Tabbed")], tabStops: [36, 72])])
+    }
+
+    func testTabStopsClearEntryIsSkippedNotEmittedAsAPhantomStop() throws {
+        let blocks = try read(document: """
+        <w:p><w:pPr><w:tabs><w:tab w:val="clear" w:pos="720"/><w:tab w:val="left" w:pos="1440"/></w:tabs></w:pPr><w:r><w:t>Tabbed</w:t></w:r></w:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Tabbed")], tabStops: [72])])
+    }
+
+    // MARK: Style inheritance — direct > style > basedOn ancestor, per-property
+
+    func testColorInheritedFromParagraphStyleWhenRunDoesNotSetItsOwn() throws {
+        let styles = """
+        <w:styles><w:style w:type="paragraph" w:styleId="Warn"><w:rPr><w:color w:val="FF0000"/></w:rPr></w:style></w:styles>
+        """
+        let blocks = try read(
+            document: "<w:p><w:pPr><w:pStyle w:val=\"Warn\"/></w:pPr><w:r><w:t>Danger</w:t></w:r></w:p>", styles: styles)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Danger", textColor: rgb("FF0000"))])])
+    }
+
+    func testDirectRunColorWinsOverItsParagraphStylesColor() throws {
+        let styles = """
+        <w:styles><w:style w:type="paragraph" w:styleId="Warn"><w:rPr><w:color w:val="FF0000"/></w:rPr></w:style></w:styles>
+        """
+        let blocks = try read(document: """
+        <w:p><w:pPr><w:pStyle w:val="Warn"/></w:pPr><w:r><w:rPr><w:color w:val="00FF00"/></w:rPr><w:t>Override</w:t></w:r></w:p>
+        """, styles: styles)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Override", textColor: rgb("00FF00"))])])
+    }
+
+    /// Neither `Leaf` nor `Mid` sets a colour — only their common ancestor `Base` does — so
+    /// resolving it correctly proves the chain climbs past a style with NO answer for this
+    /// property, not just one level.
+    func testColorResolvesThroughATwoLevelBasedOnChainWhenNeitherNearerStyleSetsIt() throws {
+        let styles = """
+        <w:styles>
+          <w:style w:type="paragraph" w:styleId="Base"><w:rPr><w:color w:val="112233"/></w:rPr></w:style>
+          <w:style w:type="paragraph" w:styleId="Mid"><w:basedOn w:val="Base"/></w:style>
+          <w:style w:type="paragraph" w:styleId="Leaf"><w:basedOn w:val="Mid"/></w:style>
+        </w:styles>
+        """
+        let blocks = try read(document: "<w:p><w:pPr><w:pStyle w:val=\"Leaf\"/></w:pPr><w:r><w:t>Chain</w:t></w:r></w:p>", styles: styles)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Chain", textColor: rgb("112233"))])])
+    }
+
+    func testAlignmentInheritedFromParagraphStyleWhenParagraphDoesNotRestateIt() throws {
+        let styles = """
+        <w:styles><w:style w:type="paragraph" w:styleId="Centered"><w:pPr><w:jc w:val="center"/></w:pPr></w:style></w:styles>
+        """
+        let blocks = try read(
+            document: "<w:p><w:pPr><w:pStyle w:val=\"Centered\"/></w:pPr><w:r><w:t>Text</w:t></w:r></w:p>", styles: styles)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Text")], alignment: .center)])
+    }
+
+    func testTabStopsInheritedFromParagraphStyleWhenParagraphDoesNotDeclareItsOwn() throws {
+        let styles = """
+        <w:styles><w:style w:type="paragraph" w:styleId="Indented"><w:pPr><w:tabs><w:tab w:val="left" w:pos="360"/></w:tabs></w:pPr></w:style></w:styles>
+        """
+        let blocks = try read(
+            document: "<w:p><w:pPr><w:pStyle w:val=\"Indented\"/></w:pPr><w:r><w:t>Text</w:t></w:r></w:p>", styles: styles)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Text")], tabStops: [18])])
+    }
+
+    // MARK: Table cells — w:shd, w:tcBorders, w:tcW
+
+    func testCellShadingFillIsReadAsBackgroundColor() throws {
+        let blocks = try read(document: """
+        <w:tbl><w:tr><w:tc><w:tcPr><w:shd w:fill="FFCC00"/></w:tcPr><w:p><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+        """)
+        guard case .table(let rows, _) = blocks.first else { return XCTFail("expected a table") }
+        XCTAssertEqual(rows[0][0].backgroundColor, rgb("FFCC00"))
+    }
+
+    func testCellShadingAutoFillIsUnshaded() throws {
+        let blocks = try read(document: """
+        <w:tbl><w:tr><w:tc><w:tcPr><w:shd w:fill="auto"/></w:tcPr><w:p><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+        """)
+        guard case .table(let rows, _) = blocks.first else { return XCTFail("expected a table") }
+        XCTAssertNil(rows[0][0].backgroundColor)
+    }
+
+    func testCellBorderColorAndWidthAreReadFromTheTopEdge() throws {
+        let blocks = try read(document: """
+        <w:tbl><w:tr><w:tc><w:tcPr><w:tcBorders><w:top w:val="single" w:sz="8" w:color="336699"/></w:tcBorders></w:tcPr><w:p><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+        """)
+        guard case .table(let rows, _) = blocks.first else { return XCTFail("expected a table") }
+        XCTAssertEqual(rows[0][0].borderColor, rgb("336699"))
+        XCTAssertEqual(rows[0][0].borderWidth, 1)
+    }
+
+    /// `w:top`'s `w:val="none"` (no border drawn on that edge) must be skipped in favour of the
+    /// next drawn edge, not read as though it were a real border.
+    func testCellBorderNoneEdgeIsSkippedInFavorOfTheNextDrawnEdge() throws {
+        let blocks = try read(document: """
+        <w:tbl><w:tr><w:tc><w:tcPr><w:tcBorders><w:top w:val="none"/><w:left w:val="single" w:sz="16" w:color="112233"/></w:tcBorders></w:tcPr><w:p><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+        """)
+        guard case .table(let rows, _) = blocks.first else { return XCTFail("expected a table") }
+        XCTAssertEqual(rows[0][0].borderColor, rgb("112233"))
+        XCTAssertEqual(rows[0][0].borderWidth, 2)
+    }
+
+    func testCellWidthDxaConvertsTwipsToPoints() throws {
+        let blocks = try read(document: """
+        <w:tbl><w:tr><w:tc><w:tcPr><w:tcW w:w="2880" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+        """)
+        guard case .table(let rows, _) = blocks.first else { return XCTFail("expected a table") }
+        XCTAssertEqual(rows[0][0].width, 144)
+    }
+
+    /// `w:type="pct"` (a percentage of the table's own available width) is out of this sprint's
+    /// scope — it must be skipped (`nil`), never misread as an absolute point value.
+    func testCellWidthPctTypeIsSkipped() throws {
+        let blocks = try read(document: """
+        <w:tbl><w:tr><w:tc><w:tcPr><w:tcW w:w="2500" w:type="pct"/></w:tcPr><w:p><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+        """)
+        guard case .table(let rows, _) = blocks.first else { return XCTFail("expected a table") }
+        XCTAssertNil(rows[0][0].width)
+    }
+
+    // MARK: Invariant 29 — reached through `MarkdownDocument`'s own read path
+
+    /// A theme-coloured run must resolve identically through `DocumentTypes.readOffice` — not
+    /// merely through `DocxReader.read` called directly — the same blindness invariant 29 has
+    /// already caught twice in this roadmap (`.odt` unreachable end-to-end, a chart placeholder
+    /// unreachable end-to-end).
+    func testThemeColoredRunIsReachedThroughDocumentTypesReadOfficeNotJustDocxReaderDirectly() throws {
+        let document = doc("<w:p><w:r><w:rPr><w:color w:themeColor=\"accent1\"/></w:rPr><w:t>Theme</w:t></w:r></w:p>")
+        let zip = buildDocx(document: document, theme: sampleTheme)
+        let archive = try ZipArchive(data: zip)
+        let blocks = try DocumentTypes.readOffice(archive, extension: "docx")
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Theme", textColor: rgb("4F81BD"))])])
     }
 }
