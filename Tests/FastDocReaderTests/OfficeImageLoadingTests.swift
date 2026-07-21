@@ -196,6 +196,60 @@ final class OfficeImageLoadingTests: XCTestCase {
         XCTAssertEqual(cell.reservedSize, reservedBefore)
     }
 
+    // MARK: Linked (external) images — S6 item 4, through `MarkdownDocument`'s own load path
+    //
+    // `DocxReader` marks a linked (`r:link`) image with `docx-external-link:<target>` instead of
+    // the generic `docx-unresolvable:` prefix (`DocxReaderTests` covers that half). This is the
+    // OTHER half: `reconcileMedia` must route that id into the ordinary markdown image pipeline —
+    // the SAME one a blocked local sibling image already uses — rather than the office
+    // archive-only path, which never even tries a real filesystem read for it.
+
+    /// When the linked target is genuinely reachable (unsandboxed test process, a real file on
+    /// disk), the image must load its REAL pixels — proving this went through the markdown
+    /// pipeline's actual disk/network read, not the office path, which degrades to a placeholder
+    /// unconditionally for anything not inside the archive.
+    func testLinkedExternalImageLoadsRealPixelsFromDiskWhenReachable() throws {
+        let picURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("fmd-linked-image-\(UUID().uuidString).png")
+        try pngData(width: 64, height: 48).write(to: picURL)
+        defer { try? FileManager.default.removeItem(at: picURL) }
+        let (doc, wc) = try openOffice(
+            blocks: [.image(id: "docx-external-link:\(picURL.absoluteString)", size: CGSize(width: 200, height: 150))],
+            archiveEntries: [])
+        let storage = try XCTUnwrap(wc.textStorageRef)
+        let att = try imageAttachment(in: storage)
+        XCTAssertNil(att.image)
+
+        let exp = expectation(description: "linked external image pixels loaded")
+        doc.reconcileMedia(in: wc)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { exp.fulfill() }
+        wait(for: [exp], timeout: 2)
+
+        XCTAssertNotNil(att.image, "a reachable linked image must load its own real pixels")
+        XCTAssertEqual(att.image?.size, NSSize(width: 64, height: 48),
+                       "the loaded file's own pixel size — proves the read came from disk via the " +
+                       "markdown image pipeline, not from the (empty) office archive")
+    }
+
+    /// Unreachable (the common sandboxed case, and this test's stand-in for it — a path that never
+    /// exists) must still degrade to a VISIBLE placeholder image, never leave the attachment blank.
+    func testLinkedExternalImageDegradesToAVisiblePlaceholderWhenUnreachable() throws {
+        let (doc, wc) = try openOffice(
+            blocks: [.image(
+                id: "docx-external-link:file:///nonexistent-\(UUID().uuidString)/pic.png",
+                size: CGSize(width: 200, height: 150))],
+            archiveEntries: [])
+        let storage = try XCTUnwrap(wc.textStorageRef)
+        let att = try imageAttachment(in: storage)
+
+        let exp = expectation(description: "unreachable linked image resolved to a placeholder")
+        doc.reconcileMedia(in: wc)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { exp.fulfill() }
+        wait(for: [exp], timeout: 2)
+
+        XCTAssertNotNil(att.image, "must degrade to a visible placeholder, never silently show nothing")
+    }
+
     // MARK: Regression — markdown image loading unaffected
 
     /// A markdown (non-office) image's true size is unknown until the pixels arrive, so — unlike an

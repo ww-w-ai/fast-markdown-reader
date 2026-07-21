@@ -270,6 +270,52 @@ final class DocxReaderTests: XCTestCase {
         XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Inserted")])])
     }
 
+    // MARK: Tracked moves — S6 item 1: a guaranteed duplication bug before this fix
+    //
+    // `w:moveFrom` wraps the moved text at its ORIGINAL location, `w:moveTo` wraps the SAME text
+    // at its NEW one. Before this fix neither name was excluded from `collectSpans`'s permissive
+    // walk, so both rendered — every tracked move duplicated its own text, 100% reproducibly.
+
+    /// The core acceptance case from the sprint brief: the moved text appears EXACTLY ONCE, at the
+    /// new location — never at the old one, and never twice.
+    func testTrackedMoveRendersItsTextExactlyOnceFromTheNewLocation() throws {
+        let blocks = try read(document: """
+        <w:p>
+          <w:r><w:t>Before </w:t></w:r>
+          <w:moveFrom w:id="1" w:author="x"><w:r><w:t>Moved</w:t></w:r></w:moveFrom>
+          <w:r><w:t>after</w:t></w:r>
+        </w:p>
+        <w:p>
+          <w:moveTo w:id="2" w:author="x"><w:r><w:t>Moved</w:t></w:r></w:moveTo>
+        </w:p>
+        """)
+        XCTAssertEqual(blocks, [
+            .paragraph(spans: [Span(text: "Before after")]),
+            .paragraph(spans: [Span(text: "Moved")]),
+        ])
+        // Belt-and-braces on the acceptance criterion itself, not just structural equality above:
+        // the word "Moved" must occur exactly once across the whole document.
+        let fullText = blocks.compactMap { block -> String? in
+            if case .paragraph(let spans) = block { return spans.map(\.text).joined() }
+            return nil
+        }.joined()
+        XCTAssertEqual(fullText.components(separatedBy: "Moved").count - 1, 1,
+                       "a tracked move must render its text exactly once, not once per location")
+    }
+
+    /// `w:moveFromRangeStart`/`w:moveFromRangeEnd` are empty boundary markers (no `w:t` of their
+    /// own) — must not contribute any text even though they sit right next to real content.
+    func testMoveFromRangeMarkersContributeNoText() throws {
+        let blocks = try read(document: """
+        <w:p>
+          <w:moveFromRangeStart w:id="1" w:author="x" w:name="move1"/>
+          <w:r><w:t>Kept</w:t></w:r>
+          <w:moveFromRangeEnd w:id="1"/>
+        </w:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Kept")])])
+    }
+
     // MARK: Breaks, tabs, whitespace
 
     func testLineBreakAndTabSurviveIntoText() throws {
@@ -869,6 +915,67 @@ final class DocxReaderTests: XCTestCase {
         XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "See ▯")])])
     }
 
+    // MARK: w:sym — S6 item 3, the small confidently-cited Wingdings mapping
+
+    /// `U+F0FC`/`U+F0FB` are Word's own Wingdings "checked"/"crossed-out" glyphs (the published
+    /// Microsoft/Unicode Wingdings-to-Unicode correspondence — see the comment above
+    /// `mappedSymbolCharacter`), mapped to real check-mark/ballot-X characters instead of ▯.
+    func testMappedWingdingsCheckMarkAndBallotXRenderTheirRealCharacters() throws {
+        let blocks = try read(document: """
+        <w:p><w:r><w:sym w:font="Wingdings" w:char="F0FC"/><w:sym w:font="Wingdings" w:char="F0FB"/></w:r></w:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "\u{2713}\u{2717}")])])
+    }
+
+    /// A `w:char` this reader is NOT confident about (bullet/arrow/phone/envelope-shaped, or simply
+    /// unlisted) keeps the honest ▯ fallback — never guessed. This is the DEFAULT for the mapping
+    /// table, not an edge case.
+    func testUnmappedWingdingsCharacterStillFallsBackToThePlaceholder() throws {
+        let blocks = try read(document: """
+        <w:p><w:r><w:sym w:font="Wingdings" w:char="F021"/></w:r></w:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "▯")])])
+    }
+
+    /// The mapping is keyed by FONT, not just `w:char` — the same code point in a different
+    /// (non-Wingdings) symbol font means something else entirely, so it must not silently map.
+    func testMatchingCharCodeInADifferentFontDoesNotMap() throws {
+        let blocks = try read(document: """
+        <w:p><w:r><w:sym w:font="Symbol" w:char="F0FC"/></w:r></w:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "▯")])])
+    }
+
+    // MARK: w:vanish — S6 item 2, hidden text (never displayed in Word's Normal view)
+
+    func testVanishedRunProducesNoSpanWhileAnOrdinaryRunBesideItStillRenders() throws {
+        let blocks = try read(document: """
+        <w:p>
+          <w:r><w:rPr><w:vanish/></w:rPr><w:t>Hidden</w:t></w:r>
+          <w:r><w:t>Visible</w:t></w:r>
+        </w:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Visible")])])
+    }
+
+    /// `<w:vanish w:val="0"/>` is Word's explicit "not hidden" — the same toggle-off convention
+    /// `isOn` already honours for bold/italic/underline/strike (see `testExplicitlyDisabled…`).
+    func testExplicitlyDisabledVanishStillRenders() throws {
+        let blocks = try read(document: """
+        <w:p><w:r><w:rPr><w:vanish w:val="0"/></w:rPr><w:t>Shown</w:t></w:r></w:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Shown")])])
+    }
+
+    /// A paragraph made ENTIRELY of vanished runs must still be a real (empty-spans) paragraph
+    /// block, never crash or vanish the block itself — this reader only hides the RUN's text.
+    func testParagraphOfOnlyVanishedRunsProducesAnEmptyParagraphNotACrash() throws {
+        let blocks = try read(document: """
+        <w:p><w:r><w:rPr><w:vanish/></w:rPr><w:t>AllHidden</w:t></w:r></w:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [])])
+    }
+
     // MARK: strikethrough / superscript / subscript
 
     func testStrikethroughRunPropertyParses() throws {
@@ -936,11 +1043,27 @@ final class DocxReaderTests: XCTestCase {
         XCTAssertEqual(blocks, [.image(id: "word/media/image1.png", size: CGSize(width: 72, height: 72))])
     }
 
-    func testLinkedExternalImageEmitsUnresolvableSizedBlockNeverZeroSize() throws {
+    // MARK: Linked (external) images — S6 item 4
+    //
+    // A `r:link` target is a REAL reference, just outside the archive — marked with its own
+    // `docx-external-link:` prefix (never `docx-unresolvable:`) so `MarkdownDocument` can route it
+    // to the same folder-grant placeholder a blocked markdown sibling image already gets, instead
+    // of the generic "this reference doesn't resolve to anything" broken-image icon.
+
+    func testLinkedExternalImageEmitsAnExternalLinkIdCarryingItsTargetAndNeverZeroSize() throws {
         let blocks = try read(
             document: "<w:p><w:r>\(drawing(cx: 914_400, cy: 914_400, link: "rId9"))</w:r></w:p>",
             rels: rels([(id: "rId9", target: "file:///Users/x/pic.png", external: true)]))
-        XCTAssertEqual(blocks, [.image(id: "docx-unresolvable:file:///Users/x/pic.png", size: CGSize(width: 72, height: 72))])
+        XCTAssertEqual(blocks, [.image(id: "docx-external-link:file:///Users/x/pic.png", size: CGSize(width: 72, height: 72))])
+    }
+
+    /// A dangling/unnamed relationship — genuinely unresolvable, not merely external — must stay on
+    /// the OLD `docx-unresolvable:` prefix, distinct from a real external link.
+    func testDanglingRelationshipStillUsesTheGenericUnresolvablePrefixNotTheExternalLinkOne() throws {
+        let blocks = try read(
+            document: "<w:p><w:r>\(drawing(cx: 914_400, cy: 914_400, embed: "rIdMissing"))</w:r></w:p>",
+            rels: rels([(id: "rId9", target: "media/image1.png", external: false)]))
+        XCTAssertEqual(blocks, [.image(id: "docx-unresolvable:rIdMissing", size: CGSize(width: 72, height: 72))])
     }
 
     func testStandaloneVMLPictWithNoAlternateContentEmitsOneImageSizedFromStyle() throws {

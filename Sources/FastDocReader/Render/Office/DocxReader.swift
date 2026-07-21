@@ -766,20 +766,36 @@ enum DocxReader {
         return .image(id: resolveId(relId: imagedata.attributes["r:id"], relationships: relationships), size: size)
     }
 
-    /// A relationship id resolves to the archive entry path for an embedded image, or to a
-    /// clearly-marked, non-archive-shaped id (`"docx-unresolvable:…"`) for anything this reader
-    /// cannot hand pixels for: no id on the element at all, an external (linked) target, or an id
-    /// that doesn't appear in `document.xml.rels` at all (a malformed/edited document) — every one
+    /// A relationship id resolves to the archive entry path for an embedded image, to
+    /// `"docx-unresolvable:…"` for anything this reader genuinely cannot hand pixels for (no id on
+    /// the element at all, or an id that doesn't appear in `document.xml.rels` — a malformed/edited
+    /// document), or to `"docx-external-link:…"` for a real, external (`r:link`) target — every one
     /// of these still returns a block, never nil, so a picture never silently vanishes from the
-    /// block list. The later sprint that draws pixels is expected to treat this prefix as "always
-    /// show a sized placeholder, never attempt an archive lookup".
+    /// block list. `MarkdownDocument`'s image loader treats the first prefix as "always show a
+    /// sized placeholder, never attempt an archive lookup" and the second as "try the folder-grant
+    /// path a blocked local image already has, using the raw target as the URL to resolve".
     private static func resolveId(relId: String?, relationships: Relationships) -> String {
         guard let relId else { return unresolvableId("no-relationship-id") }
         guard let rel = relationships.byId[relId] else { return unresolvableId(relId) }
-        return rel.external ? unresolvableId(rel.target) : rel.target
+        // A `r:link` (external target, `TargetMode="External"`) is a REAL, resolvable reference —
+        // unlike the two cases above, this isn't a malformed document, just one whose pixels live
+        // OUTSIDE this archive (under the sandbox, unreadable, and macOS never prompts — see
+        // CLAUDE.md invariant 9). Marked with its OWN prefix, never `docx-unresolvable:`, so the
+        // viewer can tell "this document points somewhere real, just can't reach it yet" apart
+        // from "this reference doesn't resolve to anything at all" — only the former can offer the
+        // SAME folder-grant placeholder a blocked markdown sibling image already gets
+        // (`FolderAccess`/`needsAccessImage()` in `MarkdownDocument`), reused rather than a second
+        // "broken image" convention invented for this one case.
+        return rel.external ? externalLinkId(rel.target) : rel.target
     }
 
     private static func unresolvableId(_ reason: String) -> String { "docx-unresolvable:\(reason)" }
+
+    /// A linked (not embedded) image's id — carries the RAW target exactly as
+    /// `word/_rels/document.xml.rels` wrote it (a `file:///…` or `http(s)://…` URL), prefixed so
+    /// `MarkdownDocument`'s image loader can route it to the folder-grant placeholder instead of
+    /// the generic broken-image icon `docx-unresolvable:` ids fall back to.
+    private static func externalLinkId(_ target: String) -> String { "docx-external-link:\(target)" }
 
     /// EMU (English Metric Units) is DrawingML's native length unit: 914400 per inch, 12700 per
     /// point (72 pt/inch × 12700 = 914400). Verified against the real test file: `cx="6400800"`
@@ -1083,7 +1099,23 @@ enum DocxReader {
         func walk(_ node: XMLNode, link: String?) {
             for child in node.children {
                 switch child.name {
-                case "w:pPr", "w:rPr", "w:del", "w:bookmarkStart", "w:bookmarkEnd", "w:proofErr",
+                // Tracked MOVES are a matched pair: `w:moveFrom` wraps the run(s) at the ORIGINAL
+                // location and `w:moveTo` wraps the SAME run(s), verbatim, at the NEW location —
+                // Word's move-tracking round-trip literally duplicates the moved text into two
+                // places in `document.xml` and relies on the reader to keep only one.
+                // `w:moveFrom` is excluded here, exactly like `w:del` right beside it: it is
+                // content that is no longer at this location. `w:moveTo` is deliberately NOT
+                // listed — it falls through to the permissive `default: walk` below and is kept,
+                // exactly like `w:ins`. Before this fix NEITHER was excluded, so both locations
+                // rendered — a 100%-reproducible text duplication on every tracked move, not a
+                // degraded edge case. The empty boundary markers `w:moveFromRangeStart`/
+                // `w:moveFromRangeEnd` (used when a move's extent doesn't align to paragraph
+                // boundaries) carry no children of their own per spec, so excluding them changes
+                // nothing today — listed anyway so this switch stays the complete, authoritative
+                // record of "moved away" markers rather than relying on them being harmlessly
+                // empty.
+                case "w:pPr", "w:rPr", "w:del", "w:moveFrom", "w:moveFromRangeStart", "w:moveFromRangeEnd",
+                     "w:bookmarkStart", "w:bookmarkEnd", "w:proofErr",
                      "w:sectPr", "w:commentRangeStart", "w:commentRangeEnd", "w:commentReference":
                     continue
                 case "w:hyperlink":
@@ -1165,6 +1197,32 @@ enum DocxReader {
     /// mistaken for empty content. A run producing no text at all (formatting-only, or an empty
     /// bookmark anchor Word occasionally wraps in its own run) yields no span — the caller must
     /// never see a phantom empty one.
+    /// A tiny, deliberately incomplete `w:char` → Unicode mapping — the ▯ fallback above stays the
+    /// default for everything not listed here, and stays honest: a wrong-looking mark beats a
+    /// silently vanished one, but a real glyph beats either when it can be cited with confidence.
+    /// This project's licence rule forbids copying a lookup table out of another reader
+    /// (LibreOffice/Calligra/pandoc are read-for-understanding only), so every entry here must
+    /// trace to a source this project can actually name: Microsoft's own Wingdings-to-Unicode
+    /// correspondence, also published by the Unicode Consortium as a vendor "best fit" mapping
+    /// (`unicode.org/Public/MAPPINGS/VENDORS/MICSFT/SYMBOL/wingding.txt`), assigns the Private-Use-
+    /// Area code point U+F0FC to the Wingdings glyph Word renders as a check mark and U+F0FB to the
+    /// one it renders as a ballot X — Word's own "checked"/"crossed-out" marks for a legacy
+    /// Wingdings-font checkbox, one of the categories the sprint brief asked for.
+    ///
+    /// Every OTHER category the brief named — bullet variants, arrows, telephone, envelope — is
+    /// DELIBERATELY NOT mapped: without live access to the published Unicode/Microsoft charts to
+    /// confirm their exact `w:char` code points, adding them would mean guessing, which the brief
+    /// explicitly forbids. They keep the honest ▯ fallback; a future pass with the actual chart in
+    /// hand can extend this table, never by copying another project's source.
+    private static func mappedSymbolCharacter(font: String?, char: String?) -> String? {
+        guard let font, font.caseInsensitiveCompare("Wingdings") == .orderedSame, let char else { return nil }
+        switch char.uppercased() {
+        case "F0FC": return "\u{2713}"   // check mark
+        case "F0FB": return "\u{2717}"   // ballot X
+        default: return nil
+        }
+    }
+
     private static func buildSpan(from run: XMLNode) -> Span? {
         var text = ""
         for child in run.children {
@@ -1172,7 +1230,7 @@ enum DocxReader {
             case "w:t": text += child.text
             case "w:br": text += "\n"
             case "w:tab": text += "\t"
-            case "w:sym": text += "▯"
+            case "w:sym": text += mappedSymbolCharacter(font: child.attributes["w:font"], char: child.attributes["w:char"]) ?? "▯"
             // A non-breaking hyphen/soft hyphen IS text (the author's punctuation choice, not
             // formatting), and a positioned tab (`w:ptab`) is whitespace like `w:tab` even though
             // this reader doesn't honour its absolute position — dropping any of the three silently
@@ -1185,6 +1243,15 @@ enum DocxReader {
         }
         guard !text.isEmpty else { return nil }
         let rPr = run.child("w:rPr")
+        // `w:vanish` is Word's own "don't show this in Normal view" toggle on a run — the same
+        // principle sprint S4 applied to ODT's hidden-text signals, kept consistent here: hide
+        // only on the file's explicit say-so. It's also how Word marks index-entry/TOC-field
+        // scaffolding, so honouring it removes clutter the author never intended to be read as
+        // body text. Deliberately handles ONLY plain `w:vanish` — `w:specVanish` is a
+        // DIFFERENT, style-level toggle ("hidden unless the paragraph mark itself says
+        // otherwise") whose exact interaction with paragraph marks this reader cannot verify
+        // with confidence from a run alone, so it is left unhandled rather than guessed at.
+        if isOn(rPr, "w:vanish") { return nil }
         let vertAlign = rPr?.child("w:vertAlign")?.attributes["w:val"]
         return Span(
             text: text, bold: isOn(rPr, "w:b"), italic: isOn(rPr, "w:i"), underline: isOn(rPr, "w:u"),

@@ -739,7 +739,23 @@ final class MarkdownDocument: NSDocument {
             guard let src = v as? String, !src.isEmpty, let att = attach(r) else { return }
             if onScreen(r) {
                 guard att.image == nil else { return }
-                if kind == .office { officeLoad.append((src, r)); return }
+                if kind == .office {
+                    // A linked (not embedded) office image's id carries the file's real,
+                    // real-world location — a `file:///…`/`http(s)://…` URL, exactly the shape
+                    // an ordinary markdown image's `src` already is (`DocxReader.externalLinkId`).
+                    // Routed into the SAME markdown pipeline below, rather than `officeLoad`'s
+                    // archive-only path, so it reuses the folder-grant placeholder a blocked
+                    // sibling markdown image already gets (`FolderAccess`/`needsAccessImage()`)
+                    // instead of the generic broken-image icon `officeLoad` falls back to for a
+                    // genuinely unresolvable id. Gap-list #8's requirement is exactly this: degrade
+                    // VISIBLY, with the existing mechanism, not a second one invented for it.
+                    if src.hasPrefix(MarkdownDocument.officeExternalLinkPrefix) {
+                        imgLoad.append((String(src.dropFirst(MarkdownDocument.officeExternalLinkPrefix.count)), r))
+                    } else {
+                        officeLoad.append((src, r))
+                    }
+                    return
+                }
                 // Mid-measure, an unmeasured remote image has no exact size yet — filling it now
                 // would resize under the reader. The measure pass fills it once it's sized.
                 if self.isMeasuringRemote, !src.hasPrefix("data:"),
@@ -843,6 +859,14 @@ final class MarkdownDocument: NSDocument {
     /// arrived — the reflow this whole design exists to avoid. Only headers are fetched, so it costs
     /// a few KB per image, not the image.
     func measureRemoteImages(in wc: DocumentWindowController) {
+        // An office document's `MDAttr.image` ids are either an archive entry path (skipped
+        // naturally below since it resolves to a local file URL) or, for a linked image, a
+        // `docx-external-link:`-prefixed id — `URL(string:)` would misread that leading segment
+        // as a URL SCHEME and treat the whole thing as a plausible remote URL, wastefully firing
+        // a network request against a scheme nothing serves. Office sizing is decided once, at
+        // build time (see `presizeKnownMedia`'s identical office skip) — there is nothing for this
+        // remote-measurement pass to usefully do for `.office` documents at all.
+        guard kind != .office else { return }
         guard let storage = wc.textStorageRef else { return }
         let baseDir = fileURL?.deletingLastPathComponent()
         var urls: [URL] = []
@@ -909,8 +933,19 @@ final class MarkdownDocument: NSDocument {
     /// relationship) or a missing archive/entry degrades to `nil` (→ the broken-image placeholder in
     /// `loadOfficePixels`) rather than crashing or attempting a filesystem read that would only fail
     /// silently.
+    /// `DocxReader.externalLinkId`'s prefix — kept here as the ONE place `reconcileMedia` and this
+    /// function both check it, rather than the literal string repeated at each call site.
+    static let officeExternalLinkPrefix = "docx-external-link:"
+
     private static func loadOfficeImage(archive: ZipArchive?, id: String, completion: @escaping (NSImage?) -> Void) {
-        guard let archive, !id.hasPrefix("docx-unresolvable:") else { completion(nil); return }
+        // A linked image never reaches this function — `reconcileMedia` routes
+        // `officeExternalLinkPrefix` ids into the ordinary markdown image pipeline instead (see
+        // there) — so an id arriving here that still starts with it would be a caller bug; treated
+        // the same as any other unresolvable id (degrade to `nil`, never crash) rather than
+        // asserting, since a rendering path is the wrong place to enforce that invariant.
+        guard let archive, !id.hasPrefix("docx-unresolvable:"), !id.hasPrefix(officeExternalLinkPrefix) else {
+            completion(nil); return
+        }
         DispatchQueue.global(qos: .userInitiated).async {
             let img = (try? archive.data(for: id)).flatMap { NSImage(data: $0) }
             DispatchQueue.main.async { completion(img) }
