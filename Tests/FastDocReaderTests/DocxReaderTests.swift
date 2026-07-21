@@ -183,6 +183,68 @@ final class DocxReaderTests: XCTestCase {
         XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Text")])])
     }
 
+    // MARK: S3 — the three ways Word marks a heading (mechanisms a/b/c of the sprint brief)
+
+    /// Mechanism (a): a paragraph can be marked a heading directly, via its OWN `w:pPr/w:outlineLvl`,
+    /// with no style involved at all.
+    func testParagraphOwnOutlineLvlIsAHeadingWithNoStyleAtAll() throws {
+        let blocks = try read(document: """
+        <w:p><w:pPr><w:outlineLvl w:val="1"/></w:pPr><w:r><w:t>Direct</w:t></w:r></w:p>
+        """)
+        XCTAssertEqual(blocks, [.heading(level: 2, spans: [Span(text: "Direct")])])
+    }
+
+    /// Mechanism (a)'s own TOCHeading guard: a paragraph's own `outlineLvl` of 9 is not a heading
+    /// either — the same rule as a style-level 9, now checked at the paragraph level.
+    func testParagraphOwnOutlineLvlNineIsNotAHeading() throws {
+        let blocks = try read(document: """
+        <w:p><w:pPr><w:outlineLvl w:val="9"/></w:pPr><w:r><w:t>Contents</w:t></w:r></w:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Contents")])])
+    }
+
+    /// Mechanism (b): `Heading3`'s style DEFINITION carries no `w:outlineLvl` at all — Word very
+    /// often omits it because the built-in id already says what it is — and it must still be read
+    /// as a level-3 heading, purely from the id.
+    func testBuiltInHeadingStyleIdWithNoOutlineLvlInItsOwnDefinitionIsStillAHeading() throws {
+        let styles = "<w:styles><w:style w:type=\"paragraph\" w:styleId=\"Heading3\"/></w:styles>"
+        let blocks = try read(
+            document: "<w:p><w:pPr><w:pStyle w:val=\"Heading3\"/></w:pPr><w:r><w:t>No outlineLvl</w:t></w:r></w:p>",
+            styles: styles)
+        XCTAssertEqual(blocks, [.heading(level: 3, spans: [Span(text: "No outlineLvl")])])
+    }
+
+    /// Mechanism (c): a CUSTOM style based on `Heading2` — carrying no `w:outlineLvl` of its own,
+    /// and `Heading2`'s own definition also carrying none (mechanism (b)'s whole premise) — must
+    /// resolve to level 2 by walking the `w:basedOn` chain up to the built-in id.
+    func testCustomStyleBasedOnHeading2WithNoOutlineLvlAnywhereInTheChainIsStillAHeading() throws {
+        let styles = """
+        <w:styles>
+          <w:style w:type="paragraph" w:styleId="Heading2"/>
+          <w:style w:type="paragraph" w:styleId="ClauseHeading"><w:basedOn w:val="Heading2"/></w:style>
+        </w:styles>
+        """
+        let blocks = try read(
+            document: "<w:p><w:pPr><w:pStyle w:val=\"ClauseHeading\"/></w:pPr><w:r><w:t>Inherited</w:t></w:r></w:p>",
+            styles: styles)
+        XCTAssertEqual(blocks, [.heading(level: 2, spans: [Span(text: "Inherited")])])
+    }
+
+    /// A `w:basedOn` CYCLE (malformed document) must not hang the reader — the walk detects the
+    /// revisit and reports "not a heading" instead of looping forever.
+    func testBasedOnCycleDoesNotHangAndIsNotTreatedAsAHeading() throws {
+        let styles = """
+        <w:styles>
+          <w:style w:type="paragraph" w:styleId="A"><w:basedOn w:val="B"/></w:style>
+          <w:style w:type="paragraph" w:styleId="B"><w:basedOn w:val="A"/></w:style>
+        </w:styles>
+        """
+        let blocks = try read(
+            document: "<w:p><w:pPr><w:pStyle w:val=\"A\"/></w:pPr><w:r><w:t>Cycle</w:t></w:r></w:p>",
+            styles: styles)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Cycle")])])
+    }
+
     // MARK: Empty markers and revision wrappers
 
     func testBookmarksAndProofErrProduceNoPhantomSpansAndDoNotSplitARunPair() throws {

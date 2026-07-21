@@ -36,7 +36,7 @@ enum DocxReader {
         guard let documentRoot = try? buildTree(archive.data(for: "word/document.xml")) else {
             throw ReadError.malformedXML("word/document.xml")
         }
-        let styleOutlineLevels = parseStyles(from: archive)
+        let styleInfo = parseStyles(from: archive)
         let numbering = parseNumbering(from: archive)
         let relationships = parseRelationships(from: archive)
         guard let body = documentRoot.child("w:body") else { return [] }
@@ -50,12 +50,12 @@ enum DocxReader {
         let (footnoteNumberById, endnoteNumberById, citationOrder) = numberNoteReferences(in: body)
         let notes = NoteNumbering(footnote: footnoteNumberById, endnote: endnoteNumberById)
         let bodyBlocks = parseBody(
-            body, styleOutlineLevels: styleOutlineLevels, numbering: numbering, relationships: relationships, notes: notes)
+            body, styleInfo: styleInfo, numbering: numbering, relationships: relationships, notes: notes)
         let footnoteBodies = parseNoteBodies(from: archive, part: "word/footnotes.xml", noteElementName: "w:footnote")
         let endnoteBodies = parseNoteBodies(from: archive, part: "word/endnotes.xml", noteElementName: "w:endnote")
         let noteBlocks = collectNoteBlocks(
             citationOrder: citationOrder, footnoteBodies: footnoteBodies, endnoteBodies: endnoteBodies,
-            styleOutlineLevels: styleOutlineLevels, numbering: numbering, relationships: relationships, notes: notes)
+            styleInfo: styleInfo, numbering: numbering, relationships: relationships, notes: notes)
         return bodyBlocks + noteBlocks
     }
 
@@ -141,7 +141,7 @@ enum DocxReader {
     /// text to fabricate for it.
     private static func collectNoteBlocks(
         citationOrder: [(kind: NoteKind, id: String, number: Int)], footnoteBodies: [String: XMLNode],
-        endnoteBodies: [String: XMLNode], styleOutlineLevels: [String: Int], numbering: NumberingInfo,
+        endnoteBodies: [String: XMLNode], styleInfo: StyleInfo, numbering: NumberingInfo,
         relationships: Relationships, notes: NoteNumbering
     ) -> [OfficeBlock] {
         citationOrder.flatMap { entry -> [OfficeBlock] in
@@ -149,7 +149,7 @@ enum DocxReader {
             guard let noteElement else { return [] }
             var blocks = noteElement.children.flatMap {
                 parseBodyChild(
-                    $0, styleOutlineLevels: styleOutlineLevels, numbering: numbering, relationships: relationships,
+                    $0, styleInfo: styleInfo, numbering: numbering, relationships: relationships,
                     notes: notes)
             }
             // Never fabricated — this is the SAME marker text emitted at the citation point
@@ -179,35 +179,86 @@ enum DocxReader {
         }
     }
 
-    // MARK: styles.xml — styleId → outlineLvl
+    // MARK: styles.xml — styleId → outlineLvl (+ basedOn chain)
 
     /// A style's NAME is not a safe signal — a localized Word install renames "Heading1" to
-    /// something like 제목 1, but `w:outlineLvl` is written in every language. Only paragraph
-    /// styles that declare one are recorded; everything else (including styles with no
-    /// `w:outlineLvl` at all) is absent from the map, which `headingLevel` reads as "not a
-    /// heading style".
-    private static func parseStyles(from archive: ZipArchive) -> [String: Int] {
+    /// something like 제목 1, but a style's ID is NOT localized: a Korean, Japanese or German Word
+    /// install still writes `w:styleId="Heading2"` even though the NAME it shows the user differs.
+    /// That is what makes mechanism (b) below safe to use — matching the id, never the name.
+    private struct StyleInfo {
+        /// styleId → its OWN declared `w:outlineLvl`, only for styles that declare one at all
+        /// (most custom styles, and many built-in `HeadingN` styles that instead rely on their id —
+        /// see `builtInHeadingLevel`).
+        var outlineLevels: [String: Int] = [:]
+        /// styleId → the styleId it's `w:basedOn`, for styles that declare one.
+        var basedOn: [String: String] = [:]
+    }
+
+    /// Reads both signals `resolvedOutlineLevel` needs: a style's own explicit `w:outlineLvl` (if
+    /// any), and its `w:basedOn` parent (if any) — everything else about the style is irrelevant
+    /// here. A style declaring neither is simply absent from both maps.
+    private static func parseStyles(from archive: ZipArchive) -> StyleInfo {
         guard archive.contains("word/styles.xml"),
               let data = try? archive.data(for: "word/styles.xml"),
               let root = try? buildTree(data)
-        else { return [:] }
-        var map: [String: Int] = [:]
+        else { return StyleInfo() }
+        var info = StyleInfo()
         for style in root.children where style.name == "w:style" {
-            guard let id = style.attributes["w:styleId"],
-                  let val = style.child("w:pPr")?.child("w:outlineLvl")?.attributes["w:val"],
-                  let level = Int(val)
-            else { continue }
-            map[id] = level
+            guard let id = style.attributes["w:styleId"] else { continue }
+            if let val = style.child("w:pPr")?.child("w:outlineLvl")?.attributes["w:val"], let level = Int(val) {
+                info.outlineLevels[id] = level
+            }
+            if let parent = style.child("w:basedOn")?.attributes["w:val"] {
+                info.basedOn[id] = parent
+            }
         }
-        return map
+        return info
+    }
+
+    /// Mechanism (b): a built-in heading style's id IS its heading level — `Heading1`…`Heading9`,
+    /// compared case-insensitively (Word has written both `Heading1` and `heading1` over the years)
+    /// against ONLY these nine ASCII ids, never against a style's (localized) name. Returns the same
+    /// 0-based scale `w:outlineLvl` uses (`Heading1` → 0), so callers treat it identically to an
+    /// explicit `outlineLvl`.
+    private static func builtInHeadingLevel(styleId: String) -> Int? {
+        let lower = styleId.lowercased()
+        guard lower.hasPrefix("heading") else { return nil }
+        guard let digit = Int(lower.dropFirst("heading".count)), (1...9).contains(digit) else { return nil }
+        return digit - 1
+    }
+
+    /// Resolves a paragraph style's outline level by walking its `w:basedOn` chain: at each style,
+    /// an explicit `w:outlineLvl` wins; failing that, the style's own id being a built-in `HeadingN`
+    /// counts as that level (this is what makes a CUSTOM style based on `Heading2` — which itself
+    /// usually carries no `w:outlineLvl` of its own, mechanism (b)'s whole premise — resolve to
+    /// level 1 without needing its own declaration); failing both, the walk continues to the
+    /// `w:basedOn` parent. A style id revisited during the walk means a cycle in a malformed
+    /// document — the walk stops and reports "not a heading" rather than looping forever.
+    private static func resolvedOutlineLevel(pStyleId: String?, styleInfo: StyleInfo) -> Int? {
+        guard var currentId = pStyleId else { return nil }
+        var visited = Set<String>()
+        while true {
+            guard !visited.contains(currentId) else { return nil }
+            visited.insert(currentId)
+            if let level = styleInfo.outlineLevels[currentId] { return level }
+            if let level = builtInHeadingLevel(styleId: currentId) { return level }
+            guard let parent = styleInfo.basedOn[currentId] else { return nil }
+            currentId = parent
+        }
     }
 
     /// `outlineLvl` 0–8 are real heading levels; 9 is what Word gives its own `TOCHeading` style
     /// and must NOT be treated as a heading (it would otherwise put a table-of-contents label at
-    /// sidebar depth 10). The emitted level is clamped to 1–6 — the vocabulary `OfficeBlock`
-    /// offers — so an `outlineLvl` of 6, 7 or 8 all render as level 6 rather than being refused.
-    private static func headingLevel(pStyleId: String?, styleOutlineLevels: [String: Int]) -> Int? {
-        guard let id = pStyleId, let level = styleOutlineLevels[id], level <= 8 else { return nil }
+    /// sidebar depth 10) — that guard applies whether the level came from the paragraph's own
+    /// `w:pPr/w:outlineLvl` (checked first — an author can mark a single paragraph as a heading with
+    /// no style at all) or from its style, INCLUDING one inherited through `w:basedOn`. The emitted
+    /// level is clamped to 1–6 — the vocabulary `OfficeBlock` offers — so an `outlineLvl` of 6, 7 or
+    /// 8 all render as level 6 rather than being refused.
+    private static func headingLevel(pPr: XMLNode?, pStyleId: String?, styleInfo: StyleInfo) -> Int? {
+        if let ownVal = pPr?.child("w:outlineLvl")?.attributes["w:val"], let ownLevel = Int(ownVal), ownLevel <= 8 {
+            return min(ownLevel + 1, 6)
+        }
+        guard let level = resolvedOutlineLevel(pStyleId: pStyleId, styleInfo: styleInfo), level <= 8 else { return nil }
         return min(level + 1, 6)
     }
 
@@ -312,7 +363,7 @@ enum DocxReader {
     /// failed to load when there never was one. Such a shape contributes its TEXT instead, if it
     /// has any (`w:txbxContent`), and nothing at all if it has neither picture nor text.
     private static func collectDrawingBlocks(
-        in node: XMLNode, styleOutlineLevels: [String: Int], numbering: NumberingInfo, relationships: Relationships,
+        in node: XMLNode, styleInfo: StyleInfo, numbering: NumberingInfo, relationships: Relationships,
         notes: NoteNumbering
     ) -> [OfficeBlock] {
         var blocks: [OfficeBlock] = []
@@ -329,7 +380,7 @@ enum DocxReader {
                         blocks.append(contentsOf: pictures)
                     } else {
                         blocks.append(contentsOf: textBoxBlocks(
-                            in: child, styleOutlineLevels: styleOutlineLevels, numbering: numbering,
+                            in: child, styleInfo: styleInfo, numbering: numbering,
                             relationships: relationships, notes: notes))
                     }
                 case "w:pict":
@@ -337,7 +388,7 @@ enum DocxReader {
                         blocks.append(block)
                     } else {
                         blocks.append(contentsOf: textBoxBlocks(
-                            in: child, styleOutlineLevels: styleOutlineLevels, numbering: numbering,
+                            in: child, styleInfo: styleInfo, numbering: numbering,
                             relationships: relationships, notes: notes))
                     }
                 default:
@@ -358,14 +409,14 @@ enum DocxReader {
     /// no text, and must produce no block; the body's own "empty paragraph = a blank line" reading
     /// does not apply to shape decoration.
     private static func textBoxBlocks(
-        in node: XMLNode, styleOutlineLevels: [String: Int], numbering: NumberingInfo, relationships: Relationships,
+        in node: XMLNode, styleInfo: StyleInfo, numbering: NumberingInfo, relationships: Relationships,
         notes: NoteNumbering
     ) -> [OfficeBlock] {
         var blocks: [OfficeBlock] = []
         for txbx in node.allDescendants("w:txbxContent") {
             for p in txbx.children where p.name == "w:p" {
                 let paragraphBlocks = parseParagraph(
-                    p, styleOutlineLevels: styleOutlineLevels, numbering: numbering, relationships: relationships,
+                    p, styleInfo: styleInfo, numbering: numbering, relationships: relationships,
                     notes: notes)
                 blocks.append(contentsOf: paragraphBlocks.filter { !isEmptyTextBlock($0) })
             }
@@ -566,12 +617,12 @@ enum DocxReader {
     // MARK: word/document.xml — body → blocks
 
     private static func parseBody(
-        _ body: XMLNode, styleOutlineLevels: [String: Int], numbering: NumberingInfo, relationships: Relationships,
+        _ body: XMLNode, styleInfo: StyleInfo, numbering: NumberingInfo, relationships: Relationships,
         notes: NoteNumbering
     ) -> [OfficeBlock] {
         body.children.flatMap {
             parseBodyChild(
-                $0, styleOutlineLevels: styleOutlineLevels, numbering: numbering, relationships: relationships, notes: notes)
+                $0, styleInfo: styleInfo, numbering: numbering, relationships: relationships, notes: notes)
         }
     }
 
@@ -584,13 +635,13 @@ enum DocxReader {
     /// a lock setting, …) is deliberately never read — the only thing needed from `w:sdt` is its
     /// content. Anything else at this level (the body's own trailing `w:sectPr`) is not a block.
     private static func parseBodyChild(
-        _ child: XMLNode, styleOutlineLevels: [String: Int], numbering: NumberingInfo, relationships: Relationships,
+        _ child: XMLNode, styleInfo: StyleInfo, numbering: NumberingInfo, relationships: Relationships,
         notes: NoteNumbering
     ) -> [OfficeBlock] {
         switch child.name {
         case "w:p":
             return parseParagraph(
-                child, styleOutlineLevels: styleOutlineLevels, numbering: numbering, relationships: relationships,
+                child, styleInfo: styleInfo, numbering: numbering, relationships: relationships,
                 notes: notes)
         case "w:tbl":
             return [parseTable(child, relationships: relationships, notes: notes)]
@@ -598,7 +649,7 @@ enum DocxReader {
             guard let content = child.child("w:sdtContent") else { return [] }
             return content.children.flatMap {
                 parseBodyChild(
-                    $0, styleOutlineLevels: styleOutlineLevels, numbering: numbering, relationships: relationships,
+                    $0, styleInfo: styleInfo, numbering: numbering, relationships: relationships,
                     notes: notes)
             }
         default:
@@ -613,13 +664,13 @@ enum DocxReader {
     /// its own) contributes no empty text block, so callers never see a phantom `.paragraph(spans: [])`
     /// standing in for a picture.
     private static func parseParagraph(
-        _ p: XMLNode, styleOutlineLevels: [String: Int], numbering: NumberingInfo, relationships: Relationships,
+        _ p: XMLNode, styleInfo: StyleInfo, numbering: NumberingInfo, relationships: Relationships,
         notes: NoteNumbering
     ) -> [OfficeBlock] {
         let pPr = p.child("w:pPr")
         let spans = collectSpans(in: p, relationships: relationships, notes: notes)
         let drawingBlocks = collectDrawingBlocks(
-            in: p, styleOutlineLevels: styleOutlineLevels, numbering: numbering, relationships: relationships,
+            in: p, styleInfo: styleInfo, numbering: numbering, relationships: relationships,
             notes: notes)
         // Heading wins over list, even when the paragraph ALSO carries `w:numPr` — Word-authored
         // contracts routinely attach a multilevel list to their heading styles so "1. Definitions"
@@ -633,7 +684,7 @@ enum DocxReader {
         let pStyleId = pPr?.child("w:pStyle")?.attributes["w:val"]
         let textBlock: OfficeBlock?
         let skipEmptyText = spans.isEmpty && !drawingBlocks.isEmpty
-        if let level = headingLevel(pStyleId: pStyleId, styleOutlineLevels: styleOutlineLevels) {
+        if let level = headingLevel(pPr: pPr, pStyleId: pStyleId, styleInfo: styleInfo) {
             textBlock = skipEmptyText ? nil : .heading(level: level, spans: spans)
         } else if let numPr = pPr?.child("w:numPr") {
             let ilvl = Int(numPr.child("w:ilvl")?.attributes["w:val"] ?? "") ?? 0

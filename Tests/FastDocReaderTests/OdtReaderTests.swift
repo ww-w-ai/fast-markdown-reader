@@ -109,6 +109,28 @@ final class OdtReaderTests: XCTestCase {
         XCTAssertEqual(blocks, [.heading(level: 6, spans: [Span(text: "Deep")])])
     }
 
+    /// S3: a `text:p` whose OWN paragraph style declares `style:default-outline-level` is a heading
+    /// too, even though it's a plain `text:p` element (Writer produces this shape). This is the ODT
+    /// counterpart of docx's style-based mechanisms — needed so both formats agree on the same
+    /// document (the sprint's cross-format-equality guard).
+    func testParagraphStyleWithDefaultOutlineLevelIsAHeadingEvenThoughItsElementIsTextP() throws {
+        let blocks = try read(
+            body: "<text:p text:style-name=\"H2Style\">Styled Heading</text:p>",
+            automaticStyles: """
+            <style:style style:name="H2Style" style:family="paragraph" style:default-outline-level="2"/>
+            """)
+        XCTAssertEqual(blocks, [.heading(level: 2, spans: [Span(text: "Styled Heading")])])
+    }
+
+    func testParagraphStyleWithNoDefaultOutlineLevelIsAnOrdinaryParagraph() throws {
+        let blocks = try read(
+            body: "<text:p text:style-name=\"Body\">Plain</text:p>",
+            automaticStyles: """
+            <style:style style:name="Body" style:family="paragraph"/>
+            """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Plain")])])
+    }
+
     // MARK: Paragraphs + span reassembly with mixed content ordering
 
     func testPlainParagraphIsText() throws {

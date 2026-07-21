@@ -46,9 +46,11 @@ enum OdtReader {
         }
         var listStyles: [String: [Int: Bool]] = [:]
         var textStyles: [String: TextStyle] = [:]
+        var paragraphOutlineLevels: [String: Int] = [:]
         for root in styleRoots.reversed() {
             listStyles.merge(parseListStyles(from: root)) { existing, _ in existing }
             textStyles.merge(parseTextStyles(from: root)) { existing, _ in existing }
+            paragraphOutlineLevels.merge(parseParagraphOutlineLevels(from: root)) { existing, _ in existing }
         }
         guard let body = contentRoot.firstDescendant("office:text") else { return [] }
         // ODF footnotes AND endnotes are the SAME element (`text:note`, told apart only by
@@ -62,8 +64,12 @@ enum OdtReader {
         // sentence. Once the body walk finishes, the collector holds every note in citation order,
         // ready to be rendered — once, here, at the document's end.
         let notes = NoteCollector()
-        let bodyBlocks = parseBody(body, listStyles: listStyles, textStyles: textStyles, archive: archive, notes: notes)
-        let noteBlocks = buildNoteBlocks(notes.entries, listStyles: listStyles, textStyles: textStyles, archive: archive)
+        let bodyBlocks = parseBody(
+            body, listStyles: listStyles, textStyles: textStyles, paragraphOutlineLevels: paragraphOutlineLevels,
+            archive: archive, notes: notes)
+        let noteBlocks = buildNoteBlocks(
+            notes.entries, listStyles: listStyles, textStyles: textStyles, paragraphOutlineLevels: paragraphOutlineLevels,
+            archive: archive)
         return bodyBlocks + noteBlocks
     }
 
@@ -100,14 +106,16 @@ enum OdtReader {
     /// EXTRACTION differs per format, only the output shape is one-to-one).
     private static func buildNoteBlocks(
         _ noteEntries: [(marker: String, body: XMLNode)], listStyles: [String: [Int: Bool]],
-        textStyles: [String: TextStyle], archive: ZipArchive
+        textStyles: [String: TextStyle], paragraphOutlineLevels: [String: Int], archive: ZipArchive
     ) -> [OfficeBlock] {
         noteEntries.flatMap { entry -> [OfficeBlock] in
             // A footnote/endnote body cannot itself contain another `text:note` in any real
             // document (ODF disallows it), so a note-body-local `NoteCollector` here only ever
             // guards against a malformed file recursing forever — it is discarded, never merged
             // back into the outer one.
-            var blocks = parseBody(entry.body, listStyles: listStyles, textStyles: textStyles, archive: archive, notes: NoteCollector())
+            var blocks = parseBody(
+                entry.body, listStyles: listStyles, textStyles: textStyles, paragraphOutlineLevels: paragraphOutlineLevels,
+                archive: archive, notes: NoteCollector())
             let marker = Span(text: entry.marker, superscript: true)
             if let first = blocks.first, let markedFirst = prependingMarker(marker, to: first) {
                 blocks[0] = markedFirst
@@ -216,11 +224,31 @@ enum OdtReader {
         return ordered
     }
 
+    // MARK: Paragraph styles — style name → default-outline-level
+
+    /// A `text:p` isn't the only way ODF marks a heading — Writer also lets a PARAGRAPH STYLE itself
+    /// declare `style:default-outline-level` (an attribute directly on `style:style`, family
+    /// `"paragraph"`), so a paragraph styled that way is a heading even though its element name is
+    /// the plain `text:p` an ordinary paragraph uses. Only `style:family="paragraph"` styles are
+    /// read, mirroring `parseTextStyles`'s own family filter — `style:style` is reused across
+    /// several families, and a text/graphic style can share a name with a paragraph style.
+    private static func parseParagraphOutlineLevels(from root: XMLNode) -> [String: Int] {
+        var map: [String: Int] = [:]
+        for styleNode in root.allDescendants("style:style") where styleNode.attributes["style:family"] == "paragraph" {
+            guard let name = styleNode.attributes["style:name"],
+                  let levelString = styleNode.attributes["style:default-outline-level"],
+                  let level = Int(levelString)
+            else { continue }
+            map[name] = level
+        }
+        return map
+    }
+
     // MARK: content.xml — office:text → blocks
 
     private static func parseBody(
-        _ text: XMLNode, listStyles: [String: [Int: Bool]], textStyles: [String: TextStyle], archive: ZipArchive,
-        notes: NoteCollector
+        _ text: XMLNode, listStyles: [String: [Int: Bool]], textStyles: [String: TextStyle],
+        paragraphOutlineLevels: [String: Int], archive: ZipArchive, notes: NoteCollector
     ) -> [OfficeBlock] {
         var blocks: [OfficeBlock] = []
         for child in text.children {
@@ -232,8 +260,18 @@ enum OdtReader {
                     child, make: { .heading(level: level, spans: $0) }, textStyles: textStyles, archive: archive,
                     notes: notes))
             case "text:p":
-                blocks.append(contentsOf: paragraphLikeBlocks(
-                    child, make: { .paragraph(spans: $0) }, textStyles: textStyles, archive: archive, notes: notes))
+                // A `text:p` whose OWN paragraph style declares `style:default-outline-level` is a
+                // heading too — Writer produces this shape routinely — resolved on the same 1-based
+                // scale `text:outline-level` already uses, so it's clamped identically.
+                if let styleName = child.attributes["text:style-name"], let rawLevel = paragraphOutlineLevels[styleName] {
+                    let level = min(max(rawLevel, 1), 6)
+                    blocks.append(contentsOf: paragraphLikeBlocks(
+                        child, make: { .heading(level: level, spans: $0) }, textStyles: textStyles, archive: archive,
+                        notes: notes))
+                } else {
+                    blocks.append(contentsOf: paragraphLikeBlocks(
+                        child, make: { .paragraph(spans: $0) }, textStyles: textStyles, archive: archive, notes: notes))
+                }
             case "text:list":
                 blocks.append(contentsOf: parseList(
                     child, level: 0, inheritedStyleName: nil, listStyles: listStyles, textStyles: textStyles,

@@ -315,6 +315,46 @@ final class OfficeDocumentTests: XCTestCase {
     /// human — read the plist straight out of the repo and assert every office extension this app
     /// claims to open (`DocumentTypes`) has a matching `LSItemContentTypes` entry the system can
     /// actually resolve back to that extension (`UTType(filenameExtension:)`), and vice versa.
+    // MARK: S3 — heading recognition on the REAL corpus fixture, through MarkdownDocument itself
+    //
+    // INVARIANT 29: a parser test proves the parser, not that the app reaches it. `bus-headings.docx`
+    // measured 0 headings before this sprint (every mechanism but the rarest was unread) and
+    // `bus-headings.odt` measured 14 — this is the real regression guard: both formats of the SAME
+    // document must produce the SAME heading count, read through `MarkdownDocument.read(from:)`,
+    // not `DocxReader`/`OdtReader` directly.
+
+    private func repoRoot() -> URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    }
+
+    /// Counts `.heading` BLOCKS, not rendered attribute ranges — three of this fixture's fourteen
+    /// headings have no text of their own (an author left the heading line blank), so their
+    /// `MDAttr.heading` range collapses to zero length and never shows up in an attribute
+    /// enumeration over the rendered storage. The block count is what the sprint brief measures
+    /// (docx: 0 → 14) and what the outline sidebar is built from before empty ones are filtered for
+    /// display — this is the level this regression guard belongs at.
+    private func headingBlockCount(_ doc: MarkdownDocument) -> Int {
+        doc.officeBlocks.filter { if case .heading = $0 { return true }; return false }.count
+    }
+
+    func testBusHeadingsDocxAndOdtAgreeOnFourteenHeadingsThroughMarkdownDocument() throws {
+        let docxURL = repoRoot().appendingPathComponent("docs/fixtures/office/bus-headings.docx")
+        let odtURL = repoRoot().appendingPathComponent("docs/fixtures/office/bus-headings.odt")
+        let (docxDoc, docxWc) = try openOffice(try Data(contentsOf: docxURL))
+        let (odtDoc, odtWc) = try openOffice(
+            try Data(contentsOf: odtURL), ext: "odt", uti: "org.oasis-open.opendocument.text")
+        // Reached through `MarkdownDocument.read(from:)` itself (invariant 29) — not `DocxReader`/
+        // `OdtReader` called directly, which would prove only the parser, not that the app gets there.
+        XCTAssertEqual(headingBlockCount(docxDoc), 14, "docx must recognize all three heading mechanisms")
+        XCTAssertEqual(headingBlockCount(odtDoc), 14)
+        XCTAssertEqual(headingBlockCount(docxDoc), headingBlockCount(odtDoc),
+                       "the same document must yield the same heading count in both formats")
+        // The window controllers are exercised (not just discarded) so a render-time crash in either
+        // format's heading path would still fail this test.
+        _ = (try XCTUnwrap(docxWc.textStorageRef), try XCTUnwrap(odtWc.textStorageRef))
+    }
+
     func testOfficeExtensionsAgreeWithInfoPlistDocumentTypes() throws {
         let repoRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
