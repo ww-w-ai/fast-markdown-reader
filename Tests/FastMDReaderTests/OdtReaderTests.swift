@@ -247,6 +247,83 @@ final class OdtReaderTests: XCTestCase {
         ], headerRows: 0)])
     }
 
+    // MARK: Merged cells — ODF's covered-table-cell convention (the opposite of docx's vMerge)
+
+    func testHorizontalMergeCollapsesCoveredCellAndCarriesColSpan() throws {
+        let blocks = try read(body: """
+        <table:table>
+          <table:table-row>
+            <table:table-cell table:number-columns-spanned="2"><text:p>Wide</text:p></table:table-cell>
+            <table:covered-table-cell/>
+            <table:table-cell><text:p>C3</text:p></table:table-cell>
+          </table:table-row>
+        </table:table>
+        """)
+        XCTAssertEqual(blocks, [.table(rows: [
+            [Cell(spans: [Span(text: "Wide")], rowSpan: 1, colSpan: 2), Cell(spans: [Span(text: "C3")])],
+        ], headerRows: 0)])
+    }
+
+    func testVerticalMergeCollapsesCoveredCellInSubsequentRowAndCarriesRowSpan() throws {
+        let blocks = try read(body: """
+        <table:table>
+          <table:table-row>
+            <table:table-cell table:number-rows-spanned="2"><text:p>Tall</text:p></table:table-cell>
+            <table:table-cell><text:p>B1</text:p></table:table-cell>
+          </table:table-row>
+          <table:table-row>
+            <table:covered-table-cell/>
+            <table:table-cell><text:p>B2</text:p></table:table-cell>
+          </table:table-row>
+        </table:table>
+        """)
+        XCTAssertEqual(blocks, [.table(rows: [
+            [Cell(spans: [Span(text: "Tall")], rowSpan: 2, colSpan: 1), Cell(spans: [Span(text: "B1")])],
+            [Cell(spans: [Span(text: "B2")])],
+        ], headerRows: 0)])
+    }
+
+    /// `table:number-columns-repeated` can appear on `table:covered-table-cell` too (a wide merge's
+    /// covered run compressed the same way an empty run would be) — it must not throw off the anchor
+    /// that follows it, regardless of the repeat count.
+    func testRepeatedCoveredCellsDoNotShiftTheAnchorThatFollows() throws {
+        let blocks = try read(body: """
+        <table:table>
+          <table:table-row>
+            <table:table-cell table:number-columns-spanned="3"><text:p>Wide</text:p></table:table-cell>
+            <table:covered-table-cell table:number-columns-repeated="2"/>
+            <table:table-cell><text:p>Next</text:p></table:table-cell>
+          </table:table-row>
+        </table:table>
+        """)
+        XCTAssertEqual(blocks, [.table(rows: [
+            [Cell(spans: [Span(text: "Wide")], rowSpan: 1, colSpan: 3), Cell(spans: [Span(text: "Next")])],
+        ], headerRows: 0)])
+    }
+
+    // MARK: Nested tables — flattened to text (Cell has no room for a nested block)
+
+    func testNestedTableInsideACellFlattensToTextRatherThanDisappearing() throws {
+        let blocks = try read(body: """
+        <table:table>
+          <table:table-row>
+            <table:table-cell>
+              <text:p>Outer</text:p>
+              <table:table>
+                <table:table-row>
+                  <table:table-cell><text:p>Nested</text:p></table:table-cell>
+                </table:table-row>
+              </table:table>
+            </table:table-cell>
+          </table:table-row>
+        </table:table>
+        """)
+        guard case .table(let rows, _) = blocks.first else { return XCTFail("expected a table block") }
+        let allText = rows.flatMap { $0 }.flatMap { $0.spans }.map(\.text).joined()
+        XCTAssertTrue(allText.contains("Outer"), "outer paragraph text must survive")
+        XCTAssertTrue(allText.contains("Nested"), "nested table's text must survive, not disappear")
+    }
+
     // MARK: Lists
 
     private let numberThenBulletListStyle = """
@@ -325,6 +402,41 @@ final class OdtReaderTests: XCTestCase {
     func testUnresolvableSpanStyleEmitsTextUnstyledRatherThanDropped() throws {
         let blocks = try read(body: "<text:p><text:span text:style-name=\"Missing\">Text</text:span></text:p>")
         XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Text")])])
+    }
+
+    func testStrikethroughSuperscriptAndSubscriptStylesMapToSpanFlags() throws {
+        let blocks = try read(
+            body: """
+            <text:p><text:span text:style-name="Strike">S</text:span><text:span text:style-name="Sup">P</text:span><text:span text:style-name="Sub">B</text:span></text:p>
+            """,
+            automaticStyles: """
+            <style:style style:name="Strike" style:family="text"><style:text-properties style:text-line-through-style="solid"/></style:style>
+            <style:style style:name="Sup" style:family="text"><style:text-properties style:text-position="super 58%"/></style:style>
+            <style:style style:name="Sub" style:family="text"><style:text-properties style:text-position="sub 58%"/></style:style>
+            """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [
+            Span(text: "S", strikethrough: true),
+            Span(text: "P", superscript: true),
+            Span(text: "B", subscripted: true),
+        ])])
+    }
+
+    // MARK: Hyperlinks
+
+    func testHyperlinkTextAProducesLinkSpan() throws {
+        let blocks = try read(body: """
+        <text:p>before <text:a xlink:href="https://example.com">link text</text:a> after</text:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [
+            Span(text: "before "),
+            Span(text: "link text", link: "https://example.com"),
+            Span(text: " after"),
+        ])])
+    }
+
+    func testHyperlinkWithNoHrefIsPlainTextNotACrash() throws {
+        let blocks = try read(body: "<text:p><text:a>no href</text:a></text:p>")
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "no href")])])
     }
 
     // MARK: Archive-level failure and absent optional parts

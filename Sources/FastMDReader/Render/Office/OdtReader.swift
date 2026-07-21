@@ -60,12 +60,15 @@ enum OdtReader {
         var bold = false
         var italic = false
         var underline = false
+        var strikethrough = false
+        var superscript = false
+        var subscripted = false
     }
 
     /// Only `style:family="text"` styles are read — ODF reuses `style:style` for paragraph, table,
     /// table-cell, graphic and text styles alike, all distinguished by `style:family`; picking up
     /// the wrong family would collide names (a paragraph style and a text style can share a name).
-    /// A style with no `style:text-properties` at all, or one that declares none of the three
+    /// A style with no `style:text-properties` at all, or one that declares none of the
     /// properties this reader understands, is simply absent from the map — `collectSpans` reads
     /// that as "no formatting", never a crash.
     private static func parseTextStyles(from root: XMLNode) -> [String: TextStyle] {
@@ -77,6 +80,14 @@ enum OdtReader {
             style.bold = props.attributes["fo:font-weight"] == "bold"
             style.italic = props.attributes["fo:font-style"] == "italic"
             if let underline = props.attributes["style:text-underline-style"] { style.underline = underline != "none" }
+            if let strike = props.attributes["style:text-line-through-style"] { style.strikethrough = strike != "none" }
+            // `style:text-position` is `"<super|sub> <percentage>"` (e.g. `"super 58%"`) — only the
+            // leading keyword decides which axis; the percentage is a font-scale hint this viewer
+            // doesn't reproduce (same "skip presentation fidelity" call as everywhere else).
+            if let position = props.attributes["style:text-position"] {
+                style.superscript = position.hasPrefix("super")
+                style.subscripted = position.hasPrefix("sub")
+            }
             map[name] = style
         }
         return map
@@ -226,16 +237,74 @@ enum OdtReader {
     /// `table:number-columns-repeated`/`table:number-rows-repeated` count — ignoring it silently
     /// loses columns (a 5-column table where 3 empty trailing cells were collapsed into one would
     /// come back as 3 columns). Both expansions happen here, once, rather than at every caller.
+    ///
+    /// `table:covered-table-cell` is ODF's OWN merge convention — the opposite of docx's `vMerge`
+    /// (research-odt.md §1): the ORIGIN cell of a merge carries `table:number-columns-spanned` /
+    /// `table:number-rows-spanned` directly, and EVERY covered position (horizontal or vertical)
+    /// gets an explicit `<table:covered-table-cell/>` placeholder in that row's own XML — there is
+    /// no cross-row bookkeeping to do, each row already states its own covered positions. Dropping
+    /// those placeholders (contributing zero `Cell`s) is therefore correct on its own: what's left
+    /// is exactly `OfficeBlock.table`'s anchor-only shape, spans/repeats notwithstanding.
     private static func expandRow(_ row: XMLNode, textStyles: [String: TextStyle]) -> [[Cell]] {
         let rowRepeat = Int(row.attributes["table:number-rows-repeated"] ?? "") ?? 1
         var cells: [Cell] = []
         for cell in row.children where cell.name == "table:table-cell" {
-            let spans = cell.children.filter { $0.name == "text:p" }
-                .flatMap { collectSpans(in: $0, style: TextStyle(), textStyles: textStyles) }
+            let spans = collectCellSpans(cell, textStyles: textStyles)
+            let rowSpan = Int(cell.attributes["table:number-rows-spanned"] ?? "") ?? 1
+            let colSpan = Int(cell.attributes["table:number-columns-spanned"] ?? "") ?? 1
             let colRepeat = Int(cell.attributes["table:number-columns-repeated"] ?? "") ?? 1
-            cells.append(contentsOf: Array(repeating: Cell(spans: spans), count: colRepeat))
+            cells.append(contentsOf: Array(repeating: Cell(spans: spans, rowSpan: rowSpan, colSpan: colSpan), count: colRepeat))
         }
+        // `table:covered-table-cell` elements are read only to confirm they exist (and can carry
+        // their own `number-columns-repeated`, e.g. a 3-wide covered run compressed to one element)
+        // — neither contributes a `Cell`, so nothing further happens with them here.
         return Array(repeating: cells, count: rowRepeat)
+    }
+
+    /// A cell's content: its own paragraphs/headings, PLUS — when ODF nests a full
+    /// `<table:table>` directly inside a `<table:table-cell>` — that inner table's text, flattened
+    /// to spans. `Cell` has no case for a nested `.table` block (research-odt.md §4 sanctions this
+    /// as a legitimate depth-1 shortcut for a flat block viewer: the grid disappears, but no text
+    /// does — "skip presentation fidelity freely, never content").
+    private static func collectCellSpans(_ cell: XMLNode, textStyles: [String: TextStyle]) -> [Span] {
+        var spans: [Span] = []
+        for child in cell.children {
+            switch child.name {
+            case "text:p", "text:h":
+                spans.append(contentsOf: collectSpans(in: child, style: TextStyle(), textStyles: textStyles))
+            case "table:table":
+                spans.append(contentsOf: flattenNestedTable(child, textStyles: textStyles))
+            default:
+                continue
+            }
+        }
+        return spans
+    }
+
+    /// Flattens a nested table's cells into one run of spans — a tab between cells, a newline after
+    /// each non-empty row — so a reader glancing at the flattened text can still tell where one cell
+    /// ended and the next began, even though the grid itself is gone. Recurses through
+    /// `collectCellSpans`, so a table nested inside a nested table also survives (no depth cap is
+    /// enforced; real documents don't go more than one or two levels, per the research survey).
+    private static func flattenNestedTable(_ table: XMLNode, textStyles: [String: TextStyle]) -> [Span] {
+        let rows = table.children.flatMap { node -> [XMLNode] in
+            if node.name == "table:table-header-rows" { return node.children.filter { $0.name == "table:table-row" } }
+            if node.name == "table:table-row" { return [node] }
+            return []
+        }
+        var spans: [Span] = []
+        for row in rows {
+            var rowHasContent = false
+            for cell in row.children where cell.name == "table:table-cell" {
+                let cellSpans = collectCellSpans(cell, textStyles: textStyles)
+                guard !cellSpans.isEmpty else { continue }
+                if rowHasContent { spans.append(Span(text: "\t")) }
+                spans.append(contentsOf: cellSpans)
+                rowHasContent = true
+            }
+            if rowHasContent { spans.append(Span(text: "\n")) }
+        }
+        return spans
     }
 
     // MARK: Images — draw:frame > draw:image
@@ -303,47 +372,56 @@ enum OdtReader {
     /// formatting in effect for any bare text reached at this level; a `text:span` resolves ITS
     /// OWN style from `text:style-name` (falling back to the inherited `style` when the name is
     /// absent or unresolvable — text is never dropped for want of a style) and passes that down to
-    /// its own children, so nesting narrows rather than resets formatting.
+    /// its own children, so nesting narrows rather than resets formatting. `link` is threaded
+    /// alongside but separately from `style`, because a hyperlink target comes from `text:a`'s own
+    /// `xlink:href` attribute, not from any named style — it narrows the same way (a `text:a` with
+    /// no `xlink:href` at all just carries the enclosing link, if any, rather than losing it).
     private static func collectSpans(in node: XMLNode, style: TextStyle, textStyles: [String: TextStyle]) -> [Span] {
         var spans: [Span] = []
-        func appendMerging(_ text: String, _ style: TextStyle) {
+        func appendMerging(_ text: String, _ style: TextStyle, _ link: String?) {
             guard !text.isEmpty else { return }
-            if let last = spans.last, last.bold == style.bold, last.italic == style.italic, last.underline == style.underline {
+            if let last = spans.last, last.bold == style.bold, last.italic == style.italic, last.underline == style.underline,
+               last.strikethrough == style.strikethrough, last.superscript == style.superscript,
+               last.subscripted == style.subscripted, last.link == link {
                 spans[spans.count - 1].text += text
             } else {
-                spans.append(Span(text: text, bold: style.bold, italic: style.italic, underline: style.underline))
+                spans.append(Span(
+                    text: text, bold: style.bold, italic: style.italic, underline: style.underline, link: link,
+                    strikethrough: style.strikethrough, superscript: style.superscript, subscripted: style.subscripted))
             }
         }
-        func walk(_ node: XMLNode, style: TextStyle) {
+        func walk(_ node: XMLNode, style: TextStyle, link: String?) {
             for child in node.children {
                 switch child.name {
                 case "#text":
-                    appendMerging(child.text, style)
+                    appendMerging(child.text, style, link)
                 case "text:span":
                     let childStyle = child.attributes["text:style-name"].flatMap { textStyles[$0] } ?? style
-                    walk(child, style: childStyle)
+                    walk(child, style: childStyle, link: link)
+                case "text:a":
+                    let href = child.attributes["xlink:href"] ?? link
+                    walk(child, style: style, link: href)
                 case "text:s":
                     let count = child.attributes["text:c"].flatMap(Int.init) ?? 1
-                    appendMerging(String(repeating: " ", count: count), style)
+                    appendMerging(String(repeating: " ", count: count), style, link)
                 case "text:tab":
-                    appendMerging("\t", style)
+                    appendMerging("\t", style, link)
                 case "text:line-break":
-                    appendMerging("\n", style)
+                    appendMerging("\n", style, link)
                 case "draw:frame":
                     continue // images are collected separately by `collectImages`
                 case "text:bookmark-start", "text:bookmark-end", "text:bookmark", "office:annotation",
                      "office:annotation-end", "text:soft-page-break":
                     continue // markers with no renderable text of their own
                 default:
-                    // `text:a` (hyperlink) and anything else this switch doesn't specifically name
-                    // is descended into rather than skipped, so text is never lost just because
-                    // ODF wrapped it in something unanticipated — same permissive-recursion
-                    // reasoning as `DocxReader.collectSpans`.
-                    walk(child, style: style)
+                    // Anything else this switch doesn't specifically name is descended into rather
+                    // than skipped, so text is never lost just because ODF wrapped it in something
+                    // unanticipated — same permissive-recursion reasoning as `DocxReader.collectSpans`.
+                    walk(child, style: style, link: link)
                 }
             }
         }
-        walk(node, style: style)
+        walk(node, style: style, link: nil)
         return spans
     }
 

@@ -52,6 +52,20 @@
 			<key>NSDocumentClass</key>
 			<string>FastMDReader.MarkdownDocument</string>
 		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>OpenDocument Text</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>org.oasis-open.opendocument.text</string>
+			</array>
+			<key>NSDocumentClass</key>
+			<string>FastMDReader.MarkdownDocument</string>
+		</dict>
 	</array>
 	<key>CFBundleExecutable</key>
 	<string>FastMDReader</string>

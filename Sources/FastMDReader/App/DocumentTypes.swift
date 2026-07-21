@@ -14,10 +14,10 @@ enum DocumentTypes {
     /// doesn't keep — it has no syntax view for them, and the file's real editor is a better answer.
     static let plainTextExtensions = ["txt", "text", "csv", "tsv", "log", "conf", "cfg", "ini", "env"]
 
-    /// Office formats, read-only (see invariants 22 and CLAUDE.md S4). Only `.docx` this sprint —
-    /// `.odt`/`.rtf` arrive in S6, and adding them here without a reader behind them would offer a
-    /// file the panel can't actually open.
-    static let officeExtensions = ["docx"]
+    /// Office formats, read-only (see invariants 22 and CLAUDE.md S4). `.rtf` was surveyed and
+    /// dropped (see the roadmap's Revision 2 — AppKit's RTF reader loses structure and images
+    /// outright); `.odt` gained a reader in R3, so it belongs here now.
+    static let officeExtensions = ["docx", "odt"]
 
     static func opensInApp(_ ext: String) -> Bool {
         let e = ext.lowercased()
