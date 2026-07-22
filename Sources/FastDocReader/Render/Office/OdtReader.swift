@@ -238,6 +238,13 @@ enum OdtReader: OfficeDocumentReader {
         var highlightColor: NSColor? = nil
         var fontSize: CGFloat? = nil
         var fontName: String? = nil
+        /// P4 — `Span.underlineStyle`/`.caps`/`.smallCaps`'s ODF sources (`style:text-underline-
+        /// style`+`style:text-underline-type`, `fo:text-transform`, `fo:font-variant`). `underlineStyle`
+        /// defaults `.single`, matching `Span`'s own default (meaningful only when `underline` above
+        /// is `true`).
+        var underlineStyle: UnderlineStyle = .single
+        var caps = false
+        var smallCaps = false
     }
 
     /// The RAW, per-style, NOT-YET-INHERITED declaration a single `style:style` element (family
@@ -255,6 +262,9 @@ enum OdtReader: OfficeDocumentReader {
         var highlightColor: NSColor? = nil
         var fontSize: CGFloat? = nil
         var fontName: String? = nil
+        var underlineStyle: UnderlineStyle? = nil
+        var caps: Bool? = nil
+        var smallCaps: Bool? = nil
         /// `style:parent-style-name` — the style this one is based on, resolved by `resolveTextStyle`.
         var parent: String? = nil
     }
@@ -300,6 +310,33 @@ enum OdtReader: OfficeDocumentReader {
                 } else if let family = props.attributes["fo:font-family"] {
                     decl.fontName = family
                 }
+                // P4 — `style:text-underline-type="double"` wins over `style:text-underline-style`
+                // (ODF lets both be stated together); read together so a double underline is never
+                // reported as merely a dotted/dashed/wavy `.single`. Absent style with a present type
+                // (rare, malformed) still resolves via the `default: .single` fallthrough.
+                if props.attributes["style:text-underline-style"] != nil
+                    || props.attributes["style:text-underline-type"] != nil {
+                    if props.attributes["style:text-underline-type"] == "double" {
+                        decl.underlineStyle = .double
+                    } else {
+                        switch props.attributes["style:text-underline-style"] {
+                        case "dotted": decl.underlineStyle = .dotted
+                        case let v? where v.hasPrefix("dash") || v == "long-dash": decl.underlineStyle = .dashed
+                        case let v? where v.hasPrefix("wave"): decl.underlineStyle = .wavy
+                        default: decl.underlineStyle = .single
+                        }
+                    }
+                }
+                // P4 — only `"uppercase"` maps to `Span.caps`; `capitalize`/`lowercase`/`none` have no
+                // equivalent field, so a document declaring one of those explicitly turns caps OFF
+                // (an explicit, non-uppercase value beats an ancestor's `uppercase`), same "explicit
+                // beats inherited" posture every other toggle in this cascade already has.
+                if let transform = props.attributes["fo:text-transform"] {
+                    decl.caps = transform == "uppercase"
+                }
+                if let variant = props.attributes["fo:font-variant"] {
+                    decl.smallCaps = variant == "small-caps"
+                }
             }
             map[name] = decl
         }
@@ -329,7 +366,8 @@ enum OdtReader: OfficeDocumentReader {
     private static func resolveTextStyle(_ styleName: String, decls: [String: TextStyleDecl]) -> TextStyle {
         var result = TextStyle()
         var have = (bold: false, italic: false, underline: false, strike: false, sup: false, sub: false,
-                    color: false, highlight: false, size: false, font: false)
+                    color: false, highlight: false, size: false, font: false,
+                    underlineStyle: false, caps: false, smallCaps: false)
         var currentName: String? = styleName
         var visited = Set<String>()
         while let name = currentName {
@@ -346,6 +384,9 @@ enum OdtReader: OfficeDocumentReader {
             if !have.highlight, let v = decl.highlightColor { result.highlightColor = v; have.highlight = true }
             if !have.size, let v = decl.fontSize { result.fontSize = v; have.size = true }
             if !have.font, let v = decl.fontName { result.fontName = v; have.font = true }
+            if !have.underlineStyle, let v = decl.underlineStyle { result.underlineStyle = v; have.underlineStyle = true }
+            if !have.caps, let v = decl.caps { result.caps = v; have.caps = true }
+            if !have.smallCaps, let v = decl.smallCaps { result.smallCaps = v; have.smallCaps = true }
             currentName = decl.parent
         }
         return result
@@ -404,6 +445,12 @@ enum OdtReader: OfficeDocumentReader {
         /// therefore `TabStop(position:)`'s default `.left`/`.none`, identical to how a bare
         /// `CGFloat` position rendered before this type existed.
         var tabStops: [TabStop] = []
+        /// P4 — spacing/indent/line-height/shading/border, cascaded the SAME nearest-wins way as
+        /// every other field here. Built up field-by-field in `resolveParagraphStyle` (each of
+        /// `ParagraphFormat`'s own `Optional` fields already IS the "unset" sentinel this cascade
+        /// needs, so no separate `have.*` flags are needed for these — unlike the `Bool`-defaulting
+        /// fields above).
+        var format = ParagraphFormat()
     }
 
     /// The RAW, not-yet-inherited declaration of one `style:style` element, family `"paragraph"`.
@@ -417,6 +464,21 @@ enum OdtReader: OfficeDocumentReader {
         var alignmentRaw: String? = nil
         var tabStops: [TabStop] = []
         var parent: String? = nil
+        /// P4 — `fo:margin-top`/`-bottom`/`-left`/`-right`, `fo:text-indent` (normalized into
+        /// EITHER `firstLineIndent` OR `hangingIndent`, never both — see the parse site), `fo:line-
+        /// height`/`style:line-height-at-least`, `fo:background-color` (paragraph SHADING — a
+        /// DIFFERENT element than `style:text-properties`'s own `fo:background-color`, which
+        /// `TextStyleDecl.highlightColor` reads as run highlight, never this), and `fo:border`.
+        var spacingBefore: CGFloat? = nil
+        var spacingAfter: CGFloat? = nil
+        var indentStart: CGFloat? = nil
+        var indentEnd: CGFloat? = nil
+        var firstLineIndent: CGFloat? = nil
+        var hangingIndent: CGFloat? = nil
+        var lineHeight: LineHeight? = nil
+        var shading: NSColor? = nil
+        var borderColor: NSColor? = nil
+        var borderWidth: CGFloat? = nil
     }
 
     /// A `text:p` isn't the only way ODF marks a heading — Writer also lets a PARAGRAPH STYLE itself
@@ -452,10 +514,57 @@ enum OdtReader: OfficeDocumentReader {
                         .compactMap { $0.attributes["style:position"].flatMap(parseLength) }
                         .map { TabStop(position: $0) }
                 }
+                // P4 — spacing/indent/line-height/shading/border, straight off this SAME element.
+                decl.spacingBefore = props.attributes["fo:margin-top"].flatMap(parseLength)
+                decl.spacingAfter = props.attributes["fo:margin-bottom"].flatMap(parseLength)
+                decl.indentStart = props.attributes["fo:margin-left"].flatMap(parseLength)
+                decl.indentEnd = props.attributes["fo:margin-right"].flatMap(parseLength)
+                // ODF's negative `fo:text-indent` IS its own hanging-indent spelling (ODF 1.3
+                // §20.271) — a POSITIVE value pushes the first line further in, a NEGATIVE one pulls
+                // it back out (a hanging indent), mirrored onto `ParagraphFormat`'s own mutually
+                // exclusive `firstLineIndent`/`hangingIndent` pair exactly as docx's `w:ind/
+                // @w:firstLine`/`@w:hanging` already are.
+                if let raw = props.attributes["fo:text-indent"], let value = parseLength(raw) {
+                    if value > 0 { decl.firstLineIndent = value } else { decl.hangingIndent = -value }
+                }
+                // `fo:line-height` is EITHER a percentage (relative to the line's own font size, ODF's
+                // `w:lineRule="auto"` equivalent) OR an absolute length (`w:lineRule="exact"`
+                // equivalent) — `"normal"` and anything unparseable both mean "unspecified", never a
+                // literal `1.0`. `style:line-height-at-least` (`w:lineRule="atLeast"` equivalent) is
+                // read only when `fo:line-height` itself is absent — ODF documents state at most one
+                // of the two on a given paragraph-properties element.
+                if let raw = props.attributes["fo:line-height"] {
+                    decl.lineHeight = parseODFLineHeight(raw)
+                } else if let raw = props.attributes["style:line-height-at-least"], let value = parseLength(raw) {
+                    decl.lineHeight = .atLeast(value)
+                }
+                // PARAGRAPH shading — `style:paragraph-properties/@fo:background-color` — is a
+                // DIFFERENT attribute occurrence than the one `parseTextStyleDecls` reads off
+                // `style:text-properties` (that one becomes `Span.highlightColor`, a RUN highlight).
+                // Both happen to share the same attribute NAME because ODF reuses `fo:background-
+                // color` across several property elements; which one this is is decided entirely by
+                // which properties element it was found on, not by anything in this function.
+                if let bg = props.attributes["fo:background-color"] { decl.shading = parseODFColor(bg) }
+                let border = parseODFBorder(props)
+                decl.borderColor = border.color
+                decl.borderWidth = border.width
             }
             map[name] = decl
         }
         return map
+    }
+
+    /// `fo:line-height`'s two legal shapes (ODF 1.3 §20.191): a PERCENTAGE, relative to the line's
+    /// own font size (`"150%"` → `LineHeight.multiple(1.5)`), or an absolute LENGTH (`"18pt"` →
+    /// `LineHeight.exact(18)`). `"normal"` (the explicit "no override" keyword) and anything this
+    /// helper cannot parse both return `nil` — unspecified, never a fabricated `1.0`.
+    private static func parseODFLineHeight(_ raw: String) -> LineHeight? {
+        if raw.hasSuffix("%") {
+            guard let percent = Double(raw.dropLast()) else { return nil }
+            return .multiple(CGFloat(percent / 100))
+        }
+        guard let points = parseLength(raw) else { return nil }
+        return .exact(points)
     }
 
     /// Resolves one paragraph style's `style:parent-style-name` chain — same nearest-declaration-wins,
@@ -467,7 +576,10 @@ enum OdtReader: OfficeDocumentReader {
     private static func resolveParagraphStyle(_ styleName: String, decls: [String: ParagraphStyleDecl]) -> ResolvedParagraphStyle {
         var result = ResolvedParagraphStyle()
         var alignmentRaw: String? = nil
-        var have = (outline: false, rtl: false, align: false, tabs: false)
+        var have = (outline: false, rtl: false, align: false, tabs: false,
+                    spacingBefore: false, spacingAfter: false, indentStart: false, indentEnd: false,
+                    firstLineIndent: false, hangingIndent: false, lineHeight: false, shading: false,
+                    borderColor: false, borderWidth: false)
         var currentName: String? = styleName
         var visited = Set<String>()
         while let name = currentName {
@@ -478,6 +590,16 @@ enum OdtReader: OfficeDocumentReader {
             if !have.rtl, let v = decl.rtl { result.rtl = v; have.rtl = true }
             if !have.align, let v = decl.alignmentRaw { alignmentRaw = v; have.align = true }
             if !have.tabs, !decl.tabStops.isEmpty { result.tabStops = decl.tabStops; have.tabs = true }
+            if !have.spacingBefore, let v = decl.spacingBefore { result.format.spacingBefore = v; have.spacingBefore = true }
+            if !have.spacingAfter, let v = decl.spacingAfter { result.format.spacingAfter = v; have.spacingAfter = true }
+            if !have.indentStart, let v = decl.indentStart { result.format.indentStart = v; have.indentStart = true }
+            if !have.indentEnd, let v = decl.indentEnd { result.format.indentEnd = v; have.indentEnd = true }
+            if !have.firstLineIndent, let v = decl.firstLineIndent { result.format.firstLineIndent = v; have.firstLineIndent = true }
+            if !have.hangingIndent, let v = decl.hangingIndent { result.format.hangingIndent = v; have.hangingIndent = true }
+            if !have.lineHeight, let v = decl.lineHeight { result.format.lineHeight = v; have.lineHeight = true }
+            if !have.shading, let v = decl.shading { result.format.shading = v; have.shading = true }
+            if !have.borderColor, let v = decl.borderColor { result.format.borderColor = v; have.borderColor = true }
+            if !have.borderWidth, let v = decl.borderWidth { result.format.borderWidth = v; have.borderWidth = true }
             currentName = decl.parent
         }
         result.alignment = resolveAlignment(alignmentRaw, rtl: result.rtl)
@@ -568,10 +690,19 @@ enum OdtReader: OfficeDocumentReader {
 
     private struct TableColumnStyle: Equatable {
         var width: CGFloat? = nil
+        /// P4 — `style:rel-column-width` (`"3*"` — a PROPORTION, not a length: ODF 1.3 §20.212). Kept
+        /// as the bare number (`3`, not `3.0` points of anything) — `resolvedGridColumnWidths` only
+        /// ever needs the RATIO between columns, and `TableBlockBuilder` normalizes any
+        /// `OfficeBlock.table.columnWidths` array to a percentage of its own sum, so a proportion unit
+        /// and a points unit are interchangeable inputs to that same normalization as long as a given
+        /// table doesn't mix the two (real ODT documents state one or the other for every column, never
+        /// both within the same table).
+        var relWidth: CGFloat? = nil
     }
 
     private struct TableColumnStyleDecl {
         var width: CGFloat? = nil
+        var relWidth: CGFloat? = nil
         var parent: String? = nil
     }
 
@@ -585,8 +716,15 @@ enum OdtReader: OfficeDocumentReader {
             guard let name = styleNode.attributes["style:name"] else { continue }
             var decl = TableColumnStyleDecl()
             decl.parent = styleNode.attributes["style:parent-style-name"]
-            if let width = styleNode.child("style:table-column-properties")?.attributes["style:column-width"] {
-                decl.width = parseLength(width)
+            if let props = styleNode.child("style:table-column-properties") {
+                if let width = props.attributes["style:column-width"] { decl.width = parseLength(width) }
+                // `"<number>*"` — the trailing `*` is the datatype's own marker (ODF 1.3 §18.3.31
+                // `styleRelativeWidth`), not decoration; a value with no `*` suffix is not this
+                // datatype at all and is left unset rather than guessed at.
+                if let rel = props.attributes["style:rel-column-width"], rel.hasSuffix("*"),
+                   let number = Double(rel.dropLast()) {
+                    decl.relWidth = CGFloat(number)
+                }
             }
             map[name] = decl
         }
@@ -602,6 +740,7 @@ enum OdtReader: OfficeDocumentReader {
             visited.insert(name)
             guard let decl = decls[name] else { break }
             if result.width == nil, let v = decl.width { result.width = v }
+            if result.relWidth == nil, let v = decl.relWidth { result.relWidth = v }
             currentName = decl.parent
         }
         return result
@@ -641,7 +780,7 @@ enum OdtReader: OfficeDocumentReader {
                 let resolved = resolvedStyle(child.attributes["text:style-name"], styles: styles)
                 blocks.append(contentsOf: paragraphLikeBlocks(
                     child, make: { .heading(level: level, spans: $0, rtl: resolved.rtl, alignment: resolved.alignment,
-                                             tabStops: resolved.tabStops) },
+                                             tabStops: resolved.tabStops, format: resolved.format) },
                     styles: styles, archive: archive, notes: notes))
             case "text:p":
                 // A `text:p` whose OWN paragraph style declares `style:default-outline-level` is a
@@ -653,12 +792,12 @@ enum OdtReader: OfficeDocumentReader {
                     let level = min(max(rawLevel, 1), 6)
                     blocks.append(contentsOf: paragraphLikeBlocks(
                         child, make: { .heading(level: level, spans: $0, rtl: resolved.rtl, alignment: resolved.alignment,
-                                                 tabStops: resolved.tabStops) },
+                                                 tabStops: resolved.tabStops, format: resolved.format) },
                         styles: styles, archive: archive, notes: notes))
                 } else {
                     blocks.append(contentsOf: paragraphLikeBlocks(
                         child, make: { .paragraph(spans: $0, rtl: resolved.rtl, alignment: resolved.alignment,
-                                                   tabStops: resolved.tabStops) },
+                                                   tabStops: resolved.tabStops, format: resolved.format) },
                         styles: styles, archive: archive, notes: notes))
                 }
             case "text:hidden-paragraph":
@@ -677,7 +816,7 @@ enum OdtReader: OfficeDocumentReader {
                     let resolved = resolvedStyle(child.attributes["text:style-name"], styles: styles)
                     blocks.append(contentsOf: paragraphLikeBlocks(
                         child, make: { .paragraph(spans: $0, rtl: resolved.rtl, alignment: resolved.alignment,
-                                                   tabStops: resolved.tabStops) },
+                                                   tabStops: resolved.tabStops, format: resolved.format) },
                         styles: styles, archive: archive, notes: notes))
                 }
             case "text:numbered-paragraph":
@@ -698,7 +837,8 @@ enum OdtReader: OfficeDocumentReader {
                     let resolved = resolvedStyle(item.attributes["text:style-name"], styles: styles)
                     blocks.append(contentsOf: paragraphLikeBlocks(
                         item, make: { .listItem(level: level, ordered: ordered, spans: $0, rtl: resolved.rtl,
-                                                 alignment: resolved.alignment, tabStops: resolved.tabStops) },
+                                                 alignment: resolved.alignment, tabStops: resolved.tabStops,
+                                                 format: resolved.format) },
                         styles: styles, archive: archive, notes: notes))
                 }
             case "text:list":
@@ -796,7 +936,8 @@ enum OdtReader: OfficeDocumentReader {
                     let resolved = resolvedStyle(child.attributes["text:style-name"], styles: styles)
                     blocks.append(contentsOf: paragraphLikeBlocks(
                         child, make: { .listItem(level: level, ordered: ordered, spans: $0, rtl: resolved.rtl,
-                                                  alignment: resolved.alignment, tabStops: resolved.tabStops) },
+                                                  alignment: resolved.alignment, tabStops: resolved.tabStops,
+                                                  format: resolved.format) },
                         styles: styles, archive: archive, notes: notes))
                 case "text:list":
                     blocks.append(contentsOf: parseList(
@@ -833,7 +974,30 @@ enum OdtReader: OfficeDocumentReader {
                 continue
             }
         }
-        return .table(rows: rows, headerRows: headerRows)
+        return .table(rows: rows, headerRows: headerRows,
+                      columnWidths: resolvedGridColumnWidths(table, tableColumnStyles: styles.tableColumnStyles))
+    }
+
+    /// P4 — `OfficeBlock.table`'s own `columnWidths: [CGFloat]` (the P3 field docx's `w:tblGrid`
+    /// already feeds — see `DocxReader.tableGridColumnWidths`): the table's GRID ratios, fed to
+    /// `TableBlockBuilder` to fill the table's width proportionally rather than falling back to its
+    /// equal-ish auto layout. Reads EVERY `table:table-column` in source order (repeats expanded, the
+    /// same `table:number-columns-repeated` handling `parseColumnWidths` above already does), preferring
+    /// a column's `relWidth` (ODF's own preferred, proportion-native form) over its absolute `width`
+    /// when a style states both. A malformed/unstyled column anywhere in the grid — same
+    /// "never partially apply an untrustworthy grid" posture `tableGridColumnWidths` documents — makes
+    /// the WHOLE grid unusable, returned as `[]` (`TableBlockBuilder`'s existing auto layout, unchanged
+    /// — this is exactly what a table with no `table:table-column` elements at all already returns).
+    private static func resolvedGridColumnWidths(_ table: XMLNode, tableColumnStyles: [String: TableColumnStyle]) -> [CGFloat] {
+        var widths: [CGFloat] = []
+        for child in table.children where child.name == "table:table-column" {
+            guard let styleName = child.attributes["table:style-name"], let style = tableColumnStyles[styleName],
+                  let width = style.relWidth ?? style.width
+            else { return [] }
+            let repeated = Int(child.attributes["table:number-columns-repeated"] ?? "") ?? 1
+            widths.append(contentsOf: Array(repeating: width, count: repeated))
+        }
+        return widths
     }
 
     /// `table:table-column` — the ELEMENT `oss-delta-odt.md`'s audit found referenced nowhere in this
@@ -958,7 +1122,7 @@ enum OdtReader: OfficeDocumentReader {
                 let resolved = resolvedStyle(child.attributes["text:style-name"], styles: styles)
                 blocks.append(contentsOf: paragraphLikeBlocks(
                     child, make: { .heading(level: level, spans: $0, rtl: resolved.rtl, alignment: resolved.alignment,
-                                             tabStops: resolved.tabStops) },
+                                             tabStops: resolved.tabStops, format: resolved.format) },
                     styles: styles, archive: archive, notes: notes))
             case "text:p":
                 let styleName = child.attributes["text:style-name"]
@@ -967,12 +1131,12 @@ enum OdtReader: OfficeDocumentReader {
                     let level = min(max(rawLevel, 1), 6)
                     blocks.append(contentsOf: paragraphLikeBlocks(
                         child, make: { .heading(level: level, spans: $0, rtl: resolved.rtl, alignment: resolved.alignment,
-                                                 tabStops: resolved.tabStops) },
+                                                 tabStops: resolved.tabStops, format: resolved.format) },
                         styles: styles, archive: archive, notes: notes))
                 } else {
                     blocks.append(contentsOf: paragraphLikeBlocks(
                         child, make: { .paragraph(spans: $0, rtl: resolved.rtl, alignment: resolved.alignment,
-                                                   tabStops: resolved.tabStops) },
+                                                   tabStops: resolved.tabStops, format: resolved.format) },
                         styles: styles, archive: archive, notes: notes))
                 }
             case "text:list":
@@ -1212,25 +1376,28 @@ enum OdtReader: OfficeDocumentReader {
             }
             guard bookmarks.isEmpty else {
                 spans.append(Span(
-                    text: text, bold: style.bold, italic: style.italic, underline: style.underline, link: link,
+                    text: text, bold: style.bold, italic: style.italic, underline: style.underline,
+                    underlineStyle: style.underlineStyle, caps: style.caps, smallCaps: style.smallCaps, link: link,
                     strikethrough: style.strikethrough, superscript: style.superscript, subscripted: style.subscripted,
                     bookmarks: bookmarks, textColor: style.textColor, highlightColor: style.highlightColor,
                     fontSize: style.fontSize, fontName: style.fontName))
                 return
             }
             // A bookmarked span is never EXTENDED by trailing text either — see the matching guard
-            // in `DocxReader.collectSpans`. `textColor`/`highlightColor`/`fontSize`/`fontName` (this
-            // sprint's own additions) join the same equality check — two runs that only differ in,
-            // say, colour must stay two separate `Span`s, or the second run's colour would silently
-            // win for the whole merged range.
+            // in `DocxReader.collectSpans`. `textColor`/`highlightColor`/`fontSize`/`fontName`/
+            // `underlineStyle`/`caps`/`smallCaps` (P3/P4's own additions) join the same equality
+            // check — two runs that only differ in, say, colour must stay two separate `Span`s, or
+            // the second run's colour would silently win for the whole merged range.
             if let last = spans.last, last.bookmarks.isEmpty, last.bold == style.bold, last.italic == style.italic, last.underline == style.underline,
                last.strikethrough == style.strikethrough, last.superscript == style.superscript,
                last.subscripted == style.subscripted, last.link == link, last.textColor == style.textColor,
-               last.highlightColor == style.highlightColor, last.fontSize == style.fontSize, last.fontName == style.fontName {
+               last.highlightColor == style.highlightColor, last.fontSize == style.fontSize, last.fontName == style.fontName,
+               last.underlineStyle == style.underlineStyle, last.caps == style.caps, last.smallCaps == style.smallCaps {
                 spans[spans.count - 1].text += text
             } else {
                 spans.append(Span(
-                    text: text, bold: style.bold, italic: style.italic, underline: style.underline, link: link,
+                    text: text, bold: style.bold, italic: style.italic, underline: style.underline,
+                    underlineStyle: style.underlineStyle, caps: style.caps, smallCaps: style.smallCaps, link: link,
                     strikethrough: style.strikethrough, superscript: style.superscript, subscripted: style.subscripted,
                     textColor: style.textColor, highlightColor: style.highlightColor, fontSize: style.fontSize,
                     fontName: style.fontName))

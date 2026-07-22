@@ -89,6 +89,15 @@ final class OdtReaderTests: XCTestCase {
         return try OdtReader.read(archive)
     }
 
+    /// Matches `OdtReader.parseODFColor`'s own construction (`deviceRed:`, not `srgbRed:`) so a
+    /// comparison against a reader-resolved colour isn't tripped up by a colour-space mismatch that
+    /// has nothing to do with whether the RGB VALUES themselves are right.
+    private func odfColor(_ hex: String) -> NSColor {
+        let value = UInt32(hex, radix: 16)!
+        return NSColor(deviceRed: CGFloat((value >> 16) & 0xFF) / 255, green: CGFloat((value >> 8) & 0xFF) / 255,
+                        blue: CGFloat(value & 0xFF) / 255, alpha: 1)
+    }
+
     private func readWithMedia(body: String, media: [(name: String, bytes: [UInt8])]) throws -> [OfficeBlock] {
         var entries: [(String, Data)] = [("content.xml", Data(doc(body: body).utf8))]
         for (name, bytes) in media { entries.append((name, Data(bytes))) }
@@ -356,7 +365,7 @@ final class OdtReaderTests: XCTestCase {
           <table:table-row><table:table-cell><text:p>A</text:p></table:table-cell></table:table-row>
         </table:table>
         """)
-        guard case .table(_, let headerRows, _) = blocks.first else { return XCTFail("expected a table block") }
+        guard case .table(_, let headerRows, _, _) = blocks.first else { return XCTFail("expected a table block") }
         XCTAssertEqual(headerRows, 0)
     }
 
@@ -538,7 +547,7 @@ final class OdtReaderTests: XCTestCase {
           </table:table-row>
         </table:table>
         """)
-        guard case .table(let rows, _, _) = blocks.first else { return XCTFail("expected a table block") }
+        guard case .table(let rows, _, _, _) = blocks.first else { return XCTFail("expected a table block") }
         // `Cell` holds `blocks`, not `spans`, since S7 — the reader still flattens a nested table
         // into a single `.paragraph` at parse time, so pull its spans back out for this assertion.
         let allText = rows.flatMap { $0 }.flatMap { $0.blocks }.flatMap { block -> [Span] in
@@ -1303,7 +1312,7 @@ final class OdtReaderTests: XCTestCase {
               <style:table-cell-properties fo:background-color="#EEEEEE" fo:border="1pt solid #000000"/>
             </style:style>
             """)
-        guard case .table(let rows, _, _) = blocks[0], let cell = rows.first?.first else { return XCTFail("expected a table cell") }
+        guard case .table(let rows, _, _, _) = blocks[0], let cell = rows.first?.first else { return XCTFail("expected a table cell") }
         XCTAssertNotNil(cell.backgroundColor)
         XCTAssertEqual(cell.borderWidth, 1)
         XCTAssertNotNil(cell.borderColor)
@@ -1323,7 +1332,7 @@ final class OdtReaderTests: XCTestCase {
               <style:table-cell-properties fo:border-top="2pt solid #123456"/>
             </style:style>
             """)
-        guard case .table(let rows, _, _) = blocks[0], let cell = rows.first?.first else { return XCTFail("expected a table cell") }
+        guard case .table(let rows, _, _, _) = blocks[0], let cell = rows.first?.first else { return XCTFail("expected a table cell") }
         XCTAssertEqual(cell.borderWidth, 2)
         XCTAssertNotNil(cell.borderColor)
     }
@@ -1339,7 +1348,7 @@ final class OdtReaderTests: XCTestCase {
             <style:style style:name="Parent" style:family="table-cell"><style:table-cell-properties fo:background-color="#00FF00"/></style:style>
             <style:style style:name="Child" style:family="table-cell" style:parent-style-name="Parent"/>
             """)
-        guard case .table(let rows, _, _) = blocks[0], let cell = rows.first?.first else { return XCTFail("expected a table cell") }
+        guard case .table(let rows, _, _, _) = blocks[0], let cell = rows.first?.first else { return XCTFail("expected a table cell") }
         XCTAssertNotNil(cell.backgroundColor)
     }
 
@@ -1355,7 +1364,7 @@ final class OdtReaderTests: XCTestCase {
             <style:style style:name="A" style:family="table-cell" style:parent-style-name="B"><style:table-cell-properties fo:background-color="#00FF00"/></style:style>
             <style:style style:name="B" style:family="table-cell" style:parent-style-name="A"/>
             """)
-        guard case .table(let rows, _, _) = blocks[0], let cell = rows.first?.first else { return XCTFail("expected a table cell") }
+        guard case .table(let rows, _, _, _) = blocks[0], let cell = rows.first?.first else { return XCTFail("expected a table cell") }
         XCTAssertNotNil(cell.backgroundColor)
     }
 
@@ -1377,7 +1386,7 @@ final class OdtReaderTests: XCTestCase {
             <style:style style:name="Col1" style:family="table-column"><style:table-column-properties style:column-width="1in"/></style:style>
             <style:style style:name="Col2" style:family="table-column"><style:table-column-properties style:column-width="2in"/></style:style>
             """)
-        guard case .table(let rows, _, _) = blocks[0] else { return XCTFail("expected a table") }
+        guard case .table(let rows, _, _, _) = blocks[0] else { return XCTFail("expected a table") }
         XCTAssertEqual(rows[0][0].width, 72)
         XCTAssertEqual(rows[0][1].width, 144)
     }
@@ -1403,7 +1412,7 @@ final class OdtReaderTests: XCTestCase {
             <style:style style:name="Col2" style:family="table-column"><style:table-column-properties style:column-width="1in"/></style:style>
             <style:style style:name="Col3" style:family="table-column"><style:table-column-properties style:column-width="3in"/></style:style>
             """)
-        guard case .table(let rows, _, _) = blocks[0] else { return XCTFail("expected a table") }
+        guard case .table(let rows, _, _, _) = blocks[0] else { return XCTFail("expected a table") }
         XCTAssertEqual(rows[0][0].width, 72)
         XCTAssertEqual(rows[0][1].width, 216)
     }
@@ -1412,7 +1421,7 @@ final class OdtReaderTests: XCTestCase {
         let blocks = try read(body: """
         <table:table><table:table-row><table:table-cell><text:p>A</text:p></table:table-cell></table:table-row></table:table>
         """)
-        guard case .table(let rows, _, _) = blocks[0] else { return XCTFail("expected a table") }
+        guard case .table(let rows, _, _, _) = blocks[0] else { return XCTFail("expected a table") }
         XCTAssertNil(rows[0][0].width)
     }
 
@@ -1463,7 +1472,7 @@ final class OdtReaderTests: XCTestCase {
             """))
         let archive = try ZipArchive(data: zip)
         let blocks = try DocumentTypes.readOffice(archive, extension: "odt")
-        guard case .table(let rows, _, _) = blocks.first, let cell = rows.first?.first else {
+        guard case .table(let rows, _, _, _) = blocks.first, let cell = rows.first?.first else {
             return XCTFail("expected a table with a cell")
         }
         XCTAssertEqual(cell.width, 72)
@@ -1472,5 +1481,176 @@ final class OdtReaderTests: XCTestCase {
             return XCTFail("expected a paragraph in the cell")
         }
         XCTAssertEqual(alignment, .center)
+    }
+
+    // MARK: P4 — paragraph cascade (spacing/indent/line-height), run props, table grid ratios
+
+    /// The cm→pt/in→pt/pt→pt length helper (already shared with every other ODF length in this
+    /// reader) AND the nearest-declaration-wins parent-style-name cascade, exercised together: `Base`
+    /// declares the box-model properties, `Child` (based on `Base`) only adds line-height — the
+    /// spacing/indent must still resolve from the PARENT, not go missing just because the paragraph's
+    /// own style is `Child`.
+    func testParagraphSpacingIndentAndLineHeightCascadeThroughParentStyle() throws {
+        let blocks = try read(
+            body: "<text:p text:style-name=\"Child\">Text</text:p>",
+            automaticStyles: """
+            <style:style style:name="Base" style:family="paragraph">
+              <style:paragraph-properties fo:margin-top="0.2cm" fo:margin-bottom="6pt" fo:text-indent="0.18in"/>
+            </style:style>
+            <style:style style:name="Child" style:family="paragraph" style:parent-style-name="Base">
+              <style:paragraph-properties fo:line-height="150%"/>
+            </style:style>
+            """)
+        guard case .paragraph(_, _, _, _, let format) = blocks[0] else { return XCTFail("expected a paragraph") }
+        XCTAssertEqual(format.spacingBefore ?? -1, 0.2 * 72 / 2.54, accuracy: 0.001) // 0.2cm
+        XCTAssertEqual(format.spacingAfter, 6) // 6pt, already points
+        XCTAssertEqual(format.firstLineIndent ?? -1, 0.18 * 72, accuracy: 0.001) // 0.18in, positive → first-line
+        XCTAssertNil(format.hangingIndent)
+        XCTAssertEqual(format.lineHeight, .multiple(1.5))
+    }
+
+    /// ODF's own hanging-indent spelling: a NEGATIVE `fo:text-indent` becomes `hangingIndent`
+    /// (positive magnitude), never `firstLineIndent`, and the two stay mutually exclusive.
+    func testNegativeTextIndentBecomesHangingIndentNotFirstLineIndent() throws {
+        let blocks = try read(
+            body: "<text:p text:style-name=\"Hang\">Text</text:p>",
+            automaticStyles: """
+            <style:style style:name="Hang" style:family="paragraph">
+              <style:paragraph-properties fo:text-indent="-0.25in"/>
+            </style:style>
+            """)
+        guard case .paragraph(_, _, _, _, let format) = blocks[0] else { return XCTFail("expected a paragraph") }
+        XCTAssertNil(format.firstLineIndent)
+        XCTAssertEqual(format.hangingIndent ?? -1, 0.25 * 72, accuracy: 0.001)
+    }
+
+    /// An absolute `fo:line-height` (a LENGTH, not a percentage) resolves to `.exact`, and
+    /// `style:line-height-at-least` (only consulted when `fo:line-height` itself is absent) to
+    /// `.atLeast` — the third `LineHeight` case this sprint's brief calls out.
+    func testAbsoluteLineHeightAndLineHeightAtLeast() throws {
+        let exact = try read(
+            body: "<text:p text:style-name=\"Exact\">Text</text:p>",
+            automaticStyles: """
+            <style:style style:name="Exact" style:family="paragraph">
+              <style:paragraph-properties fo:line-height="18pt"/>
+            </style:style>
+            """)
+        guard case .paragraph(_, _, _, _, let exactFormat) = exact[0] else { return XCTFail("expected a paragraph") }
+        XCTAssertEqual(exactFormat.lineHeight, .exact(18))
+
+        let atLeast = try read(
+            body: "<text:p text:style-name=\"AtLeast\">Text</text:p>",
+            automaticStyles: """
+            <style:style style:name="AtLeast" style:family="paragraph">
+              <style:paragraph-properties style:line-height-at-least="20pt"/>
+            </style:style>
+            """)
+        guard case .paragraph(_, _, _, _, let atLeastFormat) = atLeast[0] else { return XCTFail("expected a paragraph") }
+        XCTAssertEqual(atLeastFormat.lineHeight, .atLeast(20))
+    }
+
+    /// `style:paragraph-properties/@fo:background-color` (paragraph SHADING) must land on
+    /// `ParagraphFormat.shading`, and must NOT be conflated with a `text:span`'s OWN
+    /// `style:text-properties/@fo:background-color` (RUN highlight, `Span.highlightColor`) even
+    /// though the two share the exact same attribute name — this is the distinction the sprint brief
+    /// calls out by name. `fo:border`'s width/colour land on `ParagraphFormat.borderColor`/
+    /// `borderWidth`.
+    func testParagraphShadingAndBorderAreDistinctFromRunHighlight() throws {
+        let blocks = try read(
+            body: """
+            <text:p text:style-name="Shaded"><text:span text:style-name="Marked">hi</text:span></text:p>
+            """,
+            automaticStyles: """
+            <style:style style:name="Shaded" style:family="paragraph">
+              <style:paragraph-properties fo:background-color="#FFCC00" fo:border="0.5pt solid #000000"/>
+            </style:style>
+            <style:style style:name="Marked" style:family="text">
+              <style:text-properties fo:background-color="#00FF00"/>
+            </style:style>
+            """)
+        guard case .paragraph(let spans, _, _, _, let format) = blocks[0] else { return XCTFail("expected a paragraph") }
+        XCTAssertEqual(format.shading, odfColor("FFCC00"))
+        XCTAssertEqual(format.borderColor, odfColor("000000"))
+        XCTAssertEqual(format.borderWidth, 0.5)
+        XCTAssertEqual(spans[0].highlightColor, odfColor("00FF00"))
+        XCTAssertNotEqual(format.shading, spans[0].highlightColor)
+    }
+
+    /// `style:text-underline-type="double"` wins over the dotted/dashed/wavy `style:text-underline-
+    /// style` reading; `fo:text-transform="uppercase"` → `Span.caps`; `fo:font-variant="small-caps"`
+    /// → `Span.smallCaps`.
+    func testRunUnderlineTypeDoubleCapsAndSmallCaps() throws {
+        let blocks = try read(
+            body: """
+            <text:p><text:span text:style-name="Fancy">shout</text:span></text:p>
+            """,
+            automaticStyles: """
+            <style:style style:name="Fancy" style:family="text">
+              <style:text-properties style:text-underline-style="solid" style:text-underline-type="double"
+                fo:text-transform="uppercase" fo:font-variant="small-caps"/>
+            </style:style>
+            """)
+        guard case .paragraph(let spans, _, _, _, _) = blocks[0] else { return XCTFail("expected a paragraph") }
+        XCTAssertEqual(spans[0].underlineStyle, .double)
+        XCTAssertTrue(spans[0].caps)
+        XCTAssertTrue(spans[0].smallCaps)
+    }
+
+    /// `style:rel-column-width` ("N*") is ODF's own proportion-native column width — fed into
+    /// `OfficeBlock.table.columnWidths` so `TableBlockBuilder` fills the table proportionally
+    /// (1:3 → 25%/75%) instead of falling back to its equal-ish auto layout.
+    func testRelativeColumnWidthsFeedTableGridColumnWidthsAsAProportion() throws {
+        let blocks = try read(
+            body: """
+            <table:table>
+              <table:table-column table:style-name="Narrow"/>
+              <table:table-column table:style-name="Wide"/>
+              <table:table-row>
+                <table:table-cell><text:p>A</text:p></table:table-cell>
+                <table:table-cell><text:p>B</text:p></table:table-cell>
+              </table:table-row>
+            </table:table>
+            """,
+            automaticStyles: """
+            <style:style style:name="Narrow" style:family="table-column"><style:table-column-properties style:rel-column-width="1*"/></style:style>
+            <style:style style:name="Wide" style:family="table-column"><style:table-column-properties style:rel-column-width="3*"/></style:style>
+            """)
+        guard case .table(_, _, let columnWidths, _) = blocks[0] else { return XCTFail("expected a table") }
+        XCTAssertEqual(columnWidths, [1, 3])
+    }
+
+    /// A grid where only SOME columns resolve a width must not partially apply — `[]` (auto layout),
+    /// mirroring `DocxReader.tableGridColumnWidths`'s own "never partially apply an untrustworthy
+    /// grid" posture.
+    func testPartiallyUnstyledColumnGridFallsBackToEmptyColumnWidths() throws {
+        let blocks = try read(
+            body: """
+            <table:table>
+              <table:table-column table:style-name="Styled"/>
+              <table:table-column/>
+              <table:table-row>
+                <table:table-cell><text:p>A</text:p></table:table-cell>
+                <table:table-cell><text:p>B</text:p></table:table-cell>
+              </table:table-row>
+            </table:table>
+            """,
+            automaticStyles: """
+            <style:style style:name="Styled" style:family="table-column"><style:table-column-properties style:rel-column-width="1*"/></style:style>
+            """)
+        guard case .table(_, _, let columnWidths, _) = blocks[0] else { return XCTFail("expected a table") }
+        XCTAssertEqual(columnWidths, [])
+    }
+
+    /// A document that declares NONE of P4's new attributes renders byte-identical to before this
+    /// sprint — `ParagraphFormat()`'s all-`nil` default, `Span`'s default `.single`/`false`/`false`,
+    /// and `columnWidths: []` (the pre-P4 return value in every case that isn't this sprint's own new
+    /// tests) are exactly what an untouched document already produced.
+    func testUndeclaredP4AttributesLeaveEveryFieldAtItsPreP4Default() throws {
+        let blocks = try read(body: "<text:p>Plain text</text:p>")
+        guard case .paragraph(let spans, _, _, _, let format) = blocks[0] else { return XCTFail("expected a paragraph") }
+        XCTAssertEqual(format, ParagraphFormat())
+        XCTAssertEqual(spans[0].underlineStyle, .single)
+        XCTAssertFalse(spans[0].caps)
+        XCTAssertFalse(spans[0].smallCaps)
     }
 }
