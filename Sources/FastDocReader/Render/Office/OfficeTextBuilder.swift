@@ -184,6 +184,10 @@ enum OfficeTextBuilder {
             var font = baseFont
             var color = baseColor
             var attrs: [NSAttributedString.Key: Any] = [:]
+            // `caps` is a DISPLAY-only transform (see `Span.caps`'s doc) — computed on a local copy
+            // of the run's text, never on `span` itself, so nothing downstream (undo, re-render,
+            // the source model) ever sees an uppercased string that wasn't authored.
+            let displayText = span.caps ? span.text.uppercased() : span.text
             if span.code {
                 font = theme.codeFont
                 color = theme.inlineCodeColor
@@ -226,12 +230,31 @@ enum OfficeTextBuilder {
             if let authoredColor = span.textColor, !span.code {
                 color = resolvedTextColor(authoredColor, theme: theme)
             }
+            // `smallCaps` (unlike `caps`) never touches `displayText` — it asks the FONT itself to
+            // draw lowercase letters as small capitals, via the classic Apple `kLowerCaseType`/
+            // `kLowerCaseSmallCapsSelector` font feature (present on macOS system fonts; a font
+            // lacking the feature silently renders its ordinary lowercase glyphs instead — no
+            // crash, just no small-caps look, the same graceful-degradation posture `fontName`'s
+            // missing-family fallback already takes). Applied LAST, after every other font
+            // transform above (code/family/size/bold-italic/super-sub), so the feature rides
+            // whatever font those already produced rather than being clobbered by one of them.
+            // Word's own precedence has `caps` win when both are set — `caps` already uppercased
+            // `displayText` above, so this only visibly matters when `smallCaps` is set alone, but
+            // it is harmless to also request the feature on an already-uppercased run (small-caps
+            // has no effect on characters that are already capital).
+            if span.smallCaps {
+                let smallCapsAttrs: [[NSFontDescriptor.FeatureKey: Int]] = [[
+                    .typeIdentifier: kLowerCaseType, .selectorIdentifier: kLowerCaseSmallCapsSelector,
+                ]]
+                let descriptor = font.fontDescriptor.addingAttributes([.featureSettings: smallCapsAttrs])
+                font = NSFont(descriptor: descriptor, size: font.pointSize) ?? font
+            }
             attrs[.font] = font
             attrs[.foregroundColor] = color
             // Always drawn exactly as authored — see `Span.highlightColor`'s doc for why a
             // highlight, unlike text colour, is never reinterpreted against the theme.
             if let highlight = span.highlightColor { attrs[.backgroundColor] = highlight }
-            if span.underline { attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue }
+            if span.underline { attrs[.underlineStyle] = nsUnderlineStyle(for: span.underlineStyle).rawValue }
             if span.strikethrough { attrs[.strikethroughStyle] = NSUnderlineStyle.single.rawValue }
             // Same colour/underline treatment `MarkdownRenderer.inlineFragment`'s `Markdown.Link`
             // case uses — a link must look and behave identically whether it arrived via markdown
@@ -270,9 +293,24 @@ enum OfficeTextBuilder {
                 attrs[.writingDirection] = [NSWritingDirection.rightToLeft.rawValue
                                              | NSWritingDirectionFormatType.embedding.rawValue]
             }
-            out.append(NSAttributedString(string: span.text, attributes: attrs))
+            out.append(NSAttributedString(string: displayText, attributes: attrs))
         }
         return out
+    }
+
+    /// Maps `UnderlineStyle` (already-collapsed from docx `w:u/@w:val` — see that enum's doc) to
+    /// the nearest `NSUnderlineStyle` AppKit actually draws. `.dashed`/`.dotted` have exact pattern
+    /// equivalents; `.wavy` does not — `NSUnderlineStyle` has no wave pattern at all, so `.thick` is
+    /// used as the nearest "this is not an ordinary underline" visual distinction AppKit offers
+    /// (a plain `.single` would silently lose the fact the source asked for something unusual).
+    private static func nsUnderlineStyle(for style: UnderlineStyle) -> NSUnderlineStyle {
+        switch style {
+        case .single: return .single
+        case .double: return .double
+        case .dotted: return .patternDot
+        case .dashed: return .patternDash
+        case .wavy: return .thick
+        }
     }
 
     /// Decides whether an authored run colour survives into the current reading theme, or steps

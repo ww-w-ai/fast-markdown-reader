@@ -10,7 +10,24 @@ struct Span: Equatable {
     var bold: Bool = false
     var italic: Bool = false
     var underline: Bool = false
+    /// The underline's STYLE (docx `w:rPr/w:u/@w:val`, §17.18.99 `ST_Underline`) — meaningful only
+    /// when `underline` is `true`; a non-underlined span still carries whatever default this field
+    /// has, but `OfficeTextBuilder` never reads it in that case. Defaults to `.single`, which is
+    /// both `ST_Underline`'s own most common value AND what every span rendered before this field
+    /// existed (unconditionally `NSUnderlineStyle.single`). `underline` itself stays the on/off
+    /// toggle it always was — see `DocxReader.isOn` — this field only refines what an ON underline
+    /// LOOKS like.
+    var underlineStyle: UnderlineStyle = .single
     var code: Bool = false
+    /// docx `w:rPr/w:caps` (§17.3.2.5) — renders the run's text UPPERCASE at build time, without
+    /// changing the underlying source model (`OfficeTextBuilder` uppercases only the DISPLAYED
+    /// string). Wins over `smallCaps` when both are set (matches Word's own precedence — `w:caps`
+    /// is the stronger of the two transforms).
+    var caps: Bool = false
+    /// docx `w:rPr/w:smallCaps` (§17.3.2.33) — renders lowercase letters as small capitals via an
+    /// AppKit font feature, WITHOUT uppercasing the source text (unlike `caps` above) — the glyphs
+    /// change, the characters don't.
+    var smallCaps: Bool = false
     /// The link target, if this run is (or is inside) a hyperlink — `nil` for ordinary text. A
     /// later sprint's docx/odt parser resolves relationship ids / `text:a` hrefs down to this
     /// string; this sprint only carries the field through to rendering.
@@ -68,6 +85,16 @@ struct Span: Equatable {
     /// color" reasoning) — letting an authored family override it would make some code spans
     /// inconsistent with others for no reason a reader would understand.
     var fontName: String? = nil
+}
+
+/// An underline's drawn style — docx `w:rPr/w:u/@w:val` (§17.18.99 `ST_Underline`), collapsed from
+/// that enumeration's ~20 named values down to the handful AppKit can actually distinguish.
+/// `DocxReader` maps `double`→`.double`; `dotted`/`dottedHeavy`→`.dotted`; every `dash*` variant
+/// (`dash`/`dashLong`/`dashedHeavy`/…)→`.dashed`; every `wave*` variant (`wave`/`wavyHeavy`/
+/// `wavyDouble`)→`.wavy`; anything else, including `single` itself and an absent/unrecognized
+/// `@w:val`, →`.single`. Only consulted when `Span.underline` is `true` — see that field's doc.
+enum UnderlineStyle: Equatable {
+    case single, double, dotted, dashed, wavy
 }
 
 /// One cell of a table row. Only ANCHOR cells — the top-left corner of a merge — appear in

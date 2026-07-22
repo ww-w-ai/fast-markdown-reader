@@ -1001,8 +1001,43 @@ enum DocxReader: OfficeDocumentReader {
         case "lowerRoman": return romanNumeral(n).lowercased()
         case "upperLetter": return letterSequence(n).uppercased()
         case "lowerLetter": return letterSequence(n)
+        // `ideographDigital`/`koreanDigital` (§17.18.59 `ST_NumberFormat`) are DIGIT SUBSTITUTION,
+        // not full positional counting (Chinese/Korean "counting" numerals — e.g. 12 as "십이"/
+        // "十二" — are a materially different algorithm this reader doesn't attempt): each decimal
+        // digit of `n` is replaced one-for-one with its ideograph/Hangul numeral. `digitGlyphs`
+        // covers only 0–9, so a negative `n` falls back to `decimal` (its `-` has no glyph) same as
+        // any other unrecognized format.
+        case "ideographDigital": return digitGlyphs(n, table: chineseDigitGlyphs) ?? "\(n)"
+        case "koreanDigital": return digitGlyphs(n, table: koreanDigitGlyphs) ?? "\(n)"
+        // `decimalEnclosedCircle` — Word's circled-number list style (①②③…). Unicode's own
+        // "Enclosed Alphanumerics" block only covers 1–20 as single circled-digit code points
+        // (U+2460…U+2473); outside that range there is no single glyph to substitute, so it falls
+        // back to plain `decimal` rather than fabricating a multi-character approximation.
+        case "decimalEnclosedCircle" where n >= 1 && n <= 20:
+            return String(UnicodeScalar(0x2460 + (n - 1))!)
         default: return "\(n)"
         }
+    }
+
+    /// Ideograph numeral digits 0–9 (〇一二三四五六七八九) — CJK Unified Ideographs, the digit
+    /// glyphs `w:numFmt="ideographDigital"` substitutes in place of each decimal digit.
+    private static let chineseDigitGlyphs: [Character] = ["〇", "一", "二", "三", "四", "五", "六", "七", "八", "九"]
+    /// Hangul numeral digits 0–9 (영일이삼사오육칠팔구) — the digit glyphs
+    /// `w:numFmt="koreanDigital"` substitutes in place of each decimal digit.
+    private static let koreanDigitGlyphs: [Character] = ["영", "일", "이", "삼", "사", "오", "육", "칠", "팔", "구"]
+
+    /// One decimal digit → one glyph, in order — `nil` for any input a digit-substitution table
+    /// can't represent (negative `n`), so the caller's own `??` falls back to plain decimal.
+    private static func digitGlyphs(_ n: Int, table: [Character]) -> String? {
+        guard n >= 0 else { return nil }
+        if n == 0 { return String(table[0]) }
+        var remainder = n
+        var digits: [Character] = []
+        while remainder > 0 {
+            digits.append(table[remainder % 10])
+            remainder /= 10
+        }
+        return String(digits.reversed())
     }
 
     private static func romanNumeral(_ n: Int) -> String {
@@ -1976,7 +2011,9 @@ enum DocxReader: OfficeDocumentReader {
             // the same boundary-smearing `Span.bookmarks`' doc comment warns against, just from the
             // other direction.
             if let last = spans.last, last.bookmarks.isEmpty, last.bold == span.bold, last.italic == span.italic,
-               last.underline == span.underline, last.code == span.code, last.link == span.link,
+               last.underline == span.underline, last.underlineStyle == span.underlineStyle,
+               last.caps == span.caps, last.smallCaps == span.smallCaps,
+               last.code == span.code, last.link == span.link,
                last.strikethrough == span.strikethrough, last.superscript == span.superscript,
                last.subscripted == span.subscripted, last.rtl == span.rtl {
                 spans[spans.count - 1].text += span.text
@@ -2130,16 +2167,30 @@ enum DocxReader: OfficeDocumentReader {
     /// one it renders as a ballot X — Word's own "checked"/"crossed-out" marks for a legacy
     /// Wingdings-font checkbox, one of the categories the sprint brief asked for.
     ///
-    /// Every OTHER category the brief named — bullet variants, arrows, telephone, envelope — is
-    /// DELIBERATELY NOT mapped: without live access to the published Unicode/Microsoft charts to
-    /// confirm their exact `w:char` code points, adding them would mean guessing, which the brief
-    /// explicitly forbids. They keep the honest ▯ fallback; a future pass with the actual chart in
-    /// hand can extend this table, never by copying another project's source.
+    /// P2R extends the table with the categories the ORIGINAL brief named but that sprint left
+    /// unmapped for lack of a citable chart — bullet, box, arrow, telephone and envelope glyphs.
+    /// Source: Alan Wood's "Unicode resources" Wingdings character-set page
+    /// (`alanwood.net/demos/wingdings.html`), a long-standing, independently-citable font↔Unicode
+    /// correspondence reference (not another markdown/office READER's source — see this function's
+    /// own licence-rule note above). `w:char` is the Wingdings font's OWN code position + `0xF000`
+    /// (Word always encodes a PUA offset); the table's "Hex" column is that same code position
+    /// before the offset, e.g. its `0x9F` is this function's `F09F`. Still deliberately incomplete —
+    /// only glyphs from the brief's named categories, not an attempt at full Wingdings coverage —
+    /// and the ▯ fallback still covers everything else honestly.
     private static func mappedSymbolCharacter(font: String?, char: String?) -> String? {
         guard let font, font.caseInsensitiveCompare("Wingdings") == .orderedSame, let char else { return nil }
         switch char.uppercased() {
         case "F0FC": return "\u{2713}"   // check mark
         case "F0FB": return "\u{2717}"   // ballot X
+        case "F09F": return "\u{2022}"   // bullet
+        case "F06E": return "\u{25A0}"   // black square (box)
+        case "F06F": return "\u{25A1}"   // white square (box)
+        case "F0EF": return "\u{21E6}"   // leftwards white arrow
+        case "F0F0": return "\u{21E8}"   // rightwards white arrow
+        case "F0F1": return "\u{21E7}"   // upwards white arrow
+        case "F0F2": return "\u{21E9}"   // downwards white arrow
+        case "F028": return "\u{1F57F}"  // black touchtone telephone
+        case "F02A": return "\u{1F582}"  // back of envelope
         default: return nil
         }
     }
@@ -2189,9 +2240,26 @@ enum DocxReader: OfficeDocumentReader {
         let fontName = directFontName ?? resolvedFontName(pStyleId: pStyleId, styleInfo: styleInfo)
         return Span(
             text: text, bold: isOn(rPr, "w:b"), italic: isOn(rPr, "w:i"), underline: isOn(rPr, "w:u"),
+            underlineStyle: underlineStyleValue(rPr), code: false,
+            caps: isOn(rPr, "w:caps"), smallCaps: isOn(rPr, "w:smallCaps"),
             strikethrough: isOn(rPr, "w:strike"), superscript: vertAlign == "superscript",
             subscripted: vertAlign == "subscript", rtl: isOn(rPr, "w:rtl"),
             textColor: color, highlightColor: highlight, fontSize: fontSize, fontName: fontName)
+    }
+
+    /// Maps `w:rPr/w:u/@w:val` (§17.18.99 `ST_Underline`) to `UnderlineStyle` — see that enum's own
+    /// doc for the collapsed mapping. Only meaningful when `isOn(rPr, "w:u")` is `true`; called
+    /// unconditionally here anyway (cheap, and `Span.underline` is what actually gates whether
+    /// `OfficeTextBuilder` ever reads it), so a non-underlined run still gets a harmless `.single`.
+    private static func underlineStyleValue(_ rPr: XMLNode?) -> UnderlineStyle {
+        guard let val = rPr?.child("w:u")?.attributes["w:val"] else { return .single }
+        switch val {
+        case "double": return .double
+        case "dotted", "dottedHeavy": return .dotted
+        case let v where v.hasPrefix("dash"): return .dashed
+        case let v where v.hasPrefix("wave") || v.hasPrefix("wavy"): return .wavy
+        default: return .single
+        }
     }
 
     /// A run-property toggle (`w:b`/`w:i`/`w:u`) is ON by its mere presence — UNLESS it carries

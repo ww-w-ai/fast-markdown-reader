@@ -658,6 +658,63 @@ final class DocxReaderTests: XCTestCase {
         XCTAssertEqual(blocks, [.listItem(level: 0, ordered: false, spans: [Span(text: "Item")])])
     }
 
+    // MARK: numFmt — non-Latin numbering (P2R — §17.18.59 ST_NumberFormat)
+
+    /// `ideographDigital` is DIGIT SUBSTITUTION (one ideograph per decimal digit), not positional
+    /// Chinese counting — `12` becomes `一二`, not `十二`. Three independent increments so the
+    /// substitution is checked across more than the first digit.
+    func testIdeographDigitalNumFmtSubstitutesCjkNumeralsPerDigit() throws {
+        let numbering = """
+        <w:numbering>
+          <w:abstractNum w:abstractNumId="1">
+            <w:lvl w:ilvl="0"><w:numFmt w:val="ideographDigital"/><w:lvlText w:val="%1."/></w:lvl>
+          </w:abstractNum>
+          <w:num w:numId="9"><w:abstractNumId w:val="1"/></w:num>
+        </w:numbering>
+        """
+        let body = (1...3).map { numberedItem("9", 0, "Item\($0)") }.joined()
+        let blocks = try read(document: body, numbering: numbering)
+        let markers = blocks.compactMap { block -> String? in
+            if case .listItem(_, _, _, let marker, _, _, _, _) = block { return marker }
+            return nil
+        }
+        XCTAssertEqual(markers, ["一.", "二.", "三."])
+    }
+
+    func testKoreanDigitalNumFmtSubstitutesHangulNumeralsPerDigit() throws {
+        let numbering = """
+        <w:numbering>
+          <w:abstractNum w:abstractNumId="1">
+            <w:lvl w:ilvl="0"><w:numFmt w:val="koreanDigital"/><w:lvlText w:val="%1."/></w:lvl>
+          </w:abstractNum>
+          <w:num w:numId="9"><w:abstractNumId w:val="1"/></w:num>
+        </w:numbering>
+        """
+        let blocks = try read(document: numberedItem("9", 0, "Item"), numbering: numbering)
+        XCTAssertEqual(blocks, [.listItem(level: 0, ordered: true, spans: [Span(text: "Item")], marker: "일.")])
+    }
+
+    /// `decimalEnclosedCircle` — Word's circled-number style (①②③…), covered here only within
+    /// Unicode's single-glyph range (1–20); outside that range the format falls back to plain
+    /// decimal rather than fabricating a glyph (see `formatNumber`'s own doc).
+    func testDecimalEnclosedCircleNumFmtRendersCircledDigits() throws {
+        let numbering = """
+        <w:numbering>
+          <w:abstractNum w:abstractNumId="1">
+            <w:lvl w:ilvl="0"><w:numFmt w:val="decimalEnclosedCircle"/><w:lvlText w:val="%1"/></w:lvl>
+          </w:abstractNum>
+          <w:num w:numId="9"><w:abstractNumId w:val="1"/></w:num>
+        </w:numbering>
+        """
+        let body = (1...3).map { numberedItem("9", 0, "Item\($0)") }.joined()
+        let blocks = try read(document: body, numbering: numbering)
+        let markers = blocks.compactMap { block -> String? in
+            if case .listItem(_, _, _, let marker, _, _, _, _) = block { return marker }
+            return nil
+        }
+        XCTAssertEqual(markers, ["\u{2460}", "\u{2461}", "\u{2462}"])
+    }
+
     // MARK: Tables
 
     func testTwoByTwoTableWithAnEmptyCellKeepsShapeAndReportsHeaderRow() throws {
@@ -1193,6 +1250,29 @@ final class DocxReaderTests: XCTestCase {
         XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "▯")])])
     }
 
+    /// P2R's extension to the mapping table (bullet/box/arrow/telephone/envelope — see
+    /// `mappedSymbolCharacter`'s doc for the source), spot-checked one code per category rather
+    /// than every entry, since they all go through the identical `switch`.
+    func testP2RExtendedWingdingsCodesRenderTheirRealCharacters() throws {
+        let blocks = try read(document: """
+        <w:p><w:r>
+          <w:sym w:font="Wingdings" w:char="F09F"/>
+          <w:sym w:font="Wingdings" w:char="F06E"/>
+          <w:sym w:font="Wingdings" w:char="F0F0"/>
+        </w:r></w:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "\u{2022}\u{25A0}\u{21E8}")])])
+    }
+
+    /// A code NOT in the (still deliberately incomplete) table keeps the honest ▯ fallback even
+    /// after this sprint's extension — the point isn't "map everything", only what can be cited.
+    func testACodeStillOutsideTheExtendedTableStillFallsBackToThePlaceholder() throws {
+        let blocks = try read(document: """
+        <w:p><w:r><w:sym w:font="Wingdings" w:char="F099"/></w:r></w:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "▯")])])
+    }
+
     // MARK: w:vanish — S6 item 2, hidden text (never displayed in Word's Normal view)
 
     func testVanishedRunProducesNoSpanWhileAnOrdinaryRunBesideItStillRenders() throws {
@@ -1221,6 +1301,49 @@ final class DocxReaderTests: XCTestCase {
         <w:p><w:r><w:rPr><w:vanish/></w:rPr><w:t>AllHidden</w:t></w:r></w:p>
         """)
         XCTAssertEqual(blocks, [.paragraph(spans: [])])
+    }
+
+    // MARK: caps / smallCaps (P2R — §17.3.2.5 / §17.3.2.33)
+
+    func testCapsRunPropertyParses() throws {
+        let blocks = try read(document: "<w:p><w:r><w:rPr><w:caps/></w:rPr><w:t>Shout</w:t></w:r></w:p>")
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Shout", caps: true)])])
+    }
+
+    func testSmallCapsRunPropertyParses() throws {
+        let blocks = try read(document: "<w:p><w:r><w:rPr><w:smallCaps/></w:rPr><w:t>Whisper</w:t></w:r></w:p>")
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Whisper", smallCaps: true)])])
+    }
+
+    /// Same explicitly-disabled-toggle convention `isOn` already applies to bold/italic/underline —
+    /// `w:val="0"` turns an inherited `w:caps` back off, it is not read as ON-by-presence.
+    func testExplicitlyDisabledCapsIsNotCaps() throws {
+        let blocks = try read(document: "<w:p><w:r><w:rPr><w:caps w:val=\"0\"/></w:rPr><w:t>Plain</w:t></w:r></w:p>")
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Plain", caps: false)])])
+    }
+
+    // MARK: underline style (P2R — §17.18.99 ST_Underline)
+
+    func testUnderlineValDoubleParsesToTheDoubleUnderlineStyle() throws {
+        let blocks = try read(document: "<w:p><w:r><w:rPr><w:u w:val=\"double\"/></w:rPr><w:t>Lined</w:t></w:r></w:p>")
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Lined", underline: true, underlineStyle: .double)])])
+    }
+
+    func testUnderlineValDottedParsesToTheDottedUnderlineStyle() throws {
+        let blocks = try read(document: "<w:p><w:r><w:rPr><w:u w:val=\"dotted\"/></w:rPr><w:t>Lined</w:t></w:r></w:p>")
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Lined", underline: true, underlineStyle: .dotted)])])
+    }
+
+    func testUnderlineValWaveParsesToTheWavyUnderlineStyle() throws {
+        let blocks = try read(document: "<w:p><w:r><w:rPr><w:u w:val=\"wave\"/></w:rPr><w:t>Lined</w:t></w:r></w:p>")
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Lined", underline: true, underlineStyle: .wavy)])])
+    }
+
+    /// An ORDINARY `w:u` with no `@w:val` (or `@w:val="single"`) means the plain default this
+    /// reader already produced for every underlined run before this field existed.
+    func testPlainUnderlineWithNoValAttributeStaysTheSingleStyle() throws {
+        let blocks = try read(document: "<w:p><w:r><w:rPr><w:u/></w:rPr><w:t>Lined</w:t></w:r></w:p>")
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Lined", underline: true, underlineStyle: .single)])])
     }
 
     // MARK: strikethrough / superscript / subscript

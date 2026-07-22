@@ -6,10 +6,12 @@ final class OfficeTextBuilderTests: XCTestCase {
     private let theme = RenderTheme.current(size: 16)
 
     private func span(_ text: String, bold: Bool = false, italic: Bool = false,
-                       underline: Bool = false, code: Bool = false,
+                       underline: Bool = false, underlineStyle: UnderlineStyle = .single, code: Bool = false,
+                       caps: Bool = false, smallCaps: Bool = false,
                        textColor: NSColor? = nil, highlightColor: NSColor? = nil,
                        fontName: String? = nil, fontSize: CGFloat? = nil) -> Span {
-        Span(text: text, bold: bold, italic: italic, underline: underline, code: code,
+        Span(text: text, bold: bold, italic: italic, underline: underline, underlineStyle: underlineStyle,
+             code: code, caps: caps, smallCaps: smallCaps,
              textColor: textColor, highlightColor: highlightColor, fontSize: fontSize, fontName: fontName)
     }
 
@@ -145,6 +147,76 @@ final class OfficeTextBuilderTests: XCTestCase {
         XCTAssertFalse(italicFont!.fontDescriptor.symbolicTraits.contains(.bold))
         let underlineValue = out.attribute(.underlineStyle, at: underlineRange.location, effectiveRange: nil) as? Int
         XCTAssertEqual(underlineValue, NSUnderlineStyle.single.rawValue)
+    }
+
+    // MARK: caps / smallCaps (P2R)
+
+    /// `caps` uppercases the DISPLAYED text only — the run's own `text` never changes, so this
+    /// asserts against the rendered string, not the source `Span`.
+    func testCapsRunRendersUppercasedText() {
+        let out = build([.paragraph(spans: [span("shout", caps: true)])])
+        XCTAssertEqual(out.string, "shout".uppercased() + "\n")
+    }
+
+    /// `smallCaps` must NOT touch the string — the transform is a font feature, not a text edit —
+    /// and the font it produces must actually request the small-caps feature (not merely "some
+    /// font", which would silently do nothing visually).
+    func testSmallCapsRunKeepsLowercaseTextButAppliesTheFontFeature() {
+        let out = build([.paragraph(spans: [span("whisper", smallCaps: true)])])
+        XCTAssertEqual(out.string, "whisper\n")
+        let font = out.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+        let features = font?.fontDescriptor.object(forKey: .featureSettings) as? [[NSFontDescriptor.FeatureKey: Int]]
+        let hasSmallCapsFeature = features?.contains {
+            $0[.typeIdentifier] == kLowerCaseType && $0[.selectorIdentifier] == kLowerCaseSmallCapsSelector
+        } ?? false
+        XCTAssertTrue(hasSmallCapsFeature)
+    }
+
+    /// Word's own precedence: when a run carries BOTH toggles, `caps` wins — the text renders
+    /// uppercased (small-caps has no visible effect on already-capital letters anyway).
+    func testCapsWinsOverSmallCapsWhenBothAreSet() {
+        let out = build([.paragraph(spans: [span("both", caps: true, smallCaps: true)])])
+        XCTAssertEqual(out.string, "BOTH\n")
+    }
+
+    /// A run with neither toggle set renders byte-identical to before this field existed — the
+    /// "unspecified = identical" contract for this sprint's addition.
+    func testNeitherCapsNorSmallCapsLeavesTextAndFontUntouched() {
+        let out = build([.paragraph(spans: [span("plain")])])
+        XCTAssertEqual(out.string, "plain\n")
+        let font = out.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+        let features = font?.fontDescriptor.object(forKey: .featureSettings) as? [[NSFontDescriptor.FeatureKey: Int]]
+        XCTAssertNil(features)
+    }
+
+    // MARK: underline style (P2R)
+
+    /// `underlineStyle` only matters when `underline` is `true` — its default `.single` renders
+    /// the exact `NSUnderlineStyle.single` every underlined span rendered before this field
+    /// existed, so an unspecified style is byte-identical to before.
+    func testDefaultUnderlineStyleRendersSingle() {
+        let out = build([.paragraph(spans: [span("lined", underline: true)])])
+        let value = out.attribute(.underlineStyle, at: 0, effectiveRange: nil) as? Int
+        XCTAssertEqual(value, NSUnderlineStyle.single.rawValue)
+    }
+
+    func testDoubleUnderlineStyleRendersNSUnderlineStyleDouble() {
+        let out = build([.paragraph(spans: [span("lined", underline: true, underlineStyle: .double)])])
+        let value = out.attribute(.underlineStyle, at: 0, effectiveRange: nil) as? Int
+        XCTAssertEqual(value, NSUnderlineStyle.double.rawValue)
+    }
+
+    func testDottedUnderlineStyleRendersThePatternDotStyle() {
+        let out = build([.paragraph(spans: [span("lined", underline: true, underlineStyle: .dotted)])])
+        let value = out.attribute(.underlineStyle, at: 0, effectiveRange: nil) as? Int
+        XCTAssertEqual(value, NSUnderlineStyle.patternDot.rawValue)
+    }
+
+    /// `underline == false` never draws an underline attribute at all, regardless of whatever
+    /// `underlineStyle` happens to be carrying — the toggle still gates everything.
+    func testUnderlineOffDrawsNoUnderlineAttributeEvenWithADoubleStyleSet() {
+        let out = build([.paragraph(spans: [span("plain", underline: false, underlineStyle: .double)])])
+        XCTAssertNil(out.attribute(.underlineStyle, at: 0, effectiveRange: nil))
     }
 
     /// `code` overrides font/color to the theme's inline-code styling and tags `MDAttr.inlineCode`
