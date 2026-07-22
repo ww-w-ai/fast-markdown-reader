@@ -287,7 +287,7 @@ final class OfficeDocumentTests: XCTestCase {
     func testRTLParagraphReachesRenderedDocumentThroughTheFullReadPath() throws {
         let (doc, wc) = try openOffice(fixtureDocxWithBidiParagraph())
         XCTAssertTrue(doc.officeBlocks.contains {
-            if case .paragraph(_, let rtl, _, _) = $0 { return rtl }
+            if case .paragraph(_, let rtl, _, _, _) = $0 { return rtl }
             return false
         })
         let storage = try XCTUnwrap(wc.textStorageRef)

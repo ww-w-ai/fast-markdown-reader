@@ -234,7 +234,7 @@ final class OdtReaderTests: XCTestCase {
             </style:style>
             <style:style style:name="B" style:family="text"><style:text-properties fo:font-weight="bold"/></style:style>
             """)
-        guard case .paragraph(let spans, let rtl, _, _) = blocks[0] else { return XCTFail("expected a paragraph") }
+        guard case .paragraph(let spans, let rtl, _, _, _) = blocks[0] else { return XCTFail("expected a paragraph") }
         XCTAssertTrue(rtl)
         XCTAssertTrue(spans.allSatisfy { !$0.rtl })
     }
@@ -244,7 +244,7 @@ final class OdtReaderTests: XCTestCase {
     func testDocumentWithNoWritingModeMarkupProducesRtlFalseEverywhere() throws {
         let blocks = try read(body: "<text:p>Ordinary</text:p>")
         XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Ordinary")])])
-        guard case .paragraph(_, let rtl, _, _) = blocks[0] else { return XCTFail("expected a paragraph") }
+        guard case .paragraph(_, let rtl, _, _, _) = blocks[0] else { return XCTFail("expected a paragraph") }
         XCTAssertFalse(rtl)
     }
 
@@ -542,7 +542,7 @@ final class OdtReaderTests: XCTestCase {
         // `Cell` holds `blocks`, not `spans`, since S7 — the reader still flattens a nested table
         // into a single `.paragraph` at parse time, so pull its spans back out for this assertion.
         let allText = rows.flatMap { $0 }.flatMap { $0.blocks }.flatMap { block -> [Span] in
-            if case .paragraph(let spans, _, _, _) = block { return spans }
+            if case .paragraph(let spans, _, _, _, _) = block { return spans }
             return []
         }.map(\.text).joined()
         XCTAssertTrue(allText.contains("Outer"), "outer paragraph text must survive")
@@ -745,7 +745,7 @@ final class OdtReaderTests: XCTestCase {
           <text:note-body><text:p>Note body text.</text:p></text:note-body>
         </text:note> note.</text:p>
         """)
-        guard case .paragraph(let citingSpans, _, _, _) = blocks[0] else { return XCTFail("expected a paragraph") }
+        guard case .paragraph(let citingSpans, _, _, _, _) = blocks[0] else { return XCTFail("expected a paragraph") }
         XCTAssertFalse(citingSpans.contains { $0.text.contains("Note body text.") })
     }
 
@@ -763,7 +763,7 @@ final class OdtReaderTests: XCTestCase {
           <text:note-body><text:p>The first note body text.</text:p></text:note-body>
         </text:note> note.</text:p>
         """)
-        guard case .paragraph(let noteSpans, _, _, _) = blocks[1] else { return XCTFail("expected the appended note paragraph") }
+        guard case .paragraph(let noteSpans, _, _, _, _) = blocks[1] else { return XCTFail("expected the appended note paragraph") }
         XCTAssertEqual(noteSpans.map(\.text).joined(), "1\tThe first note body text.")
     }
 
@@ -1077,7 +1077,7 @@ final class OdtReaderTests: XCTestCase {
         let blocks = try DocumentTypes.readOffice(archive, extension: "odt")
         let allText = blocks.flatMap { block -> [String] in
             switch block {
-            case .paragraph(let spans, _, _, _), .heading(_, let spans, _, _, _), .listItem(_, _, let spans, _, _, _, _): return spans.map(\.text)
+            case .paragraph(let spans, _, _, _, _), .heading(_, let spans, _, _, _, _), .listItem(_, _, let spans, _, _, _, _, _): return spans.map(\.text)
             case .table, .image, .unsupportedGraphic, .formula: return []
             }
         }.joined()
@@ -1097,7 +1097,7 @@ final class OdtReaderTests: XCTestCase {
               <style:paragraph-properties fo:text-align="center"/>
             </style:style>
             """)
-        guard case .paragraph(_, _, let alignment, _) = blocks[0] else { return XCTFail("expected a paragraph") }
+        guard case .paragraph(_, _, let alignment, _, _) = blocks[0] else { return XCTFail("expected a paragraph") }
         XCTAssertEqual(alignment, .center)
     }
 
@@ -1111,7 +1111,7 @@ final class OdtReaderTests: XCTestCase {
               <style:paragraph-properties fo:text-align="start" style:writing-mode="lr-tb"/>
             </style:style>
             """)
-        guard case .paragraph(_, _, let a1, _) = ltr[0] else { return XCTFail("expected a paragraph") }
+        guard case .paragraph(_, _, let a1, _, _) = ltr[0] else { return XCTFail("expected a paragraph") }
         XCTAssertEqual(a1, .left)
 
         let rtl = try read(
@@ -1121,7 +1121,7 @@ final class OdtReaderTests: XCTestCase {
               <style:paragraph-properties fo:text-align="start" style:writing-mode="rl-tb"/>
             </style:style>
             """)
-        guard case .paragraph(_, let rtl2, let a2, _) = rtl[0] else { return XCTFail("expected a paragraph") }
+        guard case .paragraph(_, let rtl2, let a2, _, _) = rtl[0] else { return XCTFail("expected a paragraph") }
         XCTAssertTrue(rtl2)
         XCTAssertEqual(a2, .right)
     }
@@ -1137,7 +1137,7 @@ final class OdtReaderTests: XCTestCase {
               <style:paragraph-properties style:writing-mode="rl-tb"/>
             </style:style>
             """)
-        guard case .paragraph(_, let rtl1, let a1, _) = noAlignment[0] else { return XCTFail("expected a paragraph") }
+        guard case .paragraph(_, let rtl1, let a1, _, _) = noAlignment[0] else { return XCTFail("expected a paragraph") }
         XCTAssertTrue(rtl1)
         XCTAssertNil(a1)
 
@@ -1148,7 +1148,7 @@ final class OdtReaderTests: XCTestCase {
               <style:paragraph-properties style:writing-mode="rl-tb" fo:text-align="left"/>
             </style:style>
             """)
-        guard case .paragraph(_, let rtl2, let a2, _) = explicitLeft[0] else { return XCTFail("expected a paragraph") }
+        guard case .paragraph(_, let rtl2, let a2, _, _) = explicitLeft[0] else { return XCTFail("expected a paragraph") }
         XCTAssertTrue(rtl2)
         XCTAssertEqual(a2, .left)
     }
@@ -1166,7 +1166,7 @@ final class OdtReaderTests: XCTestCase {
               </style:paragraph-properties>
             </style:style>
             """)
-        guard case .paragraph(_, _, _, let tabStops) = blocks[0] else { return XCTFail("expected a paragraph") }
+        guard case .paragraph(_, _, _, let tabStops, _) = blocks[0] else { return XCTFail("expected a paragraph") }
         XCTAssertEqual(tabStops, [36, 72])
     }
 
@@ -1212,7 +1212,7 @@ final class OdtReaderTests: XCTestCase {
               <style:text-properties fo:color="#FF0000" fo:background-color="#FFFF00" fo:font-size="14pt" fo:font-family="Georgia"/>
             </style:style>
             """)
-        guard case .paragraph(let spans, _, _, _) = blocks[0] else { return XCTFail("expected a paragraph") }
+        guard case .paragraph(let spans, _, _, _, _) = blocks[0] else { return XCTFail("expected a paragraph") }
         XCTAssertEqual(spans[0].fontSize, 14)
         XCTAssertEqual(spans[0].fontName, "Georgia")
         XCTAssertNotNil(spans[0].textColor)
@@ -1232,7 +1232,7 @@ final class OdtReaderTests: XCTestCase {
               <style:text-properties style:font-name="Arial1"/>
             </style:style>
             """)
-        guard case .paragraph(let spans, _, _, _) = blocks[0] else { return XCTFail("expected a paragraph") }
+        guard case .paragraph(let spans, _, _, _, _) = blocks[0] else { return XCTFail("expected a paragraph") }
         XCTAssertEqual(spans[0].fontName, "Arial")
     }
 
@@ -1246,7 +1246,7 @@ final class OdtReaderTests: XCTestCase {
               <style:text-properties fo:background-color="transparent"/>
             </style:style>
             """)
-        guard case .paragraph(let spans, _, _, _) = blocks[0] else { return XCTFail("expected a paragraph") }
+        guard case .paragraph(let spans, _, _, _, _) = blocks[0] else { return XCTFail("expected a paragraph") }
         XCTAssertNil(spans[0].highlightColor)
     }
 
@@ -1261,7 +1261,7 @@ final class OdtReaderTests: XCTestCase {
               <style:text-properties fo:font-size="150%"/>
             </style:style>
             """)
-        guard case .paragraph(let spans, _, _, _) = blocks[0] else { return XCTFail("expected a paragraph") }
+        guard case .paragraph(let spans, _, _, _, _) = blocks[0] else { return XCTFail("expected a paragraph") }
         XCTAssertNil(spans[0].fontSize)
     }
 
@@ -1468,7 +1468,7 @@ final class OdtReaderTests: XCTestCase {
         }
         XCTAssertEqual(cell.width, 72)
         XCTAssertNotNil(cell.backgroundColor)
-        guard case .paragraph(_, _, let alignment, _) = cell.blocks.first else {
+        guard case .paragraph(_, _, let alignment, _, _) = cell.blocks.first else {
             return XCTFail("expected a paragraph in the cell")
         }
         XCTAssertEqual(alignment, .center)

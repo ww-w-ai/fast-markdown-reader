@@ -339,7 +339,7 @@ final class DocxReaderTests: XCTestCase {
         // Belt-and-braces on the acceptance criterion itself, not just structural equality above:
         // the word "Moved" must occur exactly once across the whole document.
         let fullText = blocks.compactMap { block -> String? in
-            if case .paragraph(let spans, _, _, _) = block { return spans.map(\.text).joined() }
+            if case .paragraph(let spans, _, _, _, _) = block { return spans.map(\.text).joined() }
             return nil
         }.joined()
         XCTAssertEqual(fullText.components(separatedBy: "Moved").count - 1, 1,
@@ -625,7 +625,7 @@ final class DocxReaderTests: XCTestCase {
             + (1...3).map { numberedItem("70", 0, "l\($0)") }.joined()
         let blocks = try read(document: body, numbering: numbering)
         let markers = blocks.compactMap { block -> String? in
-            if case .listItem(_, _, _, let marker, _, _, _) = block { return marker }
+            if case .listItem(_, _, _, let marker, _, _, _, _) = block { return marker }
             return nil
         }
         XCTAssertEqual(markers, [
@@ -952,7 +952,7 @@ final class DocxReaderTests: XCTestCase {
         // `Cell` holds `blocks`, not `spans`, since S7 — the reader still flattens a nested table
         // into a single `.paragraph` at parse time, so pull its spans back out for this assertion.
         let allText = rows.flatMap { $0 }.flatMap { $0.blocks }.flatMap { block -> [Span] in
-            if case .paragraph(let spans, _, _, _) = block { return spans }
+            if case .paragraph(let spans, _, _, _, _) = block { return spans }
             return []
         }.map(\.text).joined()
         XCTAssertTrue(allText.contains("Outer"), "the cell's own paragraph text must survive")
@@ -1294,7 +1294,7 @@ final class DocxReaderTests: XCTestCase {
     func testDocumentWithNoBidiOrRtlMarkupProducesRtlFalseEverywhere() throws {
         let blocks = try read(document: "<w:p><w:r><w:t>Ordinary</w:t></w:r></w:p>")
         XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Ordinary")])])
-        guard case .paragraph(_, let rtl, _, _) = blocks[0] else { return XCTFail("expected a paragraph") }
+        guard case .paragraph(_, let rtl, _, _, _) = blocks[0] else { return XCTFail("expected a paragraph") }
         XCTAssertFalse(rtl)
     }
 

@@ -50,7 +50,7 @@ enum OfficeTextBuilder {
         for block in blocks {
             let start = result.length
             switch block {
-            case let .heading(level, spans, rtl, alignment, tabStops):
+            case let .heading(level, spans, rtl, alignment, tabStops, _):
                 result.append(spansAttributedString(spans, baseFont: theme.headingFont(level: level),
                                                      baseColor: theme.textColor, theme: theme,
                                                      fontSizeScale: fontSizeScale))
@@ -65,7 +65,7 @@ enum OfficeTextBuilder {
                                                                   alignment: alignment, tabStops: tabStops),
                                     range: NSRange(location: start, length: result.length - start))
 
-            case let .paragraph(spans, rtl, alignment, tabStops):
+            case let .paragraph(spans, rtl, alignment, tabStops, _):
                 result.append(spansAttributedString(spans, baseFont: theme.bodyFont,
                                                      baseColor: theme.textColor, theme: theme,
                                                      fontSizeScale: fontSizeScale))
@@ -75,7 +75,7 @@ enum OfficeTextBuilder {
                                                                tabStops: tabStops),
                                     range: NSRange(location: start, length: result.length - start))
 
-            case let .listItem(level, ordered, spans, marker, rtl, alignment, tabStops):
+            case let .listItem(level, ordered, spans, marker, rtl, alignment, tabStops, _):
                 appendListItem(level: level, ordered: ordered, spans: spans, marker: marker, rtl: rtl,
                                alignment: alignment, tabStops: tabStops, into: result,
                                theme: theme, orderedCounters: &orderedCounters, fontSizeScale: fontSizeScale)
@@ -439,14 +439,14 @@ enum OfficeTextBuilder {
             // shared builder (out of this sprint's file scope). A cell's RUN-level styling
             // (`Span.rtl`, `Span.textColor`, …) still applies, unaffected — it's carried entirely
             // inside `spansAttributedString`.
-            case let .heading(level, spans, _, _, _):
+            case let .heading(level, spans, _, _, _, _):
                 result.append(spansAttributedString(spans, baseFont: theme.headingFont(level: level),
                                                      baseColor: theme.textColor, theme: theme,
                                                      fontSizeScale: fontSizeScale))
-            case let .paragraph(spans, _, _, _):
+            case let .paragraph(spans, _, _, _, _):
                 result.append(spansAttributedString(spans, baseFont: baseFont, baseColor: theme.textColor,
                                                      theme: theme, fontSizeScale: fontSizeScale))
-            case let .listItem(level, ordered, spans, marker, _, _, _):
+            case let .listItem(level, ordered, spans, marker, _, _, _, _):
                 // Cell-local numbering state — a list embedded in one cell doesn't continue a
                 // count begun in a sibling cell or at top level.
                 var counters: [Int: Int] = [:]

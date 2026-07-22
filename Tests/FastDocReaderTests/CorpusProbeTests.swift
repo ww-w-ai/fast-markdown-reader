@@ -42,7 +42,7 @@ final class CorpusProbeTests: XCTestCase {
 
         mutating func add(_ block: OfficeBlock) {
             switch block {
-            case .heading(let level, _, _, _, _): headingByLevel[level, default: 0] += 1
+            case .heading(let level, _, _, _, _, _): headingByLevel[level, default: 0] += 1
             case .paragraph: paragraphs += 1
             case .listItem: listItems += 1
             case .table: tables += 1

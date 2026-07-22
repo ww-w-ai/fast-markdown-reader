@@ -135,6 +135,72 @@ struct Cell: Equatable {
     }
 }
 
+/// A paragraph's line-spacing mode — docx `w:pPr/w:spacing/@w:lineRule` (`auto`/`exact`/`atLeast`)
+/// and ODF's equivalent `style:line-height-at-least`/`fo:line-height` distinction, carried as one
+/// closed vocabulary rather than a raw (rule, value) pair so a later sprint's builder can switch
+/// over it exhaustively. Reserved for P2 (the reader that populates it, and
+/// `OfficeTextBuilder`'s translation to `NSParagraphStyle` line-height, are next sprint's job) —
+/// this sprint only carries the vocabulary, nothing constructs a non-nil value yet.
+enum LineHeight: Equatable {
+    /// docx `w:lineRule="auto"` — a RATIO of the line's own font size, not an absolute value;
+    /// `1.0` means single spacing (the same as no line-height set at all), `2.0` double, etc.
+    case multiple(CGFloat)
+    /// docx `w:lineRule="exact"` — an EXACT height in POINTS, overriding the line's natural size
+    /// (a tall glyph or embedded object can be clipped if the exact value is smaller than it needs).
+    case exact(CGFloat)
+    /// docx `w:lineRule="atLeast"` — a MINIMUM height in POINTS; the line grows past this value
+    /// when its own content needs more room, but never shrinks below it.
+    case atLeast(CGFloat)
+}
+
+/// A paragraph's block-level formatting — spacing, indentation, shading and border — read from the
+/// source but not yet applied anywhere. Every field defaults to `nil`/`false`, meaning "the source
+/// didn't say → `OfficeTextBuilder` keeps using its own token/theme default, exactly as before this
+/// struct existed." This sprint (P1) only adds the vocabulary and a default-constructed instance to
+/// every block that can carry one; NEITHER reader (`DocxReader`/`OdtReader`) constructs a non-default
+/// value yet, NOR does `OfficeTextBuilder` read any of these fields into layout — both are P2's job.
+/// A default `ParagraphFormat()` therefore renders BYTE-IDENTICAL to a block with no `format` at all.
+struct ParagraphFormat: Equatable {
+    /// Space before/after the paragraph, in POINTS (docx `w:pPr/w:spacing/@w:before`/`@w:after` are
+    /// TWIPS — a reader converts twips→points before constructing this; ODT `fo:margin-top`/
+    /// `fo:margin-bottom` are already points). `nil` leaves the builder's own theme spacing in place.
+    var spacingBefore: CGFloat? = nil
+    var spacingAfter: CGFloat? = nil
+    /// The paragraph's line-spacing mode — see `LineHeight` above. `nil` leaves whatever line
+    /// height the builder already computes (typically driven by font size) untouched.
+    var lineHeight: LineHeight? = nil
+    /// Indentation from the text block's start/end edge (docx `w:pPr/w:ind/@w:start`(or `@w:left`)/
+    /// `@w:end`(or `@w:right`), converted twips→points; odt `fo:margin-left`/`fo:margin-right`), and
+    /// first-line/hanging indent (`w:ind/@w:firstLine`/`@w:hanging`; odt `fo:text-indent` — a
+    /// negative value there is ODF's own hanging-indent spelling, so a reader normalizes it into
+    /// EITHER `firstLineIndent` OR `hangingIndent`, never both at once, mirroring docx's own
+    /// mutually-exclusive pair). All four in POINTS. Named after the SOURCE spec's own attributes
+    /// deliberately — mapping `start`/`end` (which flip with `rtl`) onto `NSParagraphStyle`'s
+    /// physical `firstLineHeadIndent`/`headIndent` is P2's job, not this struct's.
+    var indentStart: CGFloat? = nil
+    var indentEnd: CGFloat? = nil
+    var firstLineIndent: CGFloat? = nil
+    var hangingIndent: CGFloat? = nil
+    /// docx `w:pPr/w:contextualSpacing` (a toggle, read the same on/off way as `Span.rtl` — see
+    /// `DocxReader.isOn`) / odt paragraph-style `style:contextual-spacing` — when `true`, suppresses
+    /// `spacingBefore`/`spacingAfter` between two consecutive paragraphs of the SAME style (list
+    /// items are the common case: no gap wanted between "1." and "2.", but one wanted before the
+    /// list and after it). Applying that adjacency rule is P2's job; this field only carries the bit.
+    var contextualSpacing: Bool = false
+    /// The paragraph's own background fill (docx `w:pPr/w:shd/@w:fill`, odt paragraph-style
+    /// `fo:background-color`) — `nil` means unshaded, exactly as every paragraph renders today.
+    /// Mirrors `Cell.backgroundColor`'s naming/semantics one level up, for the same reason: a
+    /// paragraph can carry its own fill independent of any table it might sit inside.
+    var shading: NSColor? = nil
+    /// The paragraph's border box (docx `w:pPr/w:pBdr`, odt paragraph-style `fo:border`) — one
+    /// uniform colour/width, mirroring `Cell.borderColor`/`Cell.borderWidth`'s existing model and
+    /// its documented reasoning: a real per-edge border (top/bottom/left/right independently) is
+    /// out of scope for the same reason it is on `Cell` — both source formats can express far more
+    /// than this vocabulary carries, and one uniform colour/width already covers the measured need.
+    var borderColor: NSColor? = nil
+    var borderWidth: CGFloat? = nil
+}
+
 /// The format-neutral block vocabulary between a document-format parser (docx/odt/… — later
 /// sprints) and `OfficeTextBuilder`, which turns these into typography. Deliberately knows
 /// nothing about Word, ODF or XML: a parser's only job is to produce this vocabulary, and
@@ -162,8 +228,13 @@ enum OfficeBlock: Equatable {
     /// (docx `w:pPr/w:tabs`, odt `style:tab-stop`) are the paragraph's OWN authored stops, in
     /// POINTS, in addition to whatever tab machinery the block already has for other reasons — a
     /// `listItem`'s marker tab (see below) is never replaced by these, only added to.
-    case heading(level: Int, spans: [Span], rtl: Bool = false, alignment: NSTextAlignment? = nil, tabStops: [CGFloat] = [])
-    case paragraph(spans: [Span], rtl: Bool = false, alignment: NSTextAlignment? = nil, tabStops: [CGFloat] = [])
+    /// `format` (trailing, defaulted — see `ParagraphFormat` above) is this sprint's (P1)
+    /// vocabulary-only addition: every existing caller that never mentions it keeps meaning "no
+    /// paragraph formatting beyond what the builder already applies," identical to before this
+    /// field existed. Populating it from a real document (the reader) and consuming it in layout
+    /// (`OfficeTextBuilder`) are both P2's job — this sprint changes no rendered output.
+    case heading(level: Int, spans: [Span], rtl: Bool = false, alignment: NSTextAlignment? = nil, tabStops: [CGFloat] = [], format: ParagraphFormat = ParagraphFormat())
+    case paragraph(spans: [Span], rtl: Bool = false, alignment: NSTextAlignment? = nil, tabStops: [CGFloat] = [], format: ParagraphFormat = ParagraphFormat())
     /// `level` is a 0-based nesting depth. `ordered` selects "1. 2. 3." numbering — per level,
     /// restarting when a SHALLOWER level intervenes but continuing across a deeper nested run —
     /// vs a bullet. See `OfficeTextBuilder` for the exact restart rule.
@@ -188,8 +259,10 @@ enum OfficeBlock: Equatable {
     /// custom tab stop never displaces the marker's own hanging-indent tab — `OfficeTextBuilder`
     /// APPENDS these after it, so `1.\t<text>` still lands the text at the item's hanging indent
     /// first and any authored stops beyond that still work inside the item's own text.
+    /// `format` means exactly what it means on `.paragraph`/`.heading` above — this sprint's
+    /// vocabulary-only addition, trailing and defaulted so no existing caller changes meaning.
     case listItem(level: Int, ordered: Bool, spans: [Span], marker: String? = nil, rtl: Bool = false,
-                  alignment: NSTextAlignment? = nil, tabStops: [CGFloat] = [])
+                  alignment: NSTextAlignment? = nil, tabStops: [CGFloat] = [], format: ParagraphFormat = ParagraphFormat())
     /// Rows of ANCHOR cells only (`rows[row]` lists the cells that START in that row, left to
     /// right — a row's `count` is therefore the number of anchors in it, NOT the column count once
     /// any span is wider than 1; a parser reading `w:gridSpan`/`table:number-columns-spanned` must
