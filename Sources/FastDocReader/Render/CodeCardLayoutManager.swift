@@ -78,6 +78,41 @@ func drawMDDecorations(_ lm: NSLayoutManager, _ storage: NSTextStorage,
         }
     }
 
+    // Office paragraph shading (docx `w:pPr/w:shd`, odt `fo:background-color`) → a full-width fill
+    // behind the paragraph's own line fragments, drawn the SAME way a code block's card is: recover
+    // the FULL attribute range (not the clipped `charRange` slice) so the fill is one stable rect
+    // across scroll passes, not a per-strip sliver. No rounding/border here — that's a plain fill;
+    // `paraBorderColor`/`paraBorderWidth` below draws the (independent) border box.
+    storage.enumerateAttribute(MDAttr.paraShading, in: charRange) { value, r0, _ in
+        guard let color = value as? NSColor else { return }
+        var range = r0
+        _ = storage.attribute(MDAttr.paraShading, at: r0.location, longestEffectiveRange: &range, in: whole)
+        let gr = lm.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+        let rect = lm.boundingRect(forGlyphRange: gr, in: container).offsetBy(dx: origin.x, dy: origin.y)
+        let fill = NSRect(x: origin.x, y: rect.minY, width: container.size.width, height: rect.height)
+        color.setFill()
+        NSBezierPath(rect: fill).fill()
+    }
+
+    // Office paragraph border (docx `w:pPr/w:pBdr`, odt `fo:border`) → a full-width stroked box
+    // around the paragraph's own line fragments — same full-range recovery as shading above.
+    // `paraBorderColor`/`paraBorderWidth` are always set together (see `MDAttr.paraBorderColor`'s
+    // doc), so reading the width at the SAME location the colour enumeration already found is safe.
+    storage.enumerateAttribute(MDAttr.paraBorderColor, in: charRange) { value, r0, _ in
+        guard let color = value as? NSColor else { return }
+        let width = CGFloat((storage.attribute(MDAttr.paraBorderWidth, at: r0.location, effectiveRange: nil) as? NSNumber)?.doubleValue ?? 1)
+        var range = r0
+        _ = storage.attribute(MDAttr.paraBorderColor, at: r0.location, longestEffectiveRange: &range, in: whole)
+        let gr = lm.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+        let rect = lm.boundingRect(forGlyphRange: gr, in: container).offsetBy(dx: origin.x, dy: origin.y)
+        let box = NSRect(x: origin.x + width / 2, y: rect.minY + width / 2,
+                         width: container.size.width - width, height: rect.height - width)
+        color.setStroke()
+        let path = NSBezierPath(rect: box)
+        path.lineWidth = width
+        path.stroke()
+    }
+
     // Thematic breaks → a full-width hairline centered on the marker line.
     storage.enumerateAttribute(MDAttr.rule, in: charRange) { value, range, _ in
         guard value != nil else { return }

@@ -398,7 +398,12 @@ enum OdtReader: OfficeDocumentReader {
         var outlineLevel: Int? = nil
         var rtl = false
         var alignment: NSTextAlignment? = nil
-        var tabStops: [CGFloat] = []
+        /// P2b — this reader migrates the VOCABULARY only: ODF's `style:tab-stop` also carries
+        /// `style:type`/`style:leader-text` (its own alignment/leader equivalents), but reading
+        /// those is out of this sprint's scope (see the sprint brief). Every stop resolved here is
+        /// therefore `TabStop(position:)`'s default `.left`/`.none`, identical to how a bare
+        /// `CGFloat` position rendered before this type existed.
+        var tabStops: [TabStop] = []
     }
 
     /// The RAW, not-yet-inherited declaration of one `style:style` element, family `"paragraph"`.
@@ -410,7 +415,7 @@ enum OdtReader: OfficeDocumentReader {
         var outlineLevel: Int? = nil
         var rtl: Bool? = nil
         var alignmentRaw: String? = nil
-        var tabStops: [CGFloat] = []
+        var tabStops: [TabStop] = []
         var parent: String? = nil
     }
 
@@ -445,6 +450,7 @@ enum OdtReader: OfficeDocumentReader {
                     decl.tabStops = tabStopsNode.children
                         .filter { $0.name == "style:tab-stop" }
                         .compactMap { $0.attributes["style:position"].flatMap(parseLength) }
+                        .map { TabStop(position: $0) }
                 }
             }
             map[name] = decl

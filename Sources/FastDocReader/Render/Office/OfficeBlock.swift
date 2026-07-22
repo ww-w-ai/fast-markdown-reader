@@ -153,6 +153,52 @@ enum LineHeight: Equatable {
     case atLeast(CGFloat)
 }
 
+/// A tab stop's ALIGNMENT — docx `w:tabs/w:tab/@w:val` (`start`/`left` → `.left`, `center` →
+/// `.center`, `end`/`right` → `.right`, `decimal` → `.decimal`; `bar`/`clear` never reach this
+/// vocabulary at all — see the reader's own `w:tab` parse for why). Text before the stop is
+/// positioned relative to `position` according to this case, exactly the way Word itself lays a
+/// tab column out — `.left` pushes text to start AT `position` (the paragraph's pre-P2b behaviour,
+/// and every markdown/office call site that never authored a real alignment), `.right` ends text
+/// AT `position`, `.center` centers it ON `position`, and `.decimal` aligns the decimal point (or,
+/// for non-numeric text, the whole run) ON `position`.
+enum TabAlignment: Equatable {
+    case left, center, right, decimal
+}
+
+/// A tab stop's LEADER (fill) character — docx `w:tabs/w:tab/@w:leader` (`dot` → `.dot`, `hyphen` →
+/// `.hyphen`, `underscore` → `.underscore`; absent or any other value → `.none`). Carried through
+/// the vocabulary but NOT drawn this sprint — AppKit's `NSTextTab` has no native leader-fill
+/// primitive, and a faithful dotted/dashed fill between the preceding text and the tab stop is a
+/// real (measured-later) rendering cost this sprint doesn't take on. A tab with a leader still
+/// renders as an ordinary aligned tab, just without the fill; `OfficeTextBuilder`'s `NSTextTab`
+/// construction reads `position`/`alignment` only, and comments why `leader` is inert.
+enum TabLeader: Equatable {
+    case none, dot, hyphen, underscore
+}
+
+/// One authored tab stop — docx `w:tabs/w:tab` (`@w:pos` in twips → `position` in points, `@w:val`
+/// → `alignment`, `@w:leader` → `leader`), odt `style:tab-stop` (`style:position` → `position`;
+/// this sprint migrates the VOCABULARY only for ODT — see `OdtReader`'s own doc on why it doesn't
+/// yet read ODF's `style:type`/`style:leader-text` into `alignment`/`leader`, so an ODT-sourced
+/// stop is always `.left`/`.none`, identical to how it rendered before this type existed).
+///
+/// `init(position:)` is the ergonomic, position-only constructor every pre-P2b call site (tests,
+/// `OdtReader`, markdown-adjacent code that never touches this vocabulary) becomes with a single
+/// added token — `alignment`/`leader` default to `.left`/`.none`, which is EXACTLY what a bare
+/// `CGFloat` position meant before this type existed, so a call site that only ever cared about
+/// position renders byte-identical after the one-token change.
+struct TabStop: Equatable {
+    var position: CGFloat
+    var alignment: TabAlignment
+    var leader: TabLeader
+
+    init(position: CGFloat, alignment: TabAlignment = .left, leader: TabLeader = .none) {
+        self.position = position
+        self.alignment = alignment
+        self.leader = leader
+    }
+}
+
 /// A paragraph's block-level formatting — spacing, indentation, shading and border — read from the
 /// source but not yet applied anywhere. Every field defaults to `nil`/`false`, meaning "the source
 /// didn't say → `OfficeTextBuilder` keeps using its own token/theme default, exactly as before this
@@ -233,8 +279,8 @@ enum OfficeBlock: Equatable {
     /// paragraph formatting beyond what the builder already applies," identical to before this
     /// field existed. Populating it from a real document (the reader) and consuming it in layout
     /// (`OfficeTextBuilder`) are both P2's job — this sprint changes no rendered output.
-    case heading(level: Int, spans: [Span], rtl: Bool = false, alignment: NSTextAlignment? = nil, tabStops: [CGFloat] = [], format: ParagraphFormat = ParagraphFormat())
-    case paragraph(spans: [Span], rtl: Bool = false, alignment: NSTextAlignment? = nil, tabStops: [CGFloat] = [], format: ParagraphFormat = ParagraphFormat())
+    case heading(level: Int, spans: [Span], rtl: Bool = false, alignment: NSTextAlignment? = nil, tabStops: [TabStop] = [], format: ParagraphFormat = ParagraphFormat())
+    case paragraph(spans: [Span], rtl: Bool = false, alignment: NSTextAlignment? = nil, tabStops: [TabStop] = [], format: ParagraphFormat = ParagraphFormat())
     /// `level` is a 0-based nesting depth. `ordered` selects "1. 2. 3." numbering — per level,
     /// restarting when a SHALLOWER level intervenes but continuing across a deeper nested run —
     /// vs a bullet. See `OfficeTextBuilder` for the exact restart rule.
@@ -262,7 +308,7 @@ enum OfficeBlock: Equatable {
     /// `format` means exactly what it means on `.paragraph`/`.heading` above — this sprint's
     /// vocabulary-only addition, trailing and defaulted so no existing caller changes meaning.
     case listItem(level: Int, ordered: Bool, spans: [Span], marker: String? = nil, rtl: Bool = false,
-                  alignment: NSTextAlignment? = nil, tabStops: [CGFloat] = [], format: ParagraphFormat = ParagraphFormat())
+                  alignment: NSTextAlignment? = nil, tabStops: [TabStop] = [], format: ParagraphFormat = ParagraphFormat())
     /// Rows of ANCHOR cells only (`rows[row]` lists the cells that START in that row, left to
     /// right — a row's `count` is therefore the number of anchors in it, NOT the column count once
     /// any span is wider than 1; a parser reading `w:gridSpan`/`table:number-columns-spanned` must

@@ -1167,7 +1167,7 @@ final class OdtReaderTests: XCTestCase {
             </style:style>
             """)
         guard case .paragraph(_, _, _, let tabStops, _) = blocks[0] else { return XCTFail("expected a paragraph") }
-        XCTAssertEqual(tabStops, [36, 72])
+        XCTAssertEqual(tabStops, [TabStop(position: 36), TabStop(position: 72)])
     }
 
     func testParagraphStyleInheritsOutlineLevelFromParentStyleName() throws {

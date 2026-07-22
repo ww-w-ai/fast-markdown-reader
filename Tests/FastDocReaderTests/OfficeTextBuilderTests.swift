@@ -1075,7 +1075,7 @@ final class OfficeTextBuilderTests: XCTestCase {
     // MARK: S13 — tab stops
 
     func testParagraphTabStopsAreAddedToTheParagraphStyle() {
-        let out = build([.paragraph(spans: [span("a\tb")], tabStops: [100, 200])])
+        let out = build([.paragraph(spans: [span("a\tb")], tabStops: [TabStop(position: 100), TabStop(position: 200)])])
         let style = out.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle
         let locations = style?.tabStops.map(\.location) ?? []
         XCTAssertTrue(locations.contains(100))
@@ -1096,7 +1096,7 @@ final class OfficeTextBuilderTests: XCTestCase {
     /// authored tab stop being present.
     func testListItemTabStopsCoexistWithTheMarkersOwnHangingIndentTab() {
         let plain = build([.listItem(level: 1, ordered: true, spans: [span("Item")])])
-        let withTab = build([.listItem(level: 1, ordered: true, spans: [span("Item")], tabStops: [300])])
+        let withTab = build([.listItem(level: 1, ordered: true, spans: [span("Item")], tabStops: [TabStop(position: 300)])])
         let plainStyle = plain.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle
         let tabStyle = withTab.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle
 
@@ -1106,6 +1106,70 @@ final class OfficeTextBuilderTests: XCTestCase {
         let tabLocations = tabStyle?.tabStops.map(\.location) ?? []
         XCTAssertEqual(tabLocations.first, plainLocations.first, "the marker's own tab must still be first")
         XCTAssertTrue(tabLocations.contains(300), "the authored tab stop must still be present alongside it")
+    }
+
+    /// P2b — `TabStop.alignment` must reach the actual `NSTextTab.alignment` AppKit lays out with,
+    /// not just round-trip through `TabStop` itself. `.decimal` has no `NSTextAlignment` case (see
+    /// `officeTextTab`'s own doc) — it maps to `.right` PLUS a `.` column terminator, so this
+    /// asserts `.right` for it and separately proves the terminator option is present.
+    func testTabStopAlignmentReachesTheBuiltNSTextTabsAlignment() {
+        let out = build([.paragraph(spans: [span("a\tb\tc\td")],
+                                     tabStops: [TabStop(position: 50, alignment: .left),
+                                                TabStop(position: 100, alignment: .center),
+                                                TabStop(position: 150, alignment: .right),
+                                                TabStop(position: 200, alignment: .decimal)])])
+        let style = try! XCTUnwrap(out.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle)
+        let byLocation = Dictionary(uniqueKeysWithValues: style.tabStops.map { ($0.location, $0) })
+        XCTAssertEqual(byLocation[50]?.alignment, .left)
+        XCTAssertEqual(byLocation[100]?.alignment, .center)
+        XCTAssertEqual(byLocation[150]?.alignment, .right)
+        XCTAssertEqual(byLocation[200]?.alignment, .right, "decimal has no NSTextAlignment case — it maps to .right")
+        XCTAssertNotNil(byLocation[200]?.options[.columnTerminators], "decimal must still carry the '.' column terminator")
+    }
+
+    /// A tab with a `leader` still renders as an ordinary aligned tab — `TabLeader` is carried
+    /// through `TabStop` but `officeTextTab` never turns it into a drawing instruction (see
+    /// `TabLeader`'s own doc); this pins that the alignment/position side is unaffected by it.
+    func testTabLeaderDoesNotAffectTheBuiltNSTextTabsAlignmentOrPosition() {
+        let out = build([.paragraph(spans: [span("a\tb")],
+                                     tabStops: [TabStop(position: 80, alignment: .right, leader: .dot)])])
+        let style = try! XCTUnwrap(out.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle)
+        XCTAssertEqual(style.tabStops.first?.location, 80)
+        XCTAssertEqual(style.tabStops.first?.alignment, .right)
+    }
+
+    // MARK: P2b — paragraph shading / border MDAttrs
+
+    /// A resolved `ParagraphFormat.shading` must reach `MDAttr.paraShading` over the block's full
+    /// rendered range (content + separator) — the attribute `drawMDDecorations` actually paints.
+    func testParagraphShadingFormatReachesMDAttrOverTheFullBlockRange() {
+        var format = ParagraphFormat()
+        format.shading = .systemYellow
+        let out = build([.paragraph(spans: [span("Shaded")], format: format)])
+        var range = NSRange()
+        _ = out.attribute(MDAttr.paraShading, at: 0, longestEffectiveRange: &range, in: NSRange(location: 0, length: out.length))
+        XCTAssertEqual(range, NSRange(location: 0, length: out.length), "must span content + trailing separator")
+        XCTAssertEqual(out.attribute(MDAttr.paraShading, at: 0, effectiveRange: nil) as? NSColor, .systemYellow)
+    }
+
+    /// A resolved border colour+width must reach BOTH `MDAttr.paraBorderColor` and
+    /// `MDAttr.paraBorderWidth` — the two `drawMDDecorations` reads together to stroke the box.
+    func testParagraphBorderFormatReachesBothMDAttrs() {
+        var format = ParagraphFormat()
+        format.borderColor = .systemRed
+        format.borderWidth = 2
+        let out = build([.paragraph(spans: [span("Boxed")], format: format)])
+        XCTAssertEqual(out.attribute(MDAttr.paraBorderColor, at: 0, effectiveRange: nil) as? NSColor, .systemRed)
+        XCTAssertEqual((out.attribute(MDAttr.paraBorderWidth, at: 0, effectiveRange: nil) as? NSNumber)?.doubleValue, 2)
+    }
+
+    /// A block with no shading/border at all (every pre-P2b call site) must carry NEITHER MDAttr —
+    /// the "unspecified stays unspecified" invariant this sprint's whole cascade depends on.
+    func testUnshadedUnborderedParagraphCarriesNeitherMDAttr() {
+        let out = build([.paragraph(spans: [span("Plain")])])
+        XCTAssertNil(out.attribute(MDAttr.paraShading, at: 0, effectiveRange: nil))
+        XCTAssertNil(out.attribute(MDAttr.paraBorderColor, at: 0, effectiveRange: nil))
+        XCTAssertNil(out.attribute(MDAttr.paraBorderWidth, at: 0, effectiveRange: nil))
     }
 
     // MARK: S13 — table cell shading / borders / width

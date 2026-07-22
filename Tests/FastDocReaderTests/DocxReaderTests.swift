@@ -2233,14 +2233,39 @@ final class DocxReaderTests: XCTestCase {
         let blocks = try read(document: """
         <w:p><w:pPr><w:tabs><w:tab w:val="left" w:pos="720"/><w:tab w:val="right" w:pos="1440"/></w:tabs></w:pPr><w:r><w:t>Tabbed</w:t></w:r></w:p>
         """)
-        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Tabbed")], tabStops: [36, 72])])
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Tabbed")],
+                                            tabStops: [TabStop(position: 36, alignment: .left),
+                                                       TabStop(position: 72, alignment: .right)])])
     }
 
     func testTabStopsClearEntryIsSkippedNotEmittedAsAPhantomStop() throws {
         let blocks = try read(document: """
         <w:p><w:pPr><w:tabs><w:tab w:val="clear" w:pos="720"/><w:tab w:val="left" w:pos="1440"/></w:tabs></w:pPr><w:r><w:t>Tabbed</w:t></w:r></w:p>
         """)
-        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Tabbed")], tabStops: [72])])
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Tabbed")], tabStops: [TabStop(position: 72)])])
+    }
+
+    /// P2b — `@w:val` (`ST_TabJc`) resolves into `TabStop.alignment`: `center`/`decimal` each get
+    /// their own case, and `@w:leader` is carried (not drawn — see `TabLeader`'s doc) alongside it.
+    func testTabAlignmentAndLeaderResolveFromWVal() throws {
+        let blocks = try read(document: """
+        <w:p><w:pPr><w:tabs>
+          <w:tab w:val="center" w:pos="720"/>
+          <w:tab w:val="decimal" w:pos="1440" w:leader="dot"/>
+        </w:tabs></w:pPr><w:r><w:t>Numbers</w:t></w:r></w:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Numbers")],
+                                            tabStops: [TabStop(position: 36, alignment: .center),
+                                                       TabStop(position: 72, alignment: .decimal, leader: .dot)])])
+    }
+
+    /// `w:val="bar"` (a vertical rule, not a text stop) has no place in this vocabulary, exactly
+    /// like `"clear"` — it must be skipped, never emitted as a phantom `.left` stop.
+    func testTabBarValueIsSkipped() throws {
+        let blocks = try read(document: """
+        <w:p><w:pPr><w:tabs><w:tab w:val="bar" w:pos="720"/><w:tab w:val="left" w:pos="1440"/></w:tabs></w:pPr><w:r><w:t>Tabbed</w:t></w:r></w:p>
+        """)
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Tabbed")], tabStops: [TabStop(position: 72)])])
     }
 
     // MARK: Style inheritance — direct > style > basedOn ancestor, per-property
@@ -2294,7 +2319,7 @@ final class DocxReaderTests: XCTestCase {
         """
         let blocks = try read(
             document: "<w:p><w:pPr><w:pStyle w:val=\"Indented\"/></w:pPr><w:r><w:t>Text</w:t></w:r></w:p>", styles: styles)
-        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Text")], tabStops: [18])])
+        XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Text")], tabStops: [TabStop(position: 18)])])
     }
 
     // MARK: Table cells — w:shd, w:tcBorders, w:tcW
@@ -2515,5 +2540,86 @@ final class DocxReaderTests: XCTestCase {
         let blocks = try read(document: "<w:p><w:r><w:t>Untouched</w:t></w:r></w:p>")
         guard case .paragraph(_, _, _, _, let format) = blocks.first else { return XCTFail("expected a paragraph") }
         XCTAssertEqual(format, ParagraphFormat())
+    }
+
+    // MARK: P2b — paragraph shading (w:pPr/w:shd) and border (w:pPr/w:pBdr)
+
+    /// `w:pPr/w:shd/@w:fill` reads exactly like `Cell`'s own shading — a direct fixture, no style
+    /// involved, is the cascade's simplest layer (paragraph's own `w:pPr` wins outright).
+    func testParagraphShadingFillIsReadIntoParagraphFormat() throws {
+        let blocks = try read(document: """
+        <w:p><w:pPr><w:shd w:fill="FFCC00"/></w:pPr><w:r><w:t>Shaded</w:t></w:r></w:p>
+        """)
+        guard case .paragraph(_, _, _, _, let format) = blocks.first else { return XCTFail("expected a paragraph") }
+        XCTAssertEqual(format.shading, rgb("FFCC00"))
+    }
+
+    /// `@w:fill="auto"` is Word's own "no fill" sentinel — reads as unshaded, same as the cell's.
+    func testParagraphShadingAutoFillIsUnshaded() throws {
+        let blocks = try read(document: """
+        <w:p><w:pPr><w:shd w:fill="auto"/></w:pPr><w:r><w:t>Plain</w:t></w:r></w:p>
+        """)
+        guard case .paragraph(_, _, _, _, let format) = blocks.first else { return XCTFail("expected a paragraph") }
+        XCTAssertNil(format.shading)
+    }
+
+    /// `w:pPr/w:pBdr`'s first drawn edge (top/left/bottom/right) supplies the paragraph's ONE
+    /// colour/width — `@w:sz` is EIGHTHS of a point (`16` → `2`pt), not the half-point unit run/
+    /// paragraph-mark sizes use.
+    func testParagraphBorderColorAndWidthAreReadFromTheTopEdge() throws {
+        let blocks = try read(document: """
+        <w:p><w:pPr><w:pBdr><w:top w:val="single" w:sz="16" w:color="336699"/></w:pBdr></w:pPr><w:r><w:t>Boxed</w:t></w:r></w:p>
+        """)
+        guard case .paragraph(_, _, _, _, let format) = blocks.first else { return XCTFail("expected a paragraph") }
+        XCTAssertEqual(format.borderColor, rgb("336699"))
+        XCTAssertEqual(format.borderWidth, 2)
+    }
+
+    /// `w:top`'s `w:val="none"` must be skipped in favour of the next drawn edge — the same rule
+    /// `cellBorder` already applies, exercised here for the paragraph reader's own copy of it.
+    func testParagraphBorderNoneEdgeIsSkippedInFavorOfTheNextDrawnEdge() throws {
+        let blocks = try read(document: """
+        <w:p><w:pPr><w:pBdr><w:top w:val="none"/><w:left w:val="single" w:sz="8" w:color="112233"/></w:pBdr></w:pPr><w:r><w:t>Boxed</w:t></w:r></w:p>
+        """)
+        guard case .paragraph(_, _, _, _, let format) = blocks.first else { return XCTFail("expected a paragraph") }
+        XCTAssertEqual(format.borderColor, rgb("112233"))
+        XCTAssertEqual(format.borderWidth, 1)
+    }
+
+    /// Shading/border join the SAME `basedOn` cascade the spacing/indent fields already use — a
+    /// leaf style with no `w:shd`/`w:pBdr` of its own must still resolve them from its ancestor,
+    /// not just from a paragraph's own direct `w:pPr`.
+    func testShadingAndBorderResolveThroughTheBasedOnStyleChain() throws {
+        let styles = """
+        <w:styles>
+          <w:style w:type="paragraph" w:styleId="Callout">
+            <w:pPr>
+              <w:shd w:fill="FFEE99"/>
+              <w:pBdr><w:top w:val="single" w:sz="8" w:color="998800"/></w:pBdr>
+            </w:pPr>
+          </w:style>
+        </w:styles>
+        """
+        let blocks = try read(
+            document: "<w:p><w:pPr><w:pStyle w:val=\"Callout\"/></w:pPr><w:r><w:t>Note</w:t></w:r></w:p>", styles: styles)
+        guard case .paragraph(_, _, _, _, let format) = blocks.first else { return XCTFail("expected a paragraph") }
+        XCTAssertEqual(format.shading, rgb("FFEE99"))
+        XCTAssertEqual(format.borderColor, rgb("998800"))
+        XCTAssertEqual(format.borderWidth, 1)
+    }
+
+    /// The paragraph's OWN direct `w:pPr/w:shd` must win over its style's — direct-wins-highest,
+    /// same priority order the spacing/indent cascade already proves.
+    func testParagraphsOwnDirectShadingWinsOverItsStylesShading() throws {
+        let styles = """
+        <w:styles>
+          <w:style w:type="paragraph" w:styleId="Callout"><w:pPr><w:shd w:fill="FFEE99"/></w:pPr></w:style>
+        </w:styles>
+        """
+        let blocks = try read(document: """
+        <w:p><w:pPr><w:pStyle w:val="Callout"/><w:shd w:fill="112233"/></w:pPr><w:r><w:t>Note</w:t></w:r></w:p>
+        """, styles: styles)
+        guard case .paragraph(_, _, _, _, let format) = blocks.first else { return XCTFail("expected a paragraph") }
+        XCTAssertEqual(format.shading, rgb("112233"))
     }
 }

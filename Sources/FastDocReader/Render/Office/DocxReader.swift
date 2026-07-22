@@ -243,7 +243,7 @@ enum DocxReader: OfficeDocumentReader {
     /// defaulting to `false` could never distinguish from an explicit `w:val="0"`.
     private struct ParaStyleProps {
         var alignment: NSTextAlignment?
-        var tabStops: [CGFloat]?
+        var tabStops: [TabStop]?
         var spacingBefore: CGFloat?
         var spacingAfter: CGFloat?
         var lineHeight: LineHeight?
@@ -252,6 +252,15 @@ enum DocxReader: OfficeDocumentReader {
         var firstLineIndent: CGFloat?
         var hangingIndent: CGFloat?
         var contextualSpacing: Bool?
+        /// P2b — `w:pPr/w:shd/@w:fill`, read exactly like `Cell`'s own shading (`cellShading`):
+        /// `nil` means this level didn't set it (keep climbing); `"auto"`/absent is unshaded, same
+        /// sentinel as the cell's.
+        var shading: NSColor?
+        /// P2b — `w:pPr/w:pBdr`, read exactly like `Cell`'s own border (`cellBorder`): the first
+        /// drawn edge's colour/width, checked top/left/bottom/right. Carried as ONE optional pair
+        /// (not two independent optionals) because a resolved border is only meaningful with both —
+        /// see `ParagraphFormat.borderColor`/`.borderWidth`'s own "mirrors Cell" doc.
+        var border: (color: NSColor?, width: CGFloat?)?
     }
 
     private struct StyleInfo {
@@ -319,7 +328,7 @@ enum DocxReader: OfficeDocumentReader {
             if paraProps.alignment != nil || paraProps.tabStops != nil || paraProps.spacingBefore != nil
                 || paraProps.spacingAfter != nil || paraProps.lineHeight != nil || paraProps.indentStart != nil
                 || paraProps.indentEnd != nil || paraProps.firstLineIndent != nil || paraProps.hangingIndent != nil
-                || paraProps.contextualSpacing != nil {
+                || paraProps.contextualSpacing != nil || paraProps.shading != nil || paraProps.border != nil {
                 info.paraProps[id] = paraProps
             }
         }
@@ -405,7 +414,30 @@ enum DocxReader: OfficeDocumentReader {
             }
         }
         props.contextualSpacing = onOffValue(pPr, "w:contextualSpacing")
+        if let shd = pPr?.child("w:shd"), let fill = shd.attributes["w:fill"], fill.lowercased() != "auto" {
+            props.shading = colorFromHex(fill)
+        }
+        if let pBdr = pPr?.child("w:pBdr") {
+            let border = paragraphBorder(pBdr)
+            if border.color != nil || border.width != nil { props.border = border }
+        }
         return props
+    }
+
+    /// `w:pPr/w:pBdr`'s edges, reduced to ONE colour/width (see `ParaStyleProps.border`'s doc) —
+    /// structurally identical to `cellBorder`'s own `w:tcBorders` walk (each edge is `w:top`/
+    /// `w:left`/`w:bottom`/`w:right`, `@w:val` present-and-not-`nil`/`none` means drawn, `@w:sz` is
+    /// EIGHTHS of a point), duplicated rather than shared because the two live under different
+    /// parent element names (`w:pBdr` also has `w:between`/`w:bar`, which a paragraph border never
+    /// reduces to — this reader only reads the box edges a `Cell`'s single colour/width can express).
+    private static func paragraphBorder(_ pBdr: XMLNode) -> (color: NSColor?, width: CGFloat?) {
+        for edge in ["w:top", "w:left", "w:bottom", "w:right"] {
+            guard let e = pBdr.child(edge), let val = e.attributes["w:val"], val != "nil", val != "none" else { continue }
+            let color = e.attributes["w:color"].flatMap { $0.lowercased() == "auto" ? nil : colorFromHex($0) }
+            let width = e.attributes["w:sz"].flatMap(Double.init).map { CGFloat($0 / 8) }
+            return (color, width)
+        }
+        return (nil, nil)
     }
 
     /// A `Bool?` sibling of `isOn` (below): `nil` when the tag is entirely absent — "this level has
@@ -444,11 +476,35 @@ enum DocxReader: OfficeDocumentReader {
     /// list is taken or left whole, never spliced — see `ParaStyleProps`'s doc), so a `clear` entry
     /// is simply skipped rather than emitted as a phantom stop at that position. A `w:tab` missing
     /// `w:pos` entirely (malformed) is skipped the same way — there is no position to place it at.
-    private static func parseTabStops(_ tabsNode: XMLNode) -> [CGFloat] {
-        tabsNode.children.compactMap { tab -> CGFloat? in
-            guard tab.name == "w:tab", tab.attributes["w:val"] != "clear" else { return nil }
+    ///
+    /// P2b — `@w:val` (spec §17.3.1.37, `ST_TabJc`) is read into `TabStop.alignment`: `"start"`/
+    /// `"left"` (and every value not otherwise named here) → `.left`, `"center"` → `.center`,
+    /// `"end"`/`"right"` → `.right`, `"decimal"` → `.decimal`. `"bar"` (a vertical rule, not a text
+    /// stop at all) is skipped exactly like `"clear"` — neither has a place in this vocabulary.
+    /// `@w:leader` is read into `TabStop.leader` (`"dot"`/`"hyphen"`/`"underscore"` → their cases,
+    /// everything else, including absent, → `.none`) and carried through UNDRAWN this sprint — see
+    /// `TabLeader`'s own doc.
+    private static func parseTabStops(_ tabsNode: XMLNode) -> [TabStop] {
+        tabsNode.children.compactMap { tab -> TabStop? in
+            guard tab.name == "w:tab" else { return nil }
+            let val = tab.attributes["w:val"]
+            guard val != "clear", val != "bar" else { return nil }
             guard let posStr = tab.attributes["w:pos"], let pos = Double(posStr) else { return nil }
-            return CGFloat(pos / 20)
+            let alignment: TabAlignment
+            switch val {
+            case "center": alignment = .center
+            case "end", "right": alignment = .right
+            case "decimal": alignment = .decimal
+            default: alignment = .left // "start"/"left"/anything else this reader doesn't special-case
+            }
+            let leader: TabLeader
+            switch tab.attributes["w:leader"] {
+            case "dot": leader = .dot
+            case "hyphen": leader = .hyphen
+            case "underscore": leader = .underscore
+            default: leader = .none
+            }
+            return TabStop(position: CGFloat(pos / 20), alignment: alignment, leader: leader)
         }
     }
 
@@ -490,8 +546,16 @@ enum DocxReader: OfficeDocumentReader {
         walkStyleChain(pStyleId, styleInfo: styleInfo) { styleInfo.paraProps[$0]?.alignment }
     }
 
-    private static func resolvedTabStops(pStyleId: String?, styleInfo: StyleInfo) -> [CGFloat]? {
+    private static func resolvedTabStops(pStyleId: String?, styleInfo: StyleInfo) -> [TabStop]? {
         walkStyleChain(pStyleId, styleInfo: styleInfo) { styleInfo.paraProps[$0]?.tabStops }
+    }
+
+    private static func resolvedShading(pStyleId: String?, styleInfo: StyleInfo) -> NSColor? {
+        walkStyleChain(pStyleId, styleInfo: styleInfo) { styleInfo.paraProps[$0]?.shading }
+    }
+
+    private static func resolvedBorder(pStyleId: String?, styleInfo: StyleInfo) -> (color: NSColor?, width: CGFloat?)? {
+        walkStyleChain(pStyleId, styleInfo: styleInfo) { styleInfo.paraProps[$0]?.border }
     }
 
     private static func resolvedSpacingBefore(pStyleId: String?, styleInfo: StyleInfo) -> CGFloat? {
@@ -545,6 +609,11 @@ enum DocxReader: OfficeDocumentReader {
         format.firstLineIndent = direct.firstLineIndent ?? resolvedFirstLineIndent(pStyleId: pStyleId, styleInfo: styleInfo) ?? defaults.firstLineIndent
         format.hangingIndent = direct.hangingIndent ?? resolvedHangingIndent(pStyleId: pStyleId, styleInfo: styleInfo) ?? defaults.hangingIndent
         format.contextualSpacing = direct.contextualSpacing ?? resolvedContextualSpacing(pStyleId: pStyleId, styleInfo: styleInfo) ?? defaults.contextualSpacing ?? false
+        // P2b — shading/border join the SAME cascade, one property at a time, same priority order.
+        format.shading = direct.shading ?? resolvedShading(pStyleId: pStyleId, styleInfo: styleInfo) ?? defaults.shading
+        let border = direct.border ?? resolvedBorder(pStyleId: pStyleId, styleInfo: styleInfo) ?? defaults.border
+        format.borderColor = border?.color
+        format.borderWidth = border?.width
         return format
     }
 
@@ -1439,7 +1508,7 @@ enum DocxReader: OfficeDocumentReader {
         // the whole of this reader's part of that contract.
         let alignment = pPr?.child("w:jc")?.attributes["w:val"].flatMap(alignmentFromJc)
             ?? resolvedAlignment(pStyleId: pStyleIdForAlignment, styleInfo: styleInfo)
-        let tabStops: [CGFloat] = {
+        let tabStops: [TabStop] = {
             if let tabsNode = pPr?.child("w:tabs") {
                 let stops = parseTabStops(tabsNode)
                 if !stops.isEmpty { return stops }

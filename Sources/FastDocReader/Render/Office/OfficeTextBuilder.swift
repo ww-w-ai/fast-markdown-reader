@@ -103,6 +103,27 @@ enum OfficeTextBuilder {
             case let .formula(latex):
                 appendFormula(latex: latex, into: result)
             }
+            // P2b — a heading/paragraph/list-item's own resolved shading/border (`format` is `nil`
+            // for every other case, so this is a no-op there): tagged over the block's FULL rendered
+            // range (content + its one trailing separator, same range `tagBlock` below tags), read
+            // by `drawMDDecorations` at draw time — see `MDAttr.paraShading`'s own doc for why this
+            // is build-time-only (nothing here recomputes geometry; the layout manager just paints a
+            // rect over glyphs already laid out).
+            if let format {
+                let range = NSRange(location: start, length: result.length - start)
+                if let shading = format.shading { result.addAttribute(MDAttr.paraShading, value: shading, range: range) }
+                // Presence is "either field resolved" — a source can legally set only `w:pBdr`'s
+                // `@w:sz` (width) with `@w:color="auto"` (theme decides), or vice versa; the SAME
+                // per-field fallback `TableBlockBuilder` already applies to `Cell.borderColor`/
+                // `.borderWidth` (`Palette.tableBorder` / `1`pt) is mirrored here so a partially
+                // resolved border still draws something rather than silently vanishing.
+                if format.borderColor != nil || format.borderWidth != nil {
+                    let color = format.borderColor ?? Palette.tableBorder
+                    let width = format.borderWidth ?? 1
+                    result.addAttribute(MDAttr.paraBorderColor, value: color, range: range)
+                    result.addAttribute(MDAttr.paraBorderWidth, value: NSNumber(value: Double(width)), range: range)
+                }
+            }
             tagBlock(from: start)
         }
         return result
@@ -299,10 +320,11 @@ enum OfficeTextBuilder {
     /// on the two) — `nil` (every pre-sprint call site) leaves `.natural` exactly as `rtl` alone
     /// left it before this parameter existed. `tabStops` (points) are appended to whatever default
     /// tab stops `NSMutableParagraphStyle()` already carries; empty (every pre-sprint call site)
-    /// changes nothing.
+    /// changes nothing. Each authored stop's OWN alignment (P2b) is carried into the built
+    /// `NSTextTab` — see `officeTextTab`'s doc for exactly how.
     private static func bodyParagraphStyle(theme: RenderTheme, rtl: Bool = false,
                                             alignment: NSTextAlignment? = nil,
-                                            tabStops: [CGFloat] = [],
+                                            tabStops: [TabStop] = [],
                                             format: ParagraphFormat? = nil,
                                             fontSizeScale: CGFloat = 1) -> NSParagraphStyle {
         let p = NSMutableParagraphStyle()
@@ -312,14 +334,14 @@ enum OfficeTextBuilder {
         p.paragraphSpacing = theme.baseFontSize * theme.paragraphSpacingRatio
         if rtl { p.baseWritingDirection = .rightToLeft }
         if let alignment { p.alignment = alignment }
-        if !tabStops.isEmpty { p.tabStops = tabStops.map { NSTextTab(textAlignment: .left, location: $0) } }
+        if !tabStops.isEmpty { p.tabStops = tabStops.map(officeTextTab) }
         applyParagraphFormat(format, fontSizeScale: fontSizeScale, to: p)
         return p.copy() as! NSParagraphStyle
     }
 
     private static func headingParagraphStyle(level: Int, theme: RenderTheme, rtl: Bool = false,
                                                alignment: NSTextAlignment? = nil,
-                                               tabStops: [CGFloat] = [],
+                                               tabStops: [TabStop] = [],
                                                format: ParagraphFormat? = nil,
                                                fontSizeScale: CGFloat = 1) -> NSParagraphStyle {
         let b = theme.baseFontSize
@@ -332,9 +354,32 @@ enum OfficeTextBuilder {
         p.paragraphSpacingBefore = style.headingSpacingBefore(level: level)
         if rtl { p.baseWritingDirection = .rightToLeft }
         if let alignment { p.alignment = alignment }
-        if !tabStops.isEmpty { p.tabStops = tabStops.map { NSTextTab(textAlignment: .left, location: $0) } }
+        if !tabStops.isEmpty { p.tabStops = tabStops.map(officeTextTab) }
         applyParagraphFormat(format, fontSizeScale: fontSizeScale, to: p)
         return p.copy() as! NSParagraphStyle
+    }
+
+    /// Builds ONE `NSTextTab` from an authored `TabStop` — `.left`/`.center`/`.right` map straight
+    /// onto `NSTextAlignment`'s own cases (Apple's modern, non-deprecated `NSTextTab` initializer
+    /// is ALREADY alignment-based, so this is a direct translation, not an emulation). `.decimal`
+    /// has no `NSTextAlignment` case at all (the deprecated `NSTextTab(type:location:)`/
+    /// `.decimalTabStopType` initializer is the only API that names one, and this codebase avoids
+    /// deprecated AppKit surface) — the documented, still-current replacement (the header comment
+    /// on `NSTextTab`'s alignment initializer) is `.right` alignment plus a column terminator
+    /// character set: text runs up TO the tab stop right-aligned, then a further terminator
+    /// (the decimal point) ends that column, which is what actually makes a `12.5` and a `100.25`
+    /// line their decimal points up under this stop — the same visible effect `.decimal` names.
+    /// `leader` is READ but never turned into a drawing instruction here — see `TabLeader`'s own
+    /// doc for why (no native AppKit primitive, and a faithful fill is a deferred rendering cost).
+    private static func officeTextTab(_ stop: TabStop) -> NSTextTab {
+        switch stop.alignment {
+        case .left: return NSTextTab(textAlignment: .left, location: stop.position, options: [:])
+        case .center: return NSTextTab(textAlignment: .center, location: stop.position, options: [:])
+        case .right: return NSTextTab(textAlignment: .right, location: stop.position, options: [:])
+        case .decimal:
+            return NSTextTab(textAlignment: .right, location: stop.position,
+                             options: [.columnTerminators: CharacterSet(charactersIn: ".")])
+        }
     }
 
     /// Applies the P2 cascade's resolved `ParagraphFormat` on top of whatever theme-token defaults
@@ -409,7 +454,7 @@ enum OfficeTextBuilder {
     /// custom tab stop must coexist with, not break, list indentation).
     private static func listParagraphStyle(markerX: CGFloat, textX: CGFloat, theme: RenderTheme,
                                             rtl: Bool = false, alignment: NSTextAlignment? = nil,
-                                            extraTabStops: [CGFloat] = [],
+                                            extraTabStops: [TabStop] = [],
                                             format: ParagraphFormat? = nil,
                                             fontSizeScale: CGFloat = 1) -> NSParagraphStyle {
         let p = NSMutableParagraphStyle()
@@ -419,8 +464,7 @@ enum OfficeTextBuilder {
         p.paragraphSpacing = theme.baseFontSize * theme.tightSpacingRatio
         p.firstLineHeadIndent = markerX
         p.headIndent = textX
-        p.tabStops = [NSTextTab(textAlignment: .left, location: textX)]
-            + extraTabStops.map { NSTextTab(textAlignment: .left, location: $0) }
+        p.tabStops = [NSTextTab(textAlignment: .left, location: textX)] + extraTabStops.map(officeTextTab)
         p.defaultTabInterval = textX
         // The marker/hang-indent geometry (`markerX`/`textX`) is left exactly as it is for an LTR
         // item — mirroring it for RTL (marker on the right, indent growing leftward) is real work
@@ -454,7 +498,7 @@ enum OfficeTextBuilder {
     /// second, competing numbering scheme — the two never mix for a single item.
     private static func appendListItem(level: Int, ordered: Bool, spans: [Span], marker suppliedMarker: String?,
                                        rtl: Bool = false, alignment: NSTextAlignment? = nil,
-                                       tabStops: [CGFloat] = [], into result: NSMutableAttributedString,
+                                       tabStops: [TabStop] = [], into result: NSMutableAttributedString,
                                        theme: RenderTheme, orderedCounters: inout [Int: Int],
                                        fontSizeScale: CGFloat = 1, format: ParagraphFormat? = nil) {
         let marker: String

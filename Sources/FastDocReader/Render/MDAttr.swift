@@ -64,4 +64,18 @@ enum MDAttr {
     /// matches an anchor link's raw fragment against these names EXACTLY (bookmark names are
     /// opaque ids like `_Toc123`, never slugified).
     static let bookmarkTarget = NSAttributedString.Key("mdBookmarkTarget")
+    /// Value = `NSColor`, an office paragraph's own background fill (docx `w:pPr/w:shd/@w:fill`,
+    /// odt `fo:background-color`) — drawn as a full-width rect behind the paragraph's line
+    /// fragments by `drawMDDecorations`, the same build-time/draw-time split every other block
+    /// decoration here uses (see `CodeCardLayoutManager`'s file doc). Never set by markdown or
+    /// plain-text documents — see `ParagraphFormat.shading`'s own doc.
+    static let paraShading = NSAttributedString.Key("mdParaShading")
+    /// Value = `NSColor`, an office paragraph's own border colour (docx `w:pPr/w:pBdr`, odt
+    /// `fo:border`) — paired with `paraBorderWidth` (never one without the other; both are set or
+    /// neither, mirroring `ParagraphFormat.borderColor`/`.borderWidth`'s own "both resolved
+    /// together" contract). Drawn as a stroked rect the same way `paraShading` is filled.
+    static let paraBorderColor = NSAttributedString.Key("mdParaBorderColor")
+    /// Value = `NSNumber` (CGFloat), the paragraph border's stroke width in points — see
+    /// `paraBorderColor`.
+    static let paraBorderWidth = NSAttributedString.Key("mdParaBorderWidth")
 }
