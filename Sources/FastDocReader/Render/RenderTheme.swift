@@ -66,3 +66,67 @@ struct RenderTheme {
     var inlineCodeColor: NSColor { Palette.inlineCodeText }
     var inlineCodeBackground: NSColor { Palette.inlineCodeBg }
 }
+
+// MARK: - Rhythm tokens (shared BASE, every format)
+//
+// The same handful of ratios (line height, paragraph spacing, indent step, …) used to be
+// hand-typed as `b * 1.45` / `b * 0.9` / … independently in `MarkdownRenderer`,
+// `OfficeTextBuilder`, `TableBlockBuilder` and `PlainTextRenderer` — one literal per site, no
+// single source of truth. These are that source: a bare ratio, multiplied by whatever base size
+// (`baseFontSize`, a heading size, the code font's point size) the ORIGINAL call site used —
+// this hoist changes naming only, never the arithmetic or where `.rounded()` is applied, so
+// rendered output stays byte-identical (see the P0 parity harness in `RenderThemeParityTests`).
+// A ratio that only one format needs stays out of here and lives on that format's own thin
+// style type instead (`MarkdownStyle` / `OfficeStyle` / `PlainTextStyle`, below).
+extension RenderTheme {
+    /// Within-paragraph line leading, as a multiple of the base font size. (Body text, image
+    /// paragraphs, list items, plain text minimum line — every format's "normal" line.)
+    var lineHeightRatio: CGFloat { 1.45 }
+    /// Gap AFTER a paragraph/body block, as a multiple of the base font size.
+    var paragraphSpacingRatio: CGFloat { 0.9 }
+    /// The smaller gap used where blocks sit closer together (list items, headings' space-after).
+    var tightSpacingRatio: CGFloat { 0.3 }
+    /// One list-indent step, as a multiple of the base font size (marker/text hang distance).
+    var listHangRatio: CGFloat { 1.7 }
+    /// Heading line leading, as a multiple of THAT heading's own font size (tighter than body).
+    var headingLineHeightRatio: CGFloat { 1.25 }
+    /// Gap AFTER a heading, as a multiple of the base font size (small — the heading should
+    /// bond to the text below it).
+    var headingSpacingAfterRatio: CGFloat { 0.4 }
+    /// Code line leading, as a multiple of the code font's own point size (open enough to read
+    /// as a bit more airy than a raw terminal). Also reused, applied to `baseFontSize`, for a
+    /// table cell's line height — the same "slightly open" rhythm, just off a different base.
+    var codeLineHeightRatio: CGFloat { 1.4 }
+}
+
+/// Markdown-only rhythm: values no other format needs, kept off the shared base per the
+/// sprint's base-vs-branch split (see `RenderTheme`'s rhythm tokens doc above).
+struct MarkdownStyle {
+    let theme: RenderTheme
+    /// Block-quote left indent (head + first-line), as a multiple of the base font size.
+    var quoteIndentRatio: CGFloat { 1.25 }
+    /// Space BEFORE a heading — roomier for H1/H2 than H3+, so the top two levels read as
+    /// clearly starting a new section.
+    func headingSpacingBefore(level: Int) -> CGFloat {
+        theme.baseFontSize * (level <= 2 ? 1.9 : 1.4)
+    }
+}
+
+/// Office (.docx/.odt)-only rhythm: values no other format needs.
+struct OfficeStyle {
+    let theme: RenderTheme
+    /// Space BEFORE a heading — same shape as `MarkdownStyle`'s (roomier for H1/H2), kept as
+    /// this format's own copy rather than merged into the base per the sprint's design (a value
+    /// only one format uses lives on that format's branch, even when two branches happen to
+    /// agree on the number).
+    func headingSpacingBefore(level: Int) -> CGFloat {
+        theme.baseFontSize * (level <= 2 ? 1.9 : 1.4)
+    }
+}
+
+/// Plain-text (.txt/.csv/.log…)-only rhythm: values no other format needs.
+struct PlainTextStyle {
+    let theme: RenderTheme
+    /// Monospace font size, as a fraction of the base font size (slightly smaller than prose).
+    var monoSizeRatio: CGFloat { 0.95 }
+}

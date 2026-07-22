@@ -884,7 +884,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         let hl = NSMutableAttributedString(attributedString:
             CodeHighlighter.highlight(code, language: lang.isEmpty ? nil : lang, theme: overlayTheme))
         // Match the wrapped card's line leading so no-wrap lines aren't tighter than wrap mode.
-        let codeLH = (overlayTheme.codeFont.pointSize * 1.4).rounded()
+        let codeLH = (overlayTheme.codeFont.pointSize * overlayTheme.codeLineHeightRatio).rounded()
         let ps = NSMutableParagraphStyle()
         ps.minimumLineHeight = codeLH; ps.maximumLineHeight = codeLH
         hl.addAttribute(.paragraphStyle, value: ps, range: NSRange(location: 0, length: hl.length))

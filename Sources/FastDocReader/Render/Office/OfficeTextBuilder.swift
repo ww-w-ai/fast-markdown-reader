@@ -260,10 +260,10 @@ enum OfficeTextBuilder {
                                             alignment: NSTextAlignment? = nil,
                                             tabStops: [CGFloat] = []) -> NSParagraphStyle {
         let p = NSMutableParagraphStyle()
-        let lh = (theme.baseFontSize * 1.45).rounded()
+        let lh = (theme.baseFontSize * theme.lineHeightRatio).rounded()
         p.minimumLineHeight = lh
         p.maximumLineHeight = lh
-        p.paragraphSpacing = theme.baseFontSize * 0.9
+        p.paragraphSpacing = theme.baseFontSize * theme.paragraphSpacingRatio
         if rtl { p.baseWritingDirection = .rightToLeft }
         if let alignment { p.alignment = alignment }
         if !tabStops.isEmpty { p.tabStops = tabStops.map { NSTextTab(textAlignment: .left, location: $0) } }
@@ -274,12 +274,13 @@ enum OfficeTextBuilder {
                                                alignment: NSTextAlignment? = nil,
                                                tabStops: [CGFloat] = []) -> NSParagraphStyle {
         let b = theme.baseFontSize
+        let style = OfficeStyle(theme: theme)
         let p = NSMutableParagraphStyle()
-        let lh = (theme.headingSize(level: level) * 1.25).rounded()
+        let lh = (theme.headingSize(level: level) * theme.headingLineHeightRatio).rounded()
         p.minimumLineHeight = lh
         p.maximumLineHeight = lh
-        p.paragraphSpacing = b * 0.4
-        p.paragraphSpacingBefore = b * (level <= 2 ? 1.9 : 1.4)
+        p.paragraphSpacing = b * theme.headingSpacingAfterRatio
+        p.paragraphSpacingBefore = style.headingSpacingBefore(level: level)
         if rtl { p.baseWritingDirection = .rightToLeft }
         if let alignment { p.alignment = alignment }
         if !tabStops.isEmpty { p.tabStops = tabStops.map { NSTextTab(textAlignment: .left, location: $0) } }
@@ -308,10 +309,10 @@ enum OfficeTextBuilder {
                                             rtl: Bool = false, alignment: NSTextAlignment? = nil,
                                             extraTabStops: [CGFloat] = []) -> NSParagraphStyle {
         let p = NSMutableParagraphStyle()
-        let lh = (theme.baseFontSize * 1.45).rounded()
+        let lh = (theme.baseFontSize * theme.lineHeightRatio).rounded()
         p.minimumLineHeight = lh
         p.maximumLineHeight = lh
-        p.paragraphSpacing = theme.baseFontSize * 0.3
+        p.paragraphSpacing = theme.baseFontSize * theme.tightSpacingRatio
         p.firstLineHeadIndent = markerX
         p.headIndent = textX
         p.tabStops = [NSTextTab(textAlignment: .left, location: textX)]
@@ -365,7 +366,7 @@ enum OfficeTextBuilder {
             }
         }
 
-        let hang = theme.baseFontSize * 1.7
+        let hang = theme.baseFontSize * theme.listHangRatio
         let markerX = CGFloat(level) * hang
         let textX = CGFloat(level + 1) * hang
         let start = result.length

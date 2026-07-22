@@ -116,14 +116,16 @@ private struct AttributedBuilder: MarkupWalker {
         self.lineStarts = ls
         self.mathSpans = AttributedBuilder.scanMathSpans(source, lineStarts: ls)
         let b = theme.baseFontSize
+        let style = MarkdownStyle(theme: theme)
         // All spacing is derived from the base font size with ABSOLUTE line heights, so it
         // scales with ⌘+/− and reads consistently. Within-paragraph leading is tight (1.45×);
         // the gap BETWEEN paragraphs is clearly larger — "near things close, far things far."
-        bodyPS  = mdPara(lineHeight: b * 1.45, spacingAfter: b * 0.9)
-        quotePS = mdPara(lineHeight: b * 1.45, spacingAfter: b * 0.9, headIndent: b * 1.25, firstLineIndent: b * 1.25)
+        bodyPS  = mdPara(lineHeight: b * theme.lineHeightRatio, spacingAfter: b * theme.paragraphSpacingRatio)
+        quotePS = mdPara(lineHeight: b * theme.lineHeightRatio, spacingAfter: b * theme.paragraphSpacingRatio,
+                         headIndent: b * style.quoteIndentRatio, firstLineIndent: b * style.quoteIndentRatio)
         let ip = NSMutableParagraphStyle()
-        ip.minimumLineHeight = (b * 1.45).rounded()   // floor only — NO ceiling, so a tall image fits
-        ip.paragraphSpacing = b * 0.9
+        ip.minimumLineHeight = (b * theme.lineHeightRatio).rounded()   // floor only — NO ceiling, so a tall image fits
+        ip.paragraphSpacing = b * theme.paragraphSpacingRatio
         imagePS = ip.copy() as! NSParagraphStyle
     }
 
@@ -345,9 +347,10 @@ private struct AttributedBuilder: MarkupWalker {
         // Tight heading leading (1.25×) with a roomy space-before and small space-after so the
         // heading bonds to the text below it. All scaled to the font size.
         let b = theme.baseFontSize
-        let ps = mdPara(lineHeight: theme.headingSize(level: heading.level) * 1.25,
-                        spacingAfter: b * 0.4,
-                        spacingBefore: b * (heading.level <= 2 ? 1.9 : 1.4))
+        let style = MarkdownStyle(theme: theme)
+        let ps = mdPara(lineHeight: theme.headingSize(level: heading.level) * theme.headingLineHeightRatio,
+                        spacingAfter: b * theme.headingSpacingAfterRatio,
+                        spacingBefore: style.headingSpacingBefore(level: heading.level))
         result.addAttribute(.paragraphStyle, value: ps,
                             range: NSRange(location: start, length: result.length - start))
         tagBlock(from: start, src: heading.range)
@@ -510,7 +513,7 @@ private struct AttributedBuilder: MarkupWalker {
     /// the parent's paragraph style is applied ONLY to the item's own line — not over the nested
     /// range, which would flatten it).
     private mutating func renderList(_ items: [ListItem], ordered: Bool, depth: Int) {
-        let hang = theme.baseFontSize * 1.7                     // one indent step
+        let hang = theme.baseFontSize * theme.listHangRatio      // one indent step
         let markerX = CGFloat(depth) * hang                     // where the bullet / number sits
         let textX = CGFloat(depth + 1) * hang                   // where the text (and wraps) align
         let ps = listPara(markerX: markerX, textX: textX)
@@ -548,9 +551,9 @@ private struct AttributedBuilder: MarkupWalker {
     /// wrapped lines align at `textX` — so the item's first line and every wrap share one edge.
     private func listPara(markerX: CGFloat, textX: CGFloat) -> NSParagraphStyle {
         let p = NSMutableParagraphStyle()
-        let lh = (theme.baseFontSize * 1.45).rounded()
+        let lh = (theme.baseFontSize * theme.lineHeightRatio).rounded()
         p.minimumLineHeight = lh; p.maximumLineHeight = lh
-        p.paragraphSpacing = theme.baseFontSize * 0.3
+        p.paragraphSpacing = theme.baseFontSize * theme.tightSpacingRatio
         p.firstLineHeadIndent = markerX
         p.headIndent = textX
         p.tabStops = [NSTextTab(textAlignment: .left, location: textX)]
@@ -587,7 +590,7 @@ private struct AttributedBuilder: MarkupWalker {
         // Card look: padding inside (head/tail indent) and gaps outside (paragraph spacing).
         // No flat .backgroundColor — CodeCardLayoutManager draws the rounded card backdrop.
         // Slightly open code leading — a bit more air between lines than a raw terminal.
-        let codeLH = (theme.codeFont.pointSize * 1.4).rounded()
+        let codeLH = (theme.codeFont.pointSize * theme.codeLineHeightRatio).rounded()
         // The block is TWO paragraphs: a blank HEADER line (reserves room for the Copy / Wrap
         // buttons) and the CODE. Splitting them lets paragraphSpacingBefore on the code add a
         // real gap BELOW the buttons — a single \u{2028}-joined paragraph could not.

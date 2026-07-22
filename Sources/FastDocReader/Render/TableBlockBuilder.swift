@@ -98,7 +98,7 @@ enum TableBlockBuilder {
         let textTable = NSTextTable()
         textTable.numberOfColumns = ncol
         textTable.setContentWidth(100, type: .percentageValueType)
-        let cellLH = (theme.baseFontSize * 1.4).rounded()
+        let cellLH = (theme.baseFontSize * theme.codeLineHeightRatio).rounded()
 
         for placement in placements {
             let header = placement.row < headerRows

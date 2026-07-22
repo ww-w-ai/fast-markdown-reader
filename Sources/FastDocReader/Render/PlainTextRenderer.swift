@@ -24,10 +24,11 @@ import AppKit
 enum PlainTextRenderer {
     static func render(_ source: String, theme: RenderTheme) -> NSAttributedString {
         let out = NSMutableAttributedString()
-        let font = NSFont.monospacedSystemFont(ofSize: theme.baseFontSize * 0.95, weight: .regular)
+        let style = PlainTextStyle(theme: theme)
+        let font = NSFont.monospacedSystemFont(ofSize: theme.baseFontSize * style.monoSizeRatio, weight: .regular)
         let ps = NSMutableParagraphStyle()
         ps.lineHeightMultiple = 1.0
-        ps.minimumLineHeight = (theme.baseFontSize * 1.45).rounded()
+        ps.minimumLineHeight = (theme.baseFontSize * theme.lineHeightRatio).rounded()
         // Wrapped continuation lines are indented so a long csv row still reads as ONE row.
         ps.headIndent = theme.baseFontSize * 1.5
         let attrs: [NSAttributedString.Key: Any] = [
