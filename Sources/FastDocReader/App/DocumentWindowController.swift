@@ -326,38 +326,36 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         }
     }
 
-    /// P11: re-sets every `FixedWidthTableBlock`'s RIGID, ABSOLUTE column width to
-    /// `columnFraction * column` — same reasoning, same two-pass shape, same run cadence as
-    /// `reanchorFillMarginTabs` immediately above (display, resize, sidebar toggle, always from
-    /// `updateTextInset`). A table's columns are fixed fractions of its own width, set once at
-    /// build time (`TableBlockBuilder.build`); this is what keeps that width tracking the
-    /// window's, exactly the way `reanchorFillMarginTabs`'s tab stop tracks it for a right-aligned
-    /// TOC entry — the table just has more than one number to re-anchor per row.
+    /// Re-lays every custom-drawn table (`TableAttachmentCell`) to THIS reading column's width — same
+    /// run cadence as `reanchorFillMarginTabs` above (display, resize, sidebar toggle, always from
+    /// `updateTextInset`). A table is built at a placeholder width (`TableBlockBuilder.initialColumn
+    /// Width`); this recomputes its column x-edges and row heights for the real column, so it fills
+    /// and tracks the window. The cell owns its own size (like `SizedAttachmentCell`), so the size
+    /// change is a display concern only — never the undo manager or `applySourceEdit`, so a read-only
+    /// office document doesn't go dirty because its window was resized (office Viewers stay clean).
     ///
-    /// Display-state only, like `reanchorFillMarginTabs`: mutates an already-rendered
-    /// `FixedWidthTableBlock`'s width and reassigns `.paragraphStyle` to force the redraw, never
-    /// touching the undo manager or `applySourceEdit`, so a read-only office document never goes
-    /// dirty because its window was resized (invariant: office Viewers stay clean).
-    ///
-    /// Two passes for the same reason `reanchorFillMarginTabs` is two passes: collecting
-    /// `(range, block)` first and mutating/reassigning after avoids touching `.paragraphStyle`
-    /// while `enumerateAttribute` is still walking that very attribute over the same storage.
+    /// Two passes: relayout every cell first, then invalidate their glyph layout so the layout
+    /// manager re-reads the new `cellSize()` and the document reflows around the new table heights —
+    /// invalidating while `enumerateAttribute` is still walking is what the split avoids.
     private func resizeTableColumns(toColumn column: CGFloat) {
         guard let storage = textView.textStorage, storage.length > 0 else { return }
+        // The USABLE line width is the container width minus its `lineFragmentPadding` on EACH side —
+        // a full-width attachment sized to the raw column would overflow that by `2 * padding` and its
+        // right edge would clip. Size the table to what a line of text actually gets, so it fills the
+        // column exactly and lines up with the body text's own left/right margins.
+        let pad = textView.textContainer?.lineFragmentPadding ?? 5
+        let usable = max(1, column - 2 * pad)
         let full = NSRange(location: 0, length: storage.length)
-        var targets: [(NSRange, FixedWidthTableBlock)] = []
-        storage.enumerateAttribute(.paragraphStyle, in: full, options: []) { value, range, _ in
-            guard let ps = value as? NSParagraphStyle,
-                  let block = ps.textBlocks.first as? FixedWidthTableBlock else { return }
-            targets.append((range, block))
+        var ranges: [NSRange] = []
+        storage.enumerateAttribute(.attachment, in: full, options: []) { value, range, _ in
+            guard let attachment = value as? NSTextAttachment,
+                  let cell = attachment.attachmentCell as? TableAttachmentCell else { return }
+            cell.relayout(width: usable)
+            ranges.append(range)
         }
-        guard !targets.isEmpty else { return }
-        for (range, block) in targets {
-            block.setContentWidth(block.columnFraction * column, type: .absoluteValueType)
-            guard let base = storage.attribute(.paragraphStyle, at: range.location,
-                                                effectiveRange: nil) as? NSParagraphStyle,
-                  let mutable = base.mutableCopy() as? NSMutableParagraphStyle else { continue }
-            storage.addAttribute(.paragraphStyle, value: mutable.copy() as! NSParagraphStyle, range: range)
+        guard !ranges.isEmpty, let lm = textView.layoutManager else { return }
+        for range in ranges {
+            lm.invalidateLayout(forCharacterRange: range, actualCharacterRange: nil)
         }
     }
 

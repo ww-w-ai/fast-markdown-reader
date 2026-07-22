@@ -244,7 +244,15 @@ final class OfficeDocumentTests: XCTestCase {
     func testTableCellTextReachesTheRenderedDocumentThroughTheFullReadPath() throws {
         let (_, wc) = try openOffice(fixtureDocxWithTable())
         let storage = try XCTUnwrap(wc.textStorageRef)
-        XCTAssertTrue(storage.string.contains("Cell A"))
+        // A table renders as ONE custom-drawn `TableAttachmentCell`, so its cell text lives inside
+        // that attachment's placed cells rather than the top-level storage string.
+        var cellTexts: [String] = []
+        storage.enumerateAttribute(.attachment, in: NSRange(location: 0, length: storage.length)) { value, _, _ in
+            if let att = value as? NSTextAttachment, let table = att.attachmentCell as? TableAttachmentCell {
+                cellTexts.append(contentsOf: table.cells.map { $0.content.string })
+            }
+        }
+        XCTAssertTrue(cellTexts.contains { $0.contains("Cell A") }, "cell text must reach the rendered document")
     }
 
     /// S8 invariant 29 (docx): an image inside a table cell must reach `doc.officeBlocks` through
