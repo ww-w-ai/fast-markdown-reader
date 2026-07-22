@@ -151,6 +151,29 @@ final class TableAttachmentCell: NSTextAttachmentCell {
             measure: { [weak self] cell, iw in self?.measuredHeight(cell, innerWidth: iw) ?? 0 })
     }
 
+    // MARK: Cell-internal media access
+    // A table is ONE attachment in the top-level storage; its cells' content never enters that
+    // storage, so the document's media passes (presize / prerender / reconcile) can't reach an
+    // image or diagram sitting inside a cell. These accessors let those passes descend into the
+    // cells — size the medium against the cell it lives in, and paint its pixels when the table is
+    // on screen — the same up-front-size-then-lazy-paint discipline top-level media already gets.
+
+    var cellCount: Int { cells.count }
+    /// The content string of cell `i`. Its attachments are reference types, so a pass can fill an
+    /// image's pixels (`att.image`) or a `SizedAttachmentCell.reservedSize` in place without
+    /// replacing the (immutable) string; a size change is picked up by the next `relayout`.
+    func cellContent(_ i: Int) -> NSAttributedString { cells[i].content }
+    var cellContents: [NSAttributedString] { cells.map { $0.content } }
+    /// The inner width cell `i` gets at the CURRENT geometry (its column-span width minus padding) —
+    /// what a cell-internal image must be fitted to, mirroring how a top-level image fits the reading
+    /// column. Zero before the first `relayout` (no column edges yet).
+    func innerWidth(ofCell i: Int) -> CGFloat {
+        guard i < cells.count, geometry.columnEdges.count == ncol + 1 else { return 0 }
+        let cell = cells[i]
+        let ec = min(cell.col + cell.colSpan, ncol)
+        return max(1, geometry.columnEdges[ec] - geometry.columnEdges[cell.col] - 2 * cell.padding)
+    }
+
     override func cellSize() -> NSSize { geometry.size }
     override func cellBaselineOffset() -> NSPoint { .zero }
     override func cellFrame(for textContainer: NSTextContainer, proposedLineFragment lineFrag: NSRect,

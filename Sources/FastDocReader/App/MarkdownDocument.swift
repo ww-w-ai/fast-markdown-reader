@@ -545,6 +545,18 @@ final class MarkdownDocument: NSDocument {
             guard seen.insert(block).inserted else { return }
             if WebBlockRenderer.cachedSize(block) == nil { codes.append(block) }
         }
+        // Also the diagrams/formulas hidden inside custom-table cells — off-storage, so the walk
+        // above never sees them. Without this a cached-looking document with an uncached in-cell
+        // formula would skip the measure pass and that formula would resize under the reader.
+        storage.enumerateAttribute(.attachment, in: NSRange(location: 0, length: storage.length)) { v, _, _ in
+            guard let table = (v as? NSTextAttachment)?.attachmentCell as? TableAttachmentCell else { return }
+            for content in table.cellContents {
+                content.enumerateWebBlocks { block, _ in
+                    guard seen.insert(block).inserted else { return }
+                    if WebBlockRenderer.cachedSize(block) == nil { codes.append(block) }
+                }
+            }
+        }
         guard !codes.isEmpty else { return }   // all cached → already presized to exact areas
         isPrerendering = true
         prerenderToken += 1
@@ -613,7 +625,7 @@ final class MarkdownDocument: NSDocument {
     /// oversized images to the column width. Internal (not private) so tests can drive it directly —
     /// see `MermaidSizingTests` — the same pattern this codebase already uses for pure, view-free
     /// math (`TextNavigator`, `BlockEdit`).
-    func fittedSize(_ pixelSize: NSSize, _ storage: NSTextStorage, _ range: NSRange, maxWidth: CGFloat) -> NSSize {
+    func fittedSize(_ pixelSize: NSSize, _ storage: NSAttributedString, _ range: NSRange, maxWidth: CGFloat) -> NSSize {
         let colW = maxWidth - 8
         var size = pixelSize
         guard size.width > 0 else { return size }
@@ -699,6 +711,67 @@ final class MarkdownDocument: NSDocument {
             att.bounds = NSRect(origin: .zero, size: fitted)
             storage.edited(.editedAttributes, range: r, changeInLength: 0)
         }
+        // Top-level media are sized; now the media hidden inside custom-table cells, which the
+        // enumerations above never reach (a table is one attachment, its cells off-storage).
+        sizeTableCellMedia(in: wc)
+    }
+
+    /// In-cell counterpart of `presizeKnownMedia`/`resizeTableColumns`. A custom table is ONE
+    /// attachment in the top-level storage, and each cell's content is a separate string that never
+    /// enters that storage — so the top-level media passes never size an image or diagram sitting
+    /// inside a cell, and the table's row heights come out wrong (and `reconcileMedia` never paints
+    /// the pixels). Here we descend into every table's cells and reserve each cell medium's EXACT
+    /// area the same cheap way the top-level pass does — a local image from its ImageIO header, a
+    /// diagram/formula from its cached PDF — fitted to the CELL's inner width, then re-solve the
+    /// table's geometry at the real column so the row that holds the medium is tall enough. Pixels
+    /// are still painted lazily by `reconcileMedia`. Office IMAGES are skipped exactly as the
+    /// top-level pass skips them: their exact size is reserved at build time and their own pixels
+    /// are authoritative (a re-fit from loaded pixels would be wrong, not redundant). Runs up front
+    /// (from `presizeKnownMedia`) and on every reflow (from `resizeTableColumns`) — the same cadence
+    /// top-level media sizing uses, so a cell image re-fits as the window (and thus the cell) resizes.
+    func sizeTableCellMedia(in wc: DocumentWindowController) {
+        guard let storage = wc.textStorageRef else { return }
+        let pad = wc.textView.textContainer?.lineFragmentPadding ?? 5
+        let column = wc.textView.textContainer?.size.width ?? 800
+        let usable = max(1, column - 2 * pad)   // matches `resizeTableColumns`'s own usable width
+        let whole = NSRange(location: 0, length: storage.length)
+        var tableRanges: [NSRange] = []
+        storage.enumerateAttribute(.attachment, in: whole) { v, tr, _ in
+            guard let table = (v as? NSTextAttachment)?.attachmentCell as? TableAttachmentCell else { return }
+            table.relayout(width: usable)   // real column first, so `innerWidth(ofCell:)` is right below
+            var changed = false
+            for i in 0..<table.cellCount {
+                let content = table.cellContent(i)
+                let cw = NSRange(location: 0, length: content.length)
+                let innerFit = table.innerWidth(ofCell: i) + 8   // fittedSize subtracts 8 for `colW`
+                func reserve(_ px: NSSize, _ r: NSRange) {
+                    guard let cell = (content.attribute(.attachment, at: r.location, effectiveRange: nil)
+                        as? NSTextAttachment)?.attachmentCell as? SizedAttachmentCell else { return }
+                    let fitted = self.fittedSize(px, content, r, maxWidth: innerFit)
+                    if cell.reservedSize != fitted { cell.reservedSize = fitted; changed = true }
+                }
+                if kind != .office {   // office images: exact at build time, never re-fit (see doc above)
+                    content.enumerateAttribute(MDAttr.image, in: cw) { val, r, _ in
+                        guard let src = val as? String, !src.hasPrefix("data:"),
+                              let url = self.resolveImageURL(src, baseDir: self.fileURL?.deletingLastPathComponent())
+                        else { return }
+                        if url.isFileURL {                                          // local: ImageIO header
+                            if let px = MarkdownDocument.imagePixelSize(url) { reserve(px, r) }
+                        } else if let px = MarkdownDocument.remoteSizes[url.absoluteString] {
+                            reserve(px, r)   // remote: measured up front by `measureRemoteImages`' cell descent
+                        }
+                    }
+                }
+                content.enumerateWebBlocks(in: cw) { block, r in
+                    guard let sz = WebBlockRenderer.cachedSize(block) else { return }   // uncached: keep placeholder
+                    reserve(sz, r)
+                }
+            }
+            if changed { table.relayout(width: usable) }
+            tableRanges.append(tr)
+        }
+        guard !tableRanges.isEmpty, let lm = wc.textView.layoutManager else { return }
+        for r in tableRanges { lm.invalidateLayout(forCharacterRange: r, actualCharacterRange: nil) }
     }
 
     /// The core of the lazy scheme: on-screen images/diagrams hold their pixels; those far from the
@@ -849,6 +922,93 @@ final class MarkdownDocument: NSDocument {
                 }
             }
         }
+
+        // Custom-table cells: the loops above walk top-level storage, which a table's cell content
+        // never enters — so cell-internal media is neither painted nor purged. A table is ONE
+        // attachment; when it's on screen fill its cell media's pixels and redraw the table, when off
+        // drop them. PAINT ONLY — sizes were reserved up front by `sizeTableCellMedia`, so this never
+        // touches reservedSize/bounds/layout (invariant 1), it only sets `att.image` and repaints.
+        func paintCell(_ img: NSImage?, _ att: NSTextAttachment, _ tableRange: NSRange) {
+            guard gen == self.renderGeneration else { return }
+            att.image = img ?? MarkdownDocument.brokenImage()
+            wc.redrawGlyphs(tableRange)
+            wc.refreshAfterImageFill()
+        }
+        var cellImg: [(String, NSTextAttachment, NSRange)] = []
+        var cellWeb: [(WebBlock, NSTextAttachment, NSRange)] = []
+        var cellPurge: [(NSTextAttachment, NSRange)] = []
+        storage.enumerateAttribute(.attachment, in: whole) { v, tr, _ in
+            guard let table = (v as? NSTextAttachment)?.attachmentCell as? TableAttachmentCell else { return }
+            let visible = onScreen(tr)
+            for content in table.cellContents {
+                let cw = NSRange(location: 0, length: content.length)
+                func inAtt(_ r: NSRange) -> NSTextAttachment? {
+                    content.attribute(.attachment, at: r.location, effectiveRange: nil) as? NSTextAttachment
+                }
+                content.enumerateAttribute(MDAttr.image, in: cw) { val, r, _ in
+                    guard let src = val as? String, !src.isEmpty, let att = inAtt(r) else { return }
+                    if visible { if att.image == nil { cellImg.append((src, att, tr)) } }
+                    else if att.image != nil { cellPurge.append((att, tr)) }
+                }
+                content.enumerateWebBlocks(in: cw) { block, r in
+                    guard let att = inAtt(r) else { return }
+                    if visible {
+                        guard att.image == nil else { return }
+                        // Mirror the top-level guard: an uncached block mid-measure has no exact size
+                        // yet, so painting it before `sizeTableCellMedia` reserves its area would show
+                        // it at the placeholder size. Wait for the prerender pass to size it.
+                        if self.isPrerendering && WebBlockRenderer.cachedSize(block) == nil { return }
+                        cellWeb.append((block, att, tr))
+                    } else if att.image != nil { cellPurge.append((att, tr)) }
+                }
+            }
+        }
+        for (att, tr) in cellPurge { att.image = nil; wc.redrawGlyphs(tr) }
+        for (src, att, tr) in cellImg {
+            if src.hasPrefix("data:") {
+                paintCell(MarkdownDocument.decodeDataURI(src), att, tr)
+            } else if kind == .office && !src.hasPrefix(MarkdownDocument.officeExternalLinkPrefix) {
+                // Embedded office picture: archive entry id, keyed by document path + id (see the
+                // top-level `officeLoad` comment for why the id alone is not a safe key).
+                let cacheKey = "\(fileURL?.path ?? "")|\(src)" as NSString
+                if let c = MarkdownDocument.officeImageCache.object(forKey: cacheKey) {
+                    paintCell(c, att, tr)
+                } else {
+                    MarkdownDocument.loadOfficeImage(archive: officeArchive, id: src) { [weak wc] img in
+                        if let img { MarkdownDocument.officeImageCache.setObject(img, forKey: cacheKey) }
+                        if wc != nil { paintCell(img, att, tr) }
+                    }
+                }
+            } else {
+                // Markdown image, or a linked office image whose id IS a real file/URL location.
+                let raw = src.hasPrefix(MarkdownDocument.officeExternalLinkPrefix)
+                    ? String(src.dropFirst(MarkdownDocument.officeExternalLinkPrefix.count)) : src
+                if let url = resolveImageURL(raw, baseDir: baseDir) {
+                    if let c = MarkdownDocument.imageCache.object(forKey: url.absoluteString as NSString) {
+                        paintCell(c, att, tr)
+                    } else if FolderAccess.needsGrant(for: url) {
+                        // Sandboxed and unreadable: show the honest "grant access" placeholder. (The
+                        // top-level path also wires a click-to-grant on the storage range; a cell has
+                        // no storage range, so the grant click isn't wired here — a known minor.)
+                        paintCell(MarkdownDocument.needsAccessImage(), att, tr)
+                    } else {
+                        MarkdownDocument.loadImage(url) { [weak wc] img in
+                            if let img { MarkdownDocument.imageCache.setObject(img, forKey: url.absoluteString as NSString) }
+                            if wc != nil { paintCell(img, att, tr) }
+                        }
+                    }
+                } else { paintCell(nil, att, tr) }
+            }
+        }
+        if !cellWeb.isEmpty {
+            let renderer = WebBlockRenderer()
+            Task { @MainActor in
+                for (block, att, tr) in cellWeb {
+                    guard let img = await renderer.renderImage(block) else { continue }
+                    paintCell(img, att, tr)
+                }
+            }
+        }
     }
 
     private func resolveImageURL(_ src: String, baseDir: URL?) -> URL? {
@@ -899,12 +1059,22 @@ final class MarkdownDocument: NSDocument {
         let baseDir = fileURL?.deletingLastPathComponent()
         var urls: [URL] = []
         var seen = Set<String>()
-        storage.enumerateAttribute(MDAttr.image, in: NSRange(location: 0, length: storage.length)) { v, _, _ in
-            guard let src = v as? String, !src.hasPrefix("data:"),
-                  let url = self.resolveImageURL(src, baseDir: baseDir), !url.isFileURL,
-                  MarkdownDocument.remoteSizes[url.absoluteString] == nil,
-                  seen.insert(url.absoluteString).inserted else { return }
-            urls.append(url)
+        func collectRemote(_ s: NSAttributedString) {
+            s.enumerateAttribute(MDAttr.image, in: NSRange(location: 0, length: s.length)) { v, _, _ in
+                guard let src = v as? String, !src.hasPrefix("data:"),
+                      let url = self.resolveImageURL(src, baseDir: baseDir), !url.isFileURL,
+                      MarkdownDocument.remoteSizes[url.absoluteString] == nil,
+                      seen.insert(url.absoluteString).inserted else { return }
+                urls.append(url)
+            }
+        }
+        collectRemote(storage)
+        // Also remote images hidden inside custom-table cells — off-storage, so the walk above never
+        // sees them. Without this a remote image in a table cell would never be measured and would
+        // stay pinned at its build-time placeholder box forever (invariant 11).
+        storage.enumerateAttribute(.attachment, in: NSRange(location: 0, length: storage.length)) { v, _, _ in
+            guard let table = (v as? NSTextAttachment)?.attachmentCell as? TableAttachmentCell else { return }
+            for content in table.cellContents { collectRemote(content) }
         }
         guard !urls.isEmpty else { return }   // all measured (or none) → presize already exact
         isMeasuringRemote = true

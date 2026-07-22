@@ -339,24 +339,13 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
     /// invalidating while `enumerateAttribute` is still walking is what the split avoids.
     private func resizeTableColumns(toColumn column: CGFloat) {
         guard let storage = textView.textStorage, storage.length > 0 else { return }
-        // The USABLE line width is the container width minus its `lineFragmentPadding` on EACH side —
-        // a full-width attachment sized to the raw column would overflow that by `2 * padding` and its
-        // right edge would clip. Size the table to what a line of text actually gets, so it fills the
-        // column exactly and lines up with the body text's own left/right margins.
-        let pad = textView.textContainer?.lineFragmentPadding ?? 5
-        let usable = max(1, column - 2 * pad)
-        let full = NSRange(location: 0, length: storage.length)
-        var ranges: [NSRange] = []
-        storage.enumerateAttribute(.attachment, in: full, options: []) { value, range, _ in
-            guard let attachment = value as? NSTextAttachment,
-                  let cell = attachment.attachmentCell as? TableAttachmentCell else { return }
-            cell.relayout(width: usable)
-            ranges.append(range)
-        }
-        guard !ranges.isEmpty, let lm = textView.layoutManager else { return }
-        for range in ranges {
-            lm.invalidateLayout(forCharacterRange: range, actualCharacterRange: nil)
-        }
+        // `sizeTableCellMedia` re-fits each table's cell-internal media to THIS column's cell widths
+        // (a cell image narrows with its cell as the window shrinks), then relayouts every table to
+        // the usable width (container minus `lineFragmentPadding` on each side — a table sized to the
+        // raw column would overflow by `2 * padding` and clip on the right) and invalidates their
+        // layout so the manager re-reads each `cellSize()`. It is the superset of the plain relayout
+        // this method used to do, and also covers a media-free table (nothing to size → just relayout).
+        (document as? MarkdownDocument)?.sizeTableCellMedia(in: self)
     }
 
     // MARK: - Table of contents (⌥⌘T)

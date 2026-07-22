@@ -514,6 +514,12 @@ enum OdtReader: OfficeDocumentReader {
         var shading: NSColor? = nil
         var borderColor: NSColor? = nil
         var borderWidth: CGFloat? = nil
+        /// ODF `style:paragraph-properties/@style:contextual-spacing` (ODF 1.3 §20.353) — the docx
+        /// `w:contextualSpacing` equivalent: when true, drop the space BETWEEN adjacent paragraphs of
+        /// the same style. `Bool?`, not `Bool`, for the same per-property cascade reason docx's is
+        /// (`DocxReader.ParaProps.contextualSpacing`): a style that never mentions it must climb the
+        /// parent chain, which a plain `false` would silently stop.
+        var contextualSpacing: Bool? = nil
     }
 
     /// A `text:p` isn't the only way ODF marks a heading — Writer also lets a PARAGRAPH STYLE itself
@@ -605,6 +611,10 @@ enum OdtReader: OfficeDocumentReader {
                 let border = parseODFBorder(props)
                 decl.borderColor = border.color
                 decl.borderWidth = border.width
+                // `style:contextual-spacing` (ODF's `w:contextualSpacing`): a plain boolean toggle —
+                // only the literal `"true"` turns it on; its ABSENCE stays `nil` (cascade climbs), and
+                // any other value reads as an explicit `false` (this level said "no", stop climbing).
+                if let cs = props.attributes["style:contextual-spacing"] { decl.contextualSpacing = (cs == "true") }
             }
             map[name] = decl
         }
@@ -636,7 +646,7 @@ enum OdtReader: OfficeDocumentReader {
         var have = (outline: false, rtl: false, align: false, tabs: false,
                     spacingBefore: false, spacingAfter: false, indentStart: false, indentEnd: false,
                     firstLineIndent: false, hangingIndent: false, lineHeight: false, shading: false,
-                    borderColor: false, borderWidth: false)
+                    borderColor: false, borderWidth: false, contextualSpacing: false)
         var currentName: String? = styleName
         var visited = Set<String>()
         while let name = currentName {
@@ -657,6 +667,7 @@ enum OdtReader: OfficeDocumentReader {
             if !have.shading, let v = decl.shading { result.format.shading = v; have.shading = true }
             if !have.borderColor, let v = decl.borderColor { result.format.borderColor = v; have.borderColor = true }
             if !have.borderWidth, let v = decl.borderWidth { result.format.borderWidth = v; have.borderWidth = true }
+            if !have.contextualSpacing, let v = decl.contextualSpacing { result.format.contextualSpacing = v; have.contextualSpacing = true }
             currentName = decl.parent
         }
         result.alignment = resolveAlignment(alignmentRaw, rtl: result.rtl)
@@ -1042,17 +1053,18 @@ enum OdtReader: OfficeDocumentReader {
     /// table is a faithful rendering, a wrongly-bolded row is not).
     private static func parseTable(_ table: XMLNode, styles: ParsedStyles, archive: ZipArchive, notes: NoteCollector) -> OfficeBlock {
         let columnWidths = parseColumnWidths(table, tableColumnStyles: styles.tableColumnStyles)
+        let columnDefaultCellStyles = parseColumnDefaultCellStyles(table, tableCellStyles: styles.tableCellStyles)
         var rows: [[Cell]] = []
         var headerRows = 0
         for child in table.children {
             switch child.name {
             case "table:table-header-rows":
                 let expanded = child.children.filter { $0.name == "table:table-row" }
-                    .flatMap { expandRow($0, columnWidths: columnWidths, styles: styles, archive: archive, notes: notes) }
+                    .flatMap { expandRow($0, columnWidths: columnWidths, columnDefaultCellStyles: columnDefaultCellStyles, styles: styles, archive: archive, notes: notes) }
                 headerRows += expanded.count
                 rows.append(contentsOf: expanded)
             case "table:table-row":
-                rows.append(contentsOf: expandRow(child, columnWidths: columnWidths, styles: styles, archive: archive, notes: notes))
+                rows.append(contentsOf: expandRow(child, columnWidths: columnWidths, columnDefaultCellStyles: columnDefaultCellStyles, styles: styles, archive: archive, notes: notes))
             default:
                 continue
             }
@@ -1090,6 +1102,22 @@ enum OdtReader: OfficeDocumentReader {
     /// `expandRow`'s own cell/row repeat expansion), `nil` where a column has no `table:style-name` or
     /// an unresolvable one — so the result's INDEX is a column position, directly usable by
     /// `expandRow`'s own running column counter.
+    /// A `table:table-column`'s `table:default-cell-style-name` — ODF's own spelling of "the default
+    /// look of cells in this column" (docx has no per-column default; it uses table-level `w:tblBorders`
+    /// instead). A cell that declares NO `table:style-name` of its own inherits this column default
+    /// (its borders, shading, vertical-alignment, padding) rather than falling straight to the theme
+    /// default. Returned one entry PER COLUMN (repeats expanded, same as `parseColumnWidths`), `nil`
+    /// where a column names no default, so the INDEX is a column position `expandRow` reads directly.
+    private static func parseColumnDefaultCellStyles(_ table: XMLNode, tableCellStyles: [String: TableCellStyle]) -> [TableCellStyle?] {
+        var out: [TableCellStyle?] = []
+        for child in table.children where child.name == "table:table-column" {
+            let style = child.attributes["table:default-cell-style-name"].flatMap { tableCellStyles[$0] }
+            let repeated = Int(child.attributes["table:number-columns-repeated"] ?? "") ?? 1
+            out.append(contentsOf: Array(repeating: style, count: repeated))
+        }
+        return out
+    }
+
     private static func parseColumnWidths(_ table: XMLNode, tableColumnStyles: [String: TableColumnStyle]) -> [CGFloat?] {
         var widths: [CGFloat?] = []
         for child in table.children where child.name == "table:table-column" {
@@ -1119,9 +1147,13 @@ enum OdtReader: OfficeDocumentReader {
     /// reached, before the index advances past it. A `table:covered-table-cell` still advances the
     /// index by its own (possibly repeated) column count even though it contributes no `Cell` —
     /// skipping that would misalign every width to its right.
-    private static func expandRow(_ row: XMLNode, columnWidths: [CGFloat?], styles: ParsedStyles, archive: ZipArchive,
+    private static func expandRow(_ row: XMLNode, columnWidths: [CGFloat?], columnDefaultCellStyles: [TableCellStyle?],
+                                   styles: ParsedStyles, archive: ZipArchive,
                                    notes: NoteCollector) -> [[Cell]] {
         let rowRepeat = Int(row.attributes["table:number-rows-repeated"] ?? "") ?? 1
+        // ODF precedence for a cell with no `table:style-name` of its own: the ROW's own
+        // `table:default-cell-style-name`, then the COLUMN's (resolved per-column-index below).
+        let rowDefaultStyle = row.attributes["table:default-cell-style-name"].flatMap { styles.tableCellStyles[$0] }
         var cells: [Cell] = []
         var columnIndex = 0
         for child in row.children {
@@ -1131,7 +1163,7 @@ enum OdtReader: OfficeDocumentReader {
                 let rowSpan = Int(child.attributes["table:number-rows-spanned"] ?? "") ?? 1
                 let colSpan = Int(child.attributes["table:number-columns-spanned"] ?? "") ?? 1
                 let colRepeat = Int(child.attributes["table:number-columns-repeated"] ?? "") ?? 1
-                let cellStyle = child.attributes["table:style-name"].flatMap { styles.tableCellStyles[$0] }
+                let ownStyle = child.attributes["table:style-name"].flatMap { styles.tableCellStyles[$0] }
                 // Each REPEAT instance advances the column index by exactly ONE — its own start
                 // column — never by `colSpan`: the ADDITIONAL columns a span covers are accounted
                 // for by the `table:covered-table-cell` element(s) that follow it in THIS row (see
@@ -1141,6 +1173,10 @@ enum OdtReader: OfficeDocumentReader {
                 // (caught by `testColumnWidthAlignsCorrectlyAcrossAColumnSpan`'s own mutation check).
                 for _ in 0..<colRepeat {
                     let width = columnIndex < columnWidths.count ? columnWidths[columnIndex] : nil
+                    // cell's own style > row default > column default (this column index) — ODF's own
+                    // cascade; the theme default in `TableBlockBuilder` remains the final fallback.
+                    let columnDefault = columnIndex < columnDefaultCellStyles.count ? columnDefaultCellStyles[columnIndex] : nil
+                    let cellStyle = ownStyle ?? rowDefaultStyle ?? columnDefault
                     cells.append(Cell(
                         blocks: blocks, rowSpan: rowSpan, colSpan: colSpan, backgroundColor: cellStyle?.backgroundColor,
                         borderColor: cellStyle?.borderColor, borderWidth: cellStyle?.borderWidth, width: width,
