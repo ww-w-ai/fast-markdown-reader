@@ -173,6 +173,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// taking over every .csv on someone's Mac is not a favour.
     private static let claimable: [(name: String, id: String, onByDefault: Bool)] = [
         ("Markdown  (.md, .markdown)", "net.daringfireball.markdown", true),
+        ("Word document  (.docx)", "org.openxmlformats.wordprocessingml.document", false),
+        ("OpenDocument text  (.odt)", "org.oasis-open.opendocument.text", false),
         ("Plain text  (.txt)", "public.plain-text", false),
         ("Comma-separated values  (.csv)", "public.comma-separated-values-text", false),
         ("Tab-separated values  (.tsv)", "public.tab-separated-values-text", false),

@@ -869,8 +869,11 @@ final class OfficeTextBuilderTests: XCTestCase {
         // trailing newline from `appendTable`'s own per-table separator, which a mere `.contains`
         // check on each word would miss.
         XCTAssertEqual(out.string, "Outer\nNested\n\n\n")
-        let outerBlocks = tableBlocks(in: out)
-        XCTAssertEqual(outerBlocks.count, 1, "only the outer table's own anchor cell — no nested grid")
+        // A multi-paragraph cell now carries its table block on EACH of its paragraphs (each keeps its
+        // own spacing/line-height), so counting runs over-counts; what proves "no nested grid" is that
+        // every run points to the SAME single block — one distinct `NSTextTableBlock`, not two.
+        let distinctBlocks = Set(tableBlocks(in: out).map { ObjectIdentifier($0) })
+        XCTAssertEqual(distinctBlocks.count, 1, "only the outer table's one block — no nested grid")
     }
 
     /// The anchor-cells-only merge contract must still hold for a cell built the NEW way
@@ -1370,53 +1373,123 @@ final class OfficeTextBuilderTests: XCTestCase {
         XCTAssertEqual(block?.backgroundColor, .systemTeal)
     }
 
+    /// P11: `NSTextTableBlock`'s own native `.border` width is always forced to `0` now (see
+    /// `TableBlockBuilder.build`) — the RESOLVED width still reaches `FixedWidthTableBlock.strokeWidth`,
+    /// which is what its own hand-drawn border paints from. The colour chain is untouched (colour
+    /// never floated row to row, only the column x position did), so it's still read the native way.
     func testCellBorderColorAndWidthOverrideTheThemeDefault() {
         let out = build([.table(rows: [[Cell(blocks: [.paragraph(spans: [span("A")])],
                                              borderColor: .systemPurple, borderWidth: 3)]], headerRows: 0)])
-        let block = try! XCTUnwrap(tableBlocks(in: out).first)
+        let block = try! XCTUnwrap(tableBlocks(in: out).first as? FixedWidthTableBlock)
         XCTAssertEqual(block.borderColor(for: .minX), .systemPurple)
-        XCTAssertEqual(block.width(for: .border, edge: .minX), 3)
+        XCTAssertEqual(block.strokeWidth, 3)
+        XCTAssertEqual(block.width(for: .border, edge: .minX), 0, "native border width stays 0 — this class draws its own")
     }
 
-    func testCellWidthSetsTheTextTableBlocksAbsoluteContentWidth() {
+    /// P11: a cell's own absolute `.width` is superseded by `FixedWidthTableBlock.columnFraction` —
+    /// every column (grid-known or not) is now a fixed FRACTION of the whole table, never an
+    /// independent per-cell absolute value (see `TableBlockBuilder.build`'s doc comment on why
+    /// mixing the two would reintroduce the same row-to-row drift P11 removes). A single-column,
+    /// no-grid table gets the whole column: fraction 1.0, so its BUILD-time content width is
+    /// exactly `TableBlockBuilder.initialColumnWidth` — `DocumentWindowController.resizeTableColumns`
+    /// re-anchors it to the real window width on the very next layout pass.
+    func testCellWidthNoLongerSetsAnIndependentAbsoluteContentWidth() {
         let out = build([.table(rows: [[Cell(blocks: [.paragraph(spans: [span("A")])], width: 120)]], headerRows: 0)])
-        let block = try! XCTUnwrap(tableBlocks(in: out).first)
-        XCTAssertEqual(block.value(for: .width), 120)
+        let block = try! XCTUnwrap(tableBlocks(in: out).first as? FixedWidthTableBlock)
+        XCTAssertEqual(block.columnFraction, 1, accuracy: 0.001)
+        XCTAssertEqual(block.value(for: .width), TableBlockBuilder.initialColumnWidth)
         XCTAssertEqual(block.valueType(for: .width), .absoluteValueType)
     }
 
     // MARK: P3 — grid-ratio column widths (`OfficeBlock.table.columnWidths`)
 
-    /// A table whose `columnWidths` matches the derived column count switches EVERY column to a
-    /// percentage of the source's own grid ratios (20/20/60 for 100/100/300pt) — this is the fix
-    /// for jagged columns: the per-cell absolute width path (`Cell.width`) is bypassed entirely
-    /// once a usable grid is present.
-    func testGridColumnWidthsBecomePercentagesThatSumToOneHundred() {
+    /// P11: a table whose `columnWidths` matches the derived column count still switches EVERY
+    /// column to the source's own grid ratios (20/20/60 for 100/100/300pt) — the fix for jagged
+    /// columns now goes further: those ratios are `FixedWidthTableBlock.columnFraction`, a RIGID
+    /// ABSOLUTE width (`fraction * TableBlockBuilder.initialColumnWidth` at build time, then
+    /// `fraction * <real column>` on every resize) rather than the `NSTextTable`-native percentage
+    /// this replaced — percentage columns are exactly what floated a merged row's boundary to a
+    /// different x than a single-cell row's.
+    func testGridColumnWidthsBecomeRigidAbsoluteWidthsInTheGridsRatio() {
         let rows: [[Cell]] = [[
             Cell(spans: [span("A")]), Cell(spans: [span("B")]), Cell(spans: [span("C")]),
         ]]
         let out = build([.table(rows: rows, headerRows: 0, columnWidths: [100, 100, 300])])
         let blocks = tableBlocks(in: out).sorted { $0.startingColumn < $1.startingColumn }
-        XCTAssertEqual(blocks.map { $0.valueType(for: .width) }, [.percentageValueType, .percentageValueType, .percentageValueType])
+            .compactMap { $0 as? FixedWidthTableBlock }
+        XCTAssertEqual(blocks.map { $0.valueType(for: .width) }, [.absoluteValueType, .absoluteValueType, .absoluteValueType])
+        let fractions = blocks.map(\.columnFraction)
+        for (actual, expected) in zip(fractions, [CGFloat(0.2), 0.2, 0.6]) {
+            XCTAssertEqual(actual, expected, accuracy: 0.001)
+        }
         let widths = blocks.map { $0.value(for: .width) }
-        for (actual, expected) in zip(widths, [CGFloat(20), 20, 60]) {
+        for (actual, expected) in zip(widths, [CGFloat(0.2), 0.2, 0.6].map { $0 * TableBlockBuilder.initialColumnWidth }) {
             XCTAssertEqual(actual, expected, accuracy: 0.001)
         }
     }
 
-    /// A merged cell (`colSpan: 2`) gets the SUM of the two grid columns it covers, not just the
-    /// first one — 20 + 20 = 40 for the wide cell, 60 for the lone remaining column.
-    func testMergedCellGetsTheSumOfItsCoveredColumnsPercentages() {
+    /// A merged cell (`colSpan: 2`) gets the SUM of the two grid columns' fractions, not just the
+    /// first one — 0.2 + 0.2 = 0.4 for the wide cell, 0.6 for the lone remaining column.
+    func testMergedCellGetsTheSumOfItsCoveredColumnsFractions() {
         let rows: [[Cell]] = [[
             Cell(spans: [span("Wide")], colSpan: 2), Cell(spans: [span("C")]),
         ]]
         let out = build([.table(rows: rows, headerRows: 0, columnWidths: [100, 100, 300])])
         let blocks = tableBlocks(in: out).sorted { $0.startingColumn < $1.startingColumn }
+            .compactMap { $0 as? FixedWidthTableBlock }
         XCTAssertEqual(blocks.count, 2)
         XCTAssertEqual(blocks[0].columnSpan, 2)
-        XCTAssertEqual(blocks[0].value(for: .width), 40, accuracy: 0.001)
-        XCTAssertEqual(blocks[0].valueType(for: .width), .percentageValueType)
-        XCTAssertEqual(blocks[1].value(for: .width), 60, accuracy: 0.001)
+        XCTAssertEqual(blocks[0].columnFraction, 0.4, accuracy: 0.001)
+        XCTAssertEqual(blocks[0].valueType(for: .width), .absoluteValueType)
+        XCTAssertEqual(blocks[1].columnFraction, 0.6, accuracy: 0.001)
+    }
+
+    /// A no-grid table (no `columnWidths` — every markdown table, and an office table before its
+    /// parser learns `w:tblGrid`) still gets a `FixedWidthTableBlock` per cell, with an EQUAL share
+    /// of the table, `colSpan / ncol` — this is what fixes markdown table alignment too, per P11's
+    /// "apply to all tables uniformly".
+    func testNoGridTableGetsEqualColumnFractions() {
+        let rows: [[Cell]] = [[Cell(spans: [span("A")]), Cell(spans: [span("B")]), Cell(spans: [span("C")])]]
+        let out = build([.table(rows: rows, headerRows: 0)])
+        let blocks = tableBlocks(in: out).sorted { $0.startingColumn < $1.startingColumn }
+            .compactMap { $0 as? FixedWidthTableBlock }
+        XCTAssertEqual(blocks.count, 3)
+        for block in blocks { XCTAssertEqual(block.columnFraction, 1.0 / 3.0, accuracy: 0.001) }
+    }
+
+    /// P11's per-edge border model: only the grid's LAST column draws its own right edge and only
+    /// the LAST row draws its own bottom edge — every other cell's shared boundary is drawn once,
+    /// by the cell to its right/below, not twice by both neighbours (see `FixedWidthTableBlock`'s
+    /// doc comment for why that's what keeps two adjacent rows' boundaries from landing at two
+    /// different x/y values). MUTATION: swapping which cell owns the trailing edge (e.g. the FIRST
+    /// column drawing the right edge instead of the last) would make this fail — it isn't a
+    /// tautological "some cell draws SOME edge" check.
+    func testOnlyTheGridsLastColumnAndRowDrawTheirOwnTrailingEdge() {
+        let rows: [[Cell]] = [
+            [Cell(spans: [span("A")]), Cell(spans: [span("B")])],
+            [Cell(spans: [span("C")]), Cell(spans: [span("D")])],
+        ]
+        let out = build([.table(rows: rows, headerRows: 0)])
+        let blocks = tableBlocks(in: out).compactMap { $0 as? FixedWidthTableBlock }
+        XCTAssertEqual(blocks.count, 4)
+        for block in blocks {
+            XCTAssertEqual(block.drawsRightEdge, block.startingColumn == 1,
+                            "only the last column (index 1) owns the right edge")
+            XCTAssertEqual(block.drawsBottomEdge, block.startingRow == 1,
+                            "only the last row (index 1) owns the bottom edge")
+        }
+    }
+
+    /// `TableBlockBuilder.build` always forces native `.border` width to `0` — `FixedWidthTableBlock`
+    /// draws its own, and a nonzero native width would double-draw (or draw at the wrong,
+    /// percentage-derived x) every boundary this class exists to make rigid.
+    func testNativeBorderWidthIsAlwaysZero() {
+        let out = build([.table(rows: [[Cell(spans: [span("A")])]], headerRows: 0)])
+        let block = try! XCTUnwrap(tableBlocks(in: out).first)
+        XCTAssertEqual(block.width(for: .border, edge: .minX), 0)
+        XCTAssertEqual(block.width(for: .border, edge: .minY), 0)
+        XCTAssertEqual(block.width(for: .border, edge: .maxX), 0)
+        XCTAssertEqual(block.width(for: .border, edge: .maxY), 0)
     }
 
     /// `columnWidths` whose count doesn't match the table's own derived column count (a malformed
@@ -1433,10 +1506,10 @@ final class OfficeTextBuilderTests: XCTestCase {
     /// exactly what a cell with no shading/border/width info renders as.
     func testCellWithNoShadingBorderOrWidthKeepsExactlyTheThemeDefaults() {
         let out = build([.table(rows: [[Cell(spans: [span("A")])]], headerRows: 0)])
-        let block = try! XCTUnwrap(tableBlocks(in: out).first)
+        let block = try! XCTUnwrap(tableBlocks(in: out).first as? FixedWidthTableBlock)
         XCTAssertNil(block.backgroundColor)
         XCTAssertEqual(block.borderColor(for: .minX), Palette.tableBorder)
-        XCTAssertEqual(block.width(for: .border, edge: .minX), 1)
+        XCTAssertEqual(block.strokeWidth, 1)
     }
 
     /// Merged cells (R1's `colSpan`) must still work once a cell can ALSO carry shading — the two
@@ -1458,9 +1531,9 @@ final class OfficeTextBuilderTests: XCTestCase {
         let rows: [[Cell]] = [[Cell(spans: [span("A")])]]
         let out = build([.table(rows: rows, headerRows: 0,
                                 format: TableFormat(defaultBorderColor: .systemPurple, defaultBorderWidth: 3))])
-        let block = try! XCTUnwrap(tableBlocks(in: out).first)
+        let block = try! XCTUnwrap(tableBlocks(in: out).first as? FixedWidthTableBlock)
         XCTAssertEqual(block.borderColor(for: .minX), .systemPurple)
-        XCTAssertEqual(block.width(for: .border, edge: .minX), 3)
+        XCTAssertEqual(block.strokeWidth, 3)
     }
 
     /// A cell's OWN border still wins over a table-level default that exists alongside it.
@@ -1468,9 +1541,9 @@ final class OfficeTextBuilderTests: XCTestCase {
         let rows: [[Cell]] = [[Cell(blocks: [.paragraph(spans: [span("A")])], borderColor: .systemRed, borderWidth: 5)]]
         let out = build([.table(rows: rows, headerRows: 0,
                                 format: TableFormat(defaultBorderColor: .systemPurple, defaultBorderWidth: 3))])
-        let block = try! XCTUnwrap(tableBlocks(in: out).first)
+        let block = try! XCTUnwrap(tableBlocks(in: out).first as? FixedWidthTableBlock)
         XCTAssertEqual(block.borderColor(for: .minX), .systemRed)
-        XCTAssertEqual(block.width(for: .border, edge: .minX), 5)
+        XCTAssertEqual(block.strokeWidth, 5)
     }
 
     /// A table-level default shading applies to a cell with no shading of its own — including a
@@ -1519,22 +1592,35 @@ final class OfficeTextBuilderTests: XCTestCase {
         XCTAssertEqual(block.verticalAlignment, .topAlignment)
     }
 
-    /// `Cell.padding` (already resolved by the reader against any table default) replaces the
-    /// hardcoded 7pt when present.
+    /// `Cell.padding` (already resolved by the reader against any table default) still delivers its
+    /// full inset when present — but through the VERTICAL block padding plus a horizontal text
+    /// indent, NOT the horizontal block padding, which is forced to 0. Per-cell horizontal padding
+    /// is what let a merged row (fewer cells → less total padding) shift a shared column seam off a
+    /// single-cell row's; zeroing it makes seams a pure cumulative sum aligned across every row.
     func testCellPaddingReplacesTheHardcodedSevenPointDefault() {
         let rows: [[Cell]] = [[Cell(blocks: [.paragraph(spans: [span("A")])], padding: 12)]]
         let out = build([.table(rows: rows, headerRows: 0)])
         let block = try! XCTUnwrap(tableBlocks(in: out).first)
-        XCTAssertEqual(block.width(for: .padding, edge: .minX), 12)
+        XCTAssertEqual(block.width(for: .padding, edge: .minY), 12)   // vertical padding carries the inset
+        XCTAssertEqual(block.width(for: .padding, edge: .maxY), 12)
+        XCTAssertEqual(block.width(for: .padding, edge: .minX), 0)    // horizontal zeroed → seams align
+        XCTAssertEqual(block.width(for: .padding, edge: .maxX), 0)
+        let ps = paragraphStyle(in: out)
+        XCTAssertEqual(ps.headIndent, 12)                            // horizontal inset via indent instead
+        XCTAssertEqual(ps.tailIndent, -12)
     }
 
     /// `nil` (every markdown table, and a docx table/cell with no declared margin) keeps the
-    /// pre-sprint 7pt default exactly as before this field existed.
+    /// pre-sprint 7pt inset — again on the vertical edges + text indent, with horizontal block
+    /// padding 0 so the default table looks the same while its column seams stay rigid.
     func testCellWithNoPaddingKeepsTheHardcodedSevenPointDefault() {
         let rows: [[Cell]] = [[Cell(spans: [span("A")])]]
         let out = build([.table(rows: rows, headerRows: 0)])
         let block = try! XCTUnwrap(tableBlocks(in: out).first)
-        XCTAssertEqual(block.width(for: .padding, edge: .minX), 7)
+        XCTAssertEqual(block.width(for: .padding, edge: .minY), 7)
+        XCTAssertEqual(block.width(for: .padding, edge: .minX), 0)
+        let ps = paragraphStyle(in: out)
+        XCTAssertEqual(ps.headIndent, 7)
     }
 
     // MARK: P2 — ParagraphFormat → NSParagraphStyle (spacing/line-height/indent/contextualSpacing)
@@ -1578,13 +1664,36 @@ final class OfficeTextBuilderTests: XCTestCase {
     }
 
     /// `.multiple` is a unitless RATIO (`w:lineRule="auto"`'s `line/240`) — it must land on
-    /// `lineHeightMultiple` UNCHANGED regardless of `fontSizeScale`, unlike every point-valued field.
-    func testLineHeightMultipleSetsLineHeightMultipleUnscaled() {
+    /// `lineHeightMultiple` UNCHANGED regardless of `fontSizeScale`, unlike every point-valued field —
+    /// AND, like `.atLeast`, it must clear the body-style token's own fixed `min == max == lh`. Leaving
+    /// that `maximumLineHeight` cap in place clamps `naturalHeight * ratio` back down to `lh`, silently
+    /// squeezing a document that asked for `w:line="260"` (1.083×) into the app's tighter fixed rhythm —
+    /// the "줄간격이 너무 타이트" bug. A multiple must govern alone, with no fixed floor or cap.
+    func testLineHeightMultipleSetsLineHeightMultipleUnscaledAndClearsAnyFixedCap() {
         var format = ParagraphFormat()
         format.lineHeight = .multiple(1.5)
         let out = OfficeTextBuilder.build([.paragraph(spans: [span("Body")], format: format)],
                                           theme: theme, documentDefaultFontSize: theme.baseFontSize / 2)
-        XCTAssertEqual(paragraphStyle(in: out).lineHeightMultiple, 1.5)
+        let style = paragraphStyle(in: out)
+        XCTAssertEqual(style.lineHeightMultiple, 1.5)
+        // Cap cleared so a document LOOSER than the floor (1.5× here) expands freely.
+        XCTAssertEqual(style.maximumLineHeight, 0)
+        // Minimum is the readability floor — set, though it doesn't bind here (1.5× > floor).
+        XCTAssertEqual(style.minimumLineHeight, theme.baseFontSize * OfficeStyle(theme: theme).bodyMinLineHeightRatio)
+    }
+
+    /// A near-single line rule (`w:line="260"` = 1.083×, this doc's actual value) measured against
+    /// the substituted body font renders far tighter than markdown body; the floor keeps office body
+    /// readable. The multiple is still set (a document asking for MORE than the floor gets it), but
+    /// the minimum guarantees a tight document never drops below the floor.
+    func testTightLineMultipleIsFlooredForReadability() {
+        var format = ParagraphFormat()
+        format.lineHeight = .multiple(260.0 / 240.0)  // 1.083×, this document's own w:line/lineRule
+        let out = OfficeTextBuilder.build([.paragraph(spans: [span("Body")], format: format)],
+                                          theme: theme, documentDefaultFontSize: theme.baseFontSize)
+        let style = paragraphStyle(in: out)
+        XCTAssertEqual(style.minimumLineHeight, theme.baseFontSize * OfficeStyle(theme: theme).bodyMinLineHeightRatio)
+        XCTAssertEqual(style.maximumLineHeight, 0)
     }
 
     /// `.exact` sets BOTH `minimumLineHeight` and `maximumLineHeight` to the same scaled point

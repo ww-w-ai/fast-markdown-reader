@@ -475,11 +475,10 @@ enum OdtReader: OfficeDocumentReader {
         var outlineLevel: Int? = nil
         var rtl = false
         var alignment: NSTextAlignment? = nil
-        /// P2b — this reader migrates the VOCABULARY only: ODF's `style:tab-stop` also carries
-        /// `style:type`/`style:leader-text` (its own alignment/leader equivalents), but reading
-        /// those is out of this sprint's scope (see the sprint brief). Every stop resolved here is
-        /// therefore `TabStop(position:)`'s default `.left`/`.none`, identical to how a bare
-        /// `CGFloat` position rendered before this type existed.
+        /// Each `style:tab-stop`'s `style:position` plus its `style:type` (alignment: left/center/
+        /// right/char→decimal) and leader (`style:leader-text`/`style:leader-style`) — parity with
+        /// `DocxReader.parseTabStops`, so an ODF TOC's right-aligned page number or a dotted leader
+        /// renders the same as its docx twin (they were previously flattened to a plain left tab).
         var tabStops: [TabStop] = []
         /// P4 — spacing/indent/line-height/shading/border, cascaded the SAME nearest-wins way as
         /// every other field here. Built up field-by-field in `resolveParagraphStyle` (each of
@@ -547,8 +546,30 @@ enum OdtReader: OfficeDocumentReader {
                 if let tabStopsNode = props.child("style:tab-stops") {
                     decl.tabStops = tabStopsNode.children
                         .filter { $0.name == "style:tab-stop" }
-                        .compactMap { $0.attributes["style:position"].flatMap(parseLength) }
-                        .map { TabStop(position: $0) }
+                        .compactMap { stop -> TabStop? in
+                            guard let pos = stop.attributes["style:position"].flatMap(parseLength) else { return nil }
+                            // ODF `style:type` (default `left`) → the same `TabAlignment` docx maps from
+                            // `w:val`; `char` is ODF's decimal-style stop. A right/decimal stop is what a
+                            // TOC page number or a right-aligned column rides — dropping it (the old
+                            // "position only" behaviour) rendered every such tab left-aligned.
+                            let alignment: TabAlignment
+                            switch stop.attributes["style:type"] {
+                            case "center": alignment = .center
+                            case "right": alignment = .right
+                            case "char": alignment = .decimal
+                            default: alignment = .left
+                            }
+                            // ODF states the leader as its fill character (`style:leader-text`) and/or a
+                            // style keyword (`style:leader-style="dotted"`); map both onto `TabLeader`.
+                            let leader: TabLeader
+                            switch stop.attributes["style:leader-text"] {
+                            case ".": leader = .dot
+                            case "_": leader = .underscore
+                            case "-", "\u{2010}": leader = .hyphen
+                            default: leader = stop.attributes["style:leader-style"] == "dotted" ? .dot : .none
+                            }
+                            return TabStop(position: pos, alignment: alignment, leader: leader)
+                        }
                 }
                 // P4 — spacing/indent/line-height/shading/border, straight off this SAME element.
                 decl.spacingBefore = props.attributes["fo:margin-top"].flatMap(parseLength)
@@ -669,12 +690,16 @@ enum OdtReader: OfficeDocumentReader {
         var backgroundColor: NSColor? = nil
         var borderColor: NSColor? = nil
         var borderWidth: CGFloat? = nil
+        var verticalAlignment: CellVAlign? = nil
+        var padding: CGFloat? = nil
     }
 
     private struct TableCellStyleDecl {
         var backgroundColor: NSColor? = nil
         var borderColor: NSColor? = nil
         var borderWidth: CGFloat? = nil
+        var verticalAlignment: CellVAlign? = nil
+        var padding: CGFloat? = nil
         var parent: String? = nil
     }
 
@@ -695,6 +720,20 @@ enum OdtReader: OfficeDocumentReader {
                 let border = parseODFBorder(props)
                 decl.borderColor = border.color
                 decl.borderWidth = border.width
+                // ODF `style:vertical-align` (top/middle/bottom/automatic) → `CellVAlign`; `middle`
+                // is the odt spelling of docx's `center`, `automatic` means "no explicit alignment"
+                // and is left nil (TableBlockBuilder's own top default stands).
+                switch props.attributes["style:vertical-align"] {
+                case "top": decl.verticalAlignment = .top
+                case "middle": decl.verticalAlignment = .center
+                case "bottom": decl.verticalAlignment = .bottom
+                default: break
+                }
+                // ODF `fo:padding` is the uniform cell inset; the per-side `fo:padding-left` etc. are a
+                // fallback (Cell.padding is one uniform value, so take the first side that names one).
+                decl.padding = props.attributes["fo:padding"].flatMap(parseLength)
+                    ?? props.attributes["fo:padding-left"].flatMap(parseLength)
+                    ?? props.attributes["fo:padding-top"].flatMap(parseLength)
             }
             map[name] = decl
         }
@@ -707,7 +746,7 @@ enum OdtReader: OfficeDocumentReader {
     /// assumed unreachable.
     private static func resolveTableCellStyle(_ styleName: String, decls: [String: TableCellStyleDecl]) -> TableCellStyle {
         var result = TableCellStyle()
-        var have = (bg: false, borderColor: false, borderWidth: false)
+        var have = (bg: false, borderColor: false, borderWidth: false, valign: false, padding: false)
         var currentName: String? = styleName
         var visited = Set<String>()
         while let name = currentName {
@@ -717,6 +756,8 @@ enum OdtReader: OfficeDocumentReader {
             if !have.bg, let v = decl.backgroundColor { result.backgroundColor = v; have.bg = true }
             if !have.borderColor, let v = decl.borderColor { result.borderColor = v; have.borderColor = true }
             if !have.borderWidth, let v = decl.borderWidth { result.borderWidth = v; have.borderWidth = true }
+            if !have.valign, let v = decl.verticalAlignment { result.verticalAlignment = v; have.valign = true }
+            if !have.padding, let v = decl.padding { result.padding = v; have.padding = true }
             currentName = decl.parent
         }
         return result
@@ -1102,7 +1143,8 @@ enum OdtReader: OfficeDocumentReader {
                     let width = columnIndex < columnWidths.count ? columnWidths[columnIndex] : nil
                     cells.append(Cell(
                         blocks: blocks, rowSpan: rowSpan, colSpan: colSpan, backgroundColor: cellStyle?.backgroundColor,
-                        borderColor: cellStyle?.borderColor, borderWidth: cellStyle?.borderWidth, width: width))
+                        borderColor: cellStyle?.borderColor, borderWidth: cellStyle?.borderWidth, width: width,
+                        verticalAlignment: cellStyle?.verticalAlignment, padding: cellStyle?.padding))
                     columnIndex += 1
                 }
             case "table:covered-table-cell":

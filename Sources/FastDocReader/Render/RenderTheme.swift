@@ -122,6 +122,25 @@ struct MarkdownStyle {
 /// Office (.docx/.odt)-only rhythm: values no other format needs.
 struct OfficeStyle {
     let theme: RenderTheme
+    /// Readability FLOOR for office body line height, as a multiple of the paragraph's own font
+    /// size. A `.docx`/`.odt` commonly declares a near-single line rule (`w:line="260" w:lineRule=
+    /// "auto"` = 1.083×) that, measured against the reader's substituted body font (system font,
+    /// natural line ≈ 1.13× — SHORTER than the CJK fonts Word lays these against, ≈ 1.3×), renders
+    /// noticeably tighter than Word shows AND than this same reader's own MARKDOWN body (`lineHeight
+    /// Ratio` 1.45×). In a reader-first viewer, one editor rendering the same prose far tighter than
+    /// another reads as a defect, so office body never drops below this floor — while a document that
+    /// asks for MORE than the floor still gets exactly what it asked for (the floor is a minimum, the
+    /// maximum stays cleared). Kept a hair under `lineHeightRatio` so a deliberately-tightened
+    /// document still reads a touch denser than the app's own default, not identical to it.
+    var bodyMinLineHeightRatio: CGFloat { 1.4 }
+    /// Readability FLOOR for the gap AFTER an office body paragraph, as a multiple of the base font
+    /// size. A dense document commonly sets a tiny `w:after` (this doc: `w:after="30"` = 1.5pt on 206
+    /// of its paragraphs), which renders consecutive bullets/lines packed almost edge to edge — the
+    /// "따닥 붙어 있는" feeling — far tighter than this same reader's markdown body. So a POSITIVE
+    /// author gap never renders below this floor, while a LARGER gap (a section break's 9pt) is kept
+    /// as-is. A gap the author (or `contextualSpacing`) set to EXACTLY zero stays zero — that is a
+    /// deliberate "no space between these" the floor must not override.
+    var bodyMinParagraphSpacingRatio: CGFloat { 0.35 }
     /// Space BEFORE a heading — same shape as `MarkdownStyle`'s (roomier for H1/H2), kept as
     /// this format's own copy rather than merged into the base per the sprint's design (a value
     /// only one format uses lives on that format's branch, even when two branches happen to
