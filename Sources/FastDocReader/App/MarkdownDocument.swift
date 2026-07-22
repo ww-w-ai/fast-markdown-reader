@@ -358,6 +358,7 @@ final class MarkdownDocument: NSDocument {
         // path as the text is. Only the full re-render used to rebuild it, which is why the sidebar
         // quietly described the document as it was several edits ago.
         wc.reloadOutline()
+        wc.reloadCommentPanel()
         // Media inside the new fragment still needs its exact area reserved before it can draw —
         // same rule as a full render (invariant: size first, pixels later).
         DispatchQueue.main.async { [weak self, weak wc] in
@@ -502,7 +503,8 @@ final class MarkdownDocument: NSDocument {
         // already real by this point (set in `DocumentWindowController.init`/`display`).
         case .office: attr = OfficeTextBuilder.build(officeBlocks, theme: theme,
                                                       columnWidth: wc.textView.textContainer?.size.width ?? 800,
-                                                      documentDefaultFontSize: officeDefaultBodyFontSize)
+                                                      documentDefaultFontSize: officeDefaultBodyFontSize,
+                                                      comments: officeComments)
         }
         wc.display(attr)
         wc.window?.title = displayName ?? "fast-md-reader"

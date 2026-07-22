@@ -78,4 +78,12 @@ enum MDAttr {
     /// Value = `NSNumber` (CGFloat), the paragraph border's stroke width in points — see
     /// `paraBorderColor`.
     static let paraBorderWidth = NSAttributedString.Key("mdParaBorderWidth")
+    /// Value = `[Int]`, the DISPLAY number(s) (`OfficeComment.number`) of the reviewer comment(s)
+    /// whose range this span falls within — set by `OfficeTextBuilder` from `Span.commentIds`
+    /// resolved against the document's `officeComments` (P6a captured the ids; this is P6b's
+    /// number-carrying attribute). A build-time-only tag: nothing here draws anything — the
+    /// comments panel's highlight + number badge (`drawCommentMarks`) reads it at DRAW time, and
+    /// only while the panel is open, so setting this attribute never changes layout (invariant
+    /// 1/24) and a comment-free document (or one whose panel is closed) never differs on screen.
+    static let commentMark = NSAttributedString.Key("mdCommentMark")
 }

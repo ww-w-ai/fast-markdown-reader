@@ -160,3 +160,45 @@ func drawMDDecorations(_ lm: NSLayoutManager, _ storage: NSTextStorage,
         NSBezierPath(roundedRect: bar, xRadius: 1.5, yRadius: 1.5).fill()
     }
 }
+
+/// Draw the comments panel's body-side signal (P6b): a faint highlight behind every commented
+/// span plus a small circular number badge at its start — PAINT ONLY, called from the text view's
+/// background pass exactly like `drawMDDecorations` (same reasoning: it must sit under the
+/// selection highlight and glyphs, never invalidate layout, and cost nothing beyond a fill + a
+/// short string draw). The caller gates this entirely on whether the comments panel is open —
+/// closed, `MDAttr.commentMark` is never even enumerated, so a comment-free document and a
+/// comment-bearing one with the panel shut are visually and behaviourally identical.
+func drawCommentMarks(_ lm: NSLayoutManager, _ storage: NSTextStorage, _ container: NSTextContainer,
+                      glyphsToShow: NSRange, at origin: NSPoint) {
+    let charRange = lm.characterRange(forGlyphRange: glyphsToShow, actualGlyphRange: nil)
+    let whole = NSRange(location: 0, length: storage.length)
+    storage.enumerateAttribute(MDAttr.commentMark, in: charRange) { value, r0, _ in
+        guard let numbers = value as? [Int], !numbers.isEmpty else { return }
+        // Recover the FULL commented range (visible slice is clipped) — same reasoning as every
+        // other decoration here: one stable rect across scroll passes, not a per-strip sliver.
+        var range = r0
+        _ = storage.attribute(MDAttr.commentMark, at: r0.location, longestEffectiveRange: &range, in: whole)
+        let gr = lm.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+        let rect = lm.boundingRect(forGlyphRange: gr, in: container).offsetBy(dx: origin.x, dy: origin.y)
+        Palette.commentHighlight.setFill()
+        NSBezierPath(rect: rect).fill()
+
+        // Small numbered badge just above-left of where the commented text starts. Drawn here (the
+        // view's background/decoration pass), NOT as an NSTextAttachment — an attachment is a
+        // glyph, and inserting one would change the character stream and the layout (invariant 1's
+        // "size must never depend on what's drawn" applies just as much to "whether anything is
+        // drawn at all").
+        let label = numbers.map(String.init).joined(separator: ",")
+        let font = NSFont.systemFont(ofSize: 9, weight: .bold)
+        let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.white]
+        let textSize = (label as NSString).size(withAttributes: attrs)
+        let badgeSize = NSSize(width: max(14, textSize.width + 6), height: 14)
+        let badgeRect = NSRect(x: rect.minX - badgeSize.width - 2,
+                               y: rect.maxY - badgeSize.height,
+                               width: badgeSize.width, height: badgeSize.height)
+        Palette.commentBadgeBg.setFill()
+        NSBezierPath(roundedRect: badgeRect, xRadius: badgeSize.height / 2, yRadius: badgeSize.height / 2).fill()
+        (label as NSString).draw(at: NSPoint(x: badgeRect.midX - textSize.width / 2,
+                                             y: badgeRect.midY - textSize.height / 2), withAttributes: attrs)
+    }
+}

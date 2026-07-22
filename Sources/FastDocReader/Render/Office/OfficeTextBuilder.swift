@@ -30,15 +30,28 @@ enum OfficeTextBuilder {
     /// 11pt paragraph, AT ANY reading size) — and the reading-size setting still governs how big
     /// the document looks overall, which is the entire point of that setting and must never be
     /// silently overridden by what the document happened to be authored at.
+    /// `comments` (P6b) is `officeComments` from `MarkdownDocument` — used ONLY to resolve each
+    /// `Span.commentIds` entry to that comment's DISPLAY number (`OfficeComment.number`), via
+    /// `commentNumbers` below, so `MDAttr.commentMark` carries the number a reader recognizes
+    /// ("Comment 3") rather than the source's opaque id string. Threaded into headings/paragraphs/
+    /// list items (where a comment's anchor overwhelmingly lands); table-cell content does not
+    /// receive it — cells build through a separate, already-deep call chain
+    /// (`appendTable`→`cellContent`) and a comment anchored inside a table cell is rare enough that
+    /// widening that chain wasn't worth the added surface for this sprint.
     static func build(_ blocks: [OfficeBlock], theme: RenderTheme,
                       columnWidth: CGFloat = .greatestFiniteMagnitude,
-                      documentDefaultFontSize: CGFloat = 11) -> NSAttributedString {
+                      documentDefaultFontSize: CGFloat = 11,
+                      comments: [OfficeComment] = []) -> NSAttributedString {
         let result = NSMutableAttributedString()
         var blockSeq = 0
         // Ordered-list numbering state, keyed by nesting level. Lives for the whole build() call
         // (not per-block) because the restart rule below needs to see across blocks.
         var orderedCounters: [Int: Int] = [:]
         let fontSizeScale = documentDefaultFontSize > 0 ? theme.baseFontSize / documentDefaultFontSize : 1
+        // id → display number, built once per build() call (comments list is small; a dictionary
+        // avoids an O(n) scan per span).
+        var commentNumbers: [String: Int] = [:]
+        for c in comments { commentNumbers[c.id] = c.number }
 
         func tagBlock(from start: Int) {
             let r = NSRange(location: start, length: result.length - start)
@@ -61,7 +74,7 @@ enum OfficeTextBuilder {
             case let .heading(level, spans, rtl, alignment, tabStops, _):
                 result.append(spansAttributedString(spans, baseFont: theme.headingFont(level: level),
                                                      baseColor: theme.textColor, theme: theme,
-                                                     fontSizeScale: fontSizeScale))
+                                                     fontSizeScale: fontSizeScale, commentNumbers: commentNumbers))
                 // Tagged BEFORE the trailing newline is appended, so a substring of this range is
                 // exactly the heading's text — precisely what the outline sidebar reads
                 // (`OutlinePanel.reload` trims and shows it verbatim).
@@ -77,7 +90,7 @@ enum OfficeTextBuilder {
             case let .paragraph(spans, rtl, alignment, tabStops, _):
                 result.append(spansAttributedString(spans, baseFont: theme.bodyFont,
                                                      baseColor: theme.textColor, theme: theme,
-                                                     fontSizeScale: fontSizeScale))
+                                                     fontSizeScale: fontSizeScale, commentNumbers: commentNumbers))
                 result.append(NSAttributedString(string: "\n"))
                 result.addAttribute(.paragraphStyle,
                                     value: bodyParagraphStyle(theme: theme, rtl: rtl, alignment: alignment,
@@ -89,7 +102,7 @@ enum OfficeTextBuilder {
                 appendListItem(level: level, ordered: ordered, spans: spans, marker: marker, rtl: rtl,
                                alignment: alignment, tabStops: tabStops, into: result,
                                theme: theme, orderedCounters: &orderedCounters, fontSizeScale: fontSizeScale,
-                               format: format)
+                               format: format, commentNumbers: commentNumbers)
 
             case let .table(rows, headerRows, columnWidths, tableFormat):
                 appendTable(rows, headerRows: headerRows, columnWidths: columnWidths, tableFormat: tableFormat,
@@ -177,8 +190,13 @@ enum OfficeTextBuilder {
     /// for the model) — defaulted to `1` so every pre-sprint call site (this file's own cell/list
     /// helpers used to, and `OfficeTextBuilderTests`' direct calls still do, pass none) keeps
     /// meaning "don't rescale", i.e. `Span.fontSize` is already in the units the caller wants.
+    /// `commentNumbers` (P6b) maps a comment's source id (`Span.commentIds` entries) to its DISPLAY
+    /// number — see `build`'s doc. Defaults to empty so every pre-P6b call site (every test, and
+    /// the table-cell chain — see `build`'s doc for why cells don't thread this) keeps compiling
+    /// and behaving exactly as before: a span with no matching number gets no `MDAttr.commentMark`.
     static func spansAttributedString(_ spans: [Span], baseFont: NSFont, baseColor: NSColor,
-                                      theme: RenderTheme, fontSizeScale: CGFloat = 1) -> NSAttributedString {
+                                      theme: RenderTheme, fontSizeScale: CGFloat = 1,
+                                      commentNumbers: [String: Int] = [:]) -> NSAttributedString {
         let out = NSMutableAttributedString()
         for span in spans {
             var font = baseFont
@@ -281,6 +299,13 @@ enum OfficeTextBuilder {
             }
             if !span.bookmarks.isEmpty {
                 attrs[MDAttr.bookmarkTarget] = span.bookmarks
+            }
+            // P6b: a span whose ids resolve to a known comment gets the DISPLAY number(s) tagged —
+            // an id with no match (comments capture failed to find it, or a stale/dangling id) is
+            // silently skipped rather than surfacing a "Comment ?" the reader can't act on.
+            if !span.commentIds.isEmpty {
+                let numbers = span.commentIds.compactMap { commentNumbers[$0] }
+                if !numbers.isEmpty { attrs[MDAttr.commentMark] = numbers }
             }
             // An explicitly-marked run (docx `w:rPr/w:rtl`) gets TextKit's own run-level embedding
             // override — the same mechanism a Unicode RLE/PDF control character would produce, just
@@ -539,7 +564,8 @@ enum OfficeTextBuilder {
                                        rtl: Bool = false, alignment: NSTextAlignment? = nil,
                                        tabStops: [TabStop] = [], into result: NSMutableAttributedString,
                                        theme: RenderTheme, orderedCounters: inout [Int: Int],
-                                       fontSizeScale: CGFloat = 1, format: ParagraphFormat? = nil) {
+                                       fontSizeScale: CGFloat = 1, format: ParagraphFormat? = nil,
+                                       commentNumbers: [String: Int] = [:]) {
         let marker: String
         if let suppliedMarker {
             marker = suppliedMarker + "\t"
@@ -566,7 +592,7 @@ enum OfficeTextBuilder {
         result.append(NSAttributedString(string: marker,
             attributes: [.font: theme.bodyFont, .foregroundColor: theme.textColor]))
         result.append(spansAttributedString(spans, baseFont: theme.bodyFont, baseColor: theme.textColor,
-                                            theme: theme, fontSizeScale: fontSizeScale))
+                                            theme: theme, fontSizeScale: fontSizeScale, commentNumbers: commentNumbers))
         result.append(NSAttributedString(string: "\n"))
         result.addAttribute(.paragraphStyle,
                             value: listParagraphStyle(markerX: markerX, textX: textX, theme: theme, rtl: rtl,

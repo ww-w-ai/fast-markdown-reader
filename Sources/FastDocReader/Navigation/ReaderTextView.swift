@@ -17,6 +17,14 @@ final class ReaderTextView: NSTextView {
 
     override var acceptsFirstResponder: Bool { true }
 
+    /// P6b: whether the comments panel is currently open. Gates `drawCommentMarks` entirely — set
+    /// by the window controller's toggle, never read/written from anywhere else. Setting it forces
+    /// a repaint (the highlight/badges must appear or vanish the instant the panel opens/closes,
+    /// not wait for the next unrelated redraw) but never touches layout — see that function's doc.
+    var commentsVisible = false {
+        didSet { if oldValue != commentsVisible { setNeedsDisplay(visibleRect) } }
+    }
+
     /// Draw block decorations (code cards, inline-code chips, rules, quote bars) in the view's
     /// BACKGROUND pass so they sit beneath the selection highlight and glyphs — otherwise an
     /// opaque code card painted by the layout manager hides the selection inside it.
@@ -31,6 +39,12 @@ final class ReaderTextView: NSTextView {
         drawReadingLine(lm, tc)   // under the decorations and glyphs — it's ambient, not a highlight
         let glyphRange = lm.glyphRange(forBoundingRect: visibleRect, in: tc)
         drawMDDecorations(lm, storage, tc, glyphsToShow: glyphRange, at: textContainerOrigin)
+        // Comment highlight + number badges — ONLY while the panel is open. Closed, this function
+        // isn't even called, so a comment-bearing document with the panel shut costs nothing beyond
+        // the (already-set, harmless) MDAttr.commentMark attribute sitting unread in the storage.
+        if commentsVisible {
+            drawCommentMarks(lm, storage, tc, glyphsToShow: glyphRange, at: textContainerOrigin)
+        }
     }
 
     /// A faint band across the line the reading cursor sits on, so a glance finds your place after a

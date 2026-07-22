@@ -110,6 +110,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let toc = viewMenu.addItem(withTitle: "Table of Contents",
                                    action: Selector(("toggleTableOfContents:")), keyEquivalent: "t")
         toc.keyEquivalentModifierMask = []   // a bare letter, like the block keys E/I/D/U/J
+        // P6b: comments panel — greyed out (`validateMenuItem`) for any document that has none.
+        let comments = viewMenu.addItem(withTitle: "Comments",
+                                        action: Selector(("toggleComments:")), keyEquivalent: "c")
+        comments.keyEquivalentModifierMask = [.command, .option]
         viewMenu.addItem(.separator())
         viewMenu.addItem(withTitle: "Reload", action: Selector(("reloadDocument:")), keyEquivalent: "r")
 

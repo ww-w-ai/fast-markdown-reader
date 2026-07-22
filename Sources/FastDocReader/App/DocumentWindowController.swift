@@ -9,6 +9,11 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
     let textView: ReaderTextView
     private let scrollView = NSScrollView()
     private let outline = OutlinePanel(frame: NSRect(x: 0, y: 0, width: OutlinePanel.defaultWidth, height: 400))
+    // P6b: the right-side comments panel — an INSPECTOR split item (trailing), distinct from the
+    // outline's SIDEBAR item (leading). Both live on the same `splitVC`; `NSSplitViewController`
+    // treats "sidebar" and "inspector" as independent kinds; see invariant 26/27's reasoning for
+    // why this must be a real split item rather than a hand-built overlay.
+    private let commentPanel = CommentPanel(frame: NSRect(x: 0, y: 0, width: CommentPanel.defaultWidth, height: 400))
     // A real NSSplitViewController with a `sidebar` item, not a hand-built NSSplitView. That is
     // what makes the panel LOOK like a Mac sidebar — the inset rounded panel, the system material,
     // the toolbar's ⌥⌘S toggle sitting beside the traffic lights, the divider that tracks it. Every
@@ -25,6 +30,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         return p
     }()
     private var sidebarItem: NSSplitViewItem!
+    private var commentsItem: NSSplitViewItem!
 
     // MARK: R5 — read-only badge + "Edit in <App>" (office documents only)
     private let officeBadge = NSTextField(labelWithString: "Read-only")
@@ -94,10 +100,22 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         contentVC.view = scrollView
         splitVC.addSplitViewItem(sidebarItem)
         splitVC.addSplitViewItem(NSSplitViewItem(viewController: contentVC))
+        // P6b: the comments panel as a trailing INSPECTOR item, added AFTER content so it sits on
+        // the right. Hidden by default (owner's decision, verbatim) — a document with no comments
+        // (or one whose panel hasn't been asked for) shows nothing extra.
+        let commentsVC = NSViewController()
+        commentsVC.view = commentPanel
+        commentsItem = NSSplitViewItem(inspectorWithViewController: commentsVC)
+        commentsItem.minimumThickness = 220
+        commentsItem.maximumThickness = 420
+        commentsItem.canCollapse = true
+        commentsItem.isCollapsed = true
+        splitVC.addSplitViewItem(commentsItem)
         // Old name kept on purpose after the rename — a defaults key for the remembered sidebar
         // width, not a visible identifier. See the matching note on the window frame autosave.
         splitVC.splitView.autosaveName = "FastMDReaderSidebar"
         outline.onSelect = { [weak self] charIndex in self?.goToOutlineEntry(charIndex) }
+        commentPanel.onSelect = { [weak self] number in self?.goToComment(number: number) }
         window.contentViewController = splitVC
         // The sidebar button goes in a TITLEBAR ACCESSORY, not a toolbar. Measured, twice: this
         // macOS lays toolbar items out trailing — with the title leading — so a toolbar button ends
@@ -311,6 +329,57 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         window?.makeFirstResponder(textView)
     }
 
+    // MARK: - Comments panel (P6b, ⌥⌘C)
+
+    private var isCommentsVisible = false
+
+    /// Toggle the right-side comments panel. Off for a document with no comments — same reasoning
+    /// `toggleTableOfContents` gives for an empty outline (a panel taking a fifth of the window that
+    /// teaches the reader the feature is broken).
+    @objc func toggleComments(_ sender: Any?) {
+        guard let doc = document as? MarkdownDocument else { return }
+        reloadCommentPanel()
+        guard !doc.officeComments.isEmpty || isCommentsVisible else { NSSound.beep(); return }
+        // Same freeze-during-slide treatment the outline toggle uses (see its own comment): the
+        // text column doesn't change width here — only the trailing inspector does — but reflow is
+        // still suspended so a resize-triggered relayout can't race the split animation.
+        let anchor = readingAnchor()
+        suspendReflow = true
+        commentsItem.animator().isCollapsed.toggle()
+        isCommentsVisible = !commentsItem.isCollapsed
+        textView.commentsVisible = isCommentsVisible
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            guard let self else { return }
+            self.reflow(keeping: anchor)
+            self.reloadCommentPanel()
+        }
+    }
+
+    /// Rebuild the panel's list from the current document — called from every place that renders
+    /// (both `display(_:)` and the splice-edit path), the same "both render paths" discipline
+    /// `reloadOutline()` follows (invariant 23), so the panel never shows a stale list.
+    func reloadCommentPanel() {
+        guard let doc = document as? MarkdownDocument else { commentPanel.reload(from: []); return }
+        commentPanel.reload(from: doc.officeComments)
+    }
+
+    /// Clicking a comment row scrolls the body to that comment's first anchored span — found by
+    /// scanning `MDAttr.commentMark` for the matching NUMBER, the same attribute the draw pass
+    /// reads. A comment the body never anchors (see `OfficeComment.number`'s doc) has no range to
+    /// find; nothing happens, same as a dead cross-reference (`AnchorResolver`'s own posture).
+    private func goToComment(number: Int) {
+        guard let storage = textView.textStorage else { return }
+        var found: Int?
+        storage.enumerateAttribute(MDAttr.commentMark, in: NSRange(location: 0, length: storage.length)) { value, range, stop in
+            guard let numbers = value as? [Int], numbers.contains(number) else { return }
+            found = range.location
+            stop.pointee = true
+        }
+        guard let charIndex = found else { return }
+        textView.setSelectedRange(NSRange(location: charIndex, length: 0))
+        scrollCharToTop(charIndex)
+    }
+
     // MARK: Toolbar (the sidebar button)
 
     private func sidebarButtonView() -> NSView {
@@ -483,7 +552,20 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
             item.title = isOutlineVisible ? "Hide Table of Contents" : "Table of Contents"
             return canShowTableOfContents
         }
+        if item.action == #selector(toggleComments(_:)) {
+            item.title = isCommentsVisible ? "Hide Comments" : "Comments"
+            return canShowComments
+        }
         return true
+    }
+
+    /// Enabled only where the panel means something: an office document that actually has
+    /// comments. (Once open it stays enabled/toggle-able even if a later reload finds zero — same
+    /// posture `guard !doc.officeComments.isEmpty || isCommentsVisible` already takes in the toggle
+    /// itself, so the menu and the action never disagree about whether closing is allowed.)
+    var canShowComments: Bool {
+        guard let doc = document as? MarkdownDocument else { return false }
+        return !doc.officeComments.isEmpty || isCommentsVisible
     }
 
     /// Enabled only where a table of contents means something: markdown, with headings in it.
@@ -510,6 +592,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         textView.textStorage?.setAttributedString(attributed)
         textView.recomputeHeadingOffsets()
         reloadOutline()
+        reloadCommentPanel()
         updateOfficeAccessory()
         textView.resetCaret()
         window?.makeFirstResponder(textView)

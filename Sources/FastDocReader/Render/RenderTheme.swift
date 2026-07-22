@@ -40,6 +40,13 @@ enum Palette {
     static let tableBorder     = NSColor.dynamic(light: NSColor(rgb: 0x37352F, alpha: 0.16),
                                                  dark:  NSColor(rgb: 0xFFFFFF, alpha: 0.16))
     static let tableHeaderBg   = NSColor(rgb: 0x878378, alpha: 0.10)   // warm neutral, both modes
+    // P6b: comment highlight — a faint amber wash behind a commented span (only drawn while the
+    // comments panel is open, see `drawCommentMarks`), and the number badge it's paired with. Amber
+    // rather than the reading-line's blue tint so the two "you should look here" signals never read
+    // as the same kind of thing.
+    static let commentHighlight = NSColor.dynamic(light: NSColor(rgb: 0xE9A23B, alpha: 0.16),
+                                                  dark:  NSColor(rgb: 0xE9A23B, alpha: 0.22))
+    static let commentBadgeBg   = NSColor(rgb: 0xE9A23B)   // solid amber, both modes
 }
 
 struct RenderTheme {
