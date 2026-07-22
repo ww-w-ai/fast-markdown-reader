@@ -1205,6 +1205,49 @@ final class OfficeTextBuilderTests: XCTestCase {
         XCTAssertEqual(block.valueType(for: .width), .absoluteValueType)
     }
 
+    // MARK: P3 — grid-ratio column widths (`OfficeBlock.table.columnWidths`)
+
+    /// A table whose `columnWidths` matches the derived column count switches EVERY column to a
+    /// percentage of the source's own grid ratios (20/20/60 for 100/100/300pt) — this is the fix
+    /// for jagged columns: the per-cell absolute width path (`Cell.width`) is bypassed entirely
+    /// once a usable grid is present.
+    func testGridColumnWidthsBecomePercentagesThatSumToOneHundred() {
+        let rows: [[Cell]] = [[
+            Cell(spans: [span("A")]), Cell(spans: [span("B")]), Cell(spans: [span("C")]),
+        ]]
+        let out = build([.table(rows: rows, headerRows: 0, columnWidths: [100, 100, 300])])
+        let blocks = tableBlocks(in: out).sorted { $0.startingColumn < $1.startingColumn }
+        XCTAssertEqual(blocks.map { $0.valueType(for: .width) }, [.percentageValueType, .percentageValueType, .percentageValueType])
+        let widths = blocks.map { $0.value(for: .width) }
+        for (actual, expected) in zip(widths, [CGFloat(20), 20, 60]) {
+            XCTAssertEqual(actual, expected, accuracy: 0.001)
+        }
+    }
+
+    /// A merged cell (`colSpan: 2`) gets the SUM of the two grid columns it covers, not just the
+    /// first one — 20 + 20 = 40 for the wide cell, 60 for the lone remaining column.
+    func testMergedCellGetsTheSumOfItsCoveredColumnsPercentages() {
+        let rows: [[Cell]] = [[
+            Cell(spans: [span("Wide")], colSpan: 2), Cell(spans: [span("C")]),
+        ]]
+        let out = build([.table(rows: rows, headerRows: 0, columnWidths: [100, 100, 300])])
+        let blocks = tableBlocks(in: out).sorted { $0.startingColumn < $1.startingColumn }
+        XCTAssertEqual(blocks.count, 2)
+        XCTAssertEqual(blocks[0].columnSpan, 2)
+        XCTAssertEqual(blocks[0].value(for: .width), 40, accuracy: 0.001)
+        XCTAssertEqual(blocks[0].valueType(for: .width), .percentageValueType)
+        XCTAssertEqual(blocks[1].value(for: .width), 60, accuracy: 0.001)
+    }
+
+    /// `columnWidths` whose count doesn't match the table's own derived column count (a malformed
+    /// grid) is exactly "no grid known" — the pre-existing per-cell/auto path renders unchanged.
+    func testMismatchedColumnWidthsCountFallsBackToPerCellLayout() {
+        let rows: [[Cell]] = [[Cell(spans: [span("A")]), Cell(spans: [span("B")])]]
+        let out = build([.table(rows: rows, headerRows: 0, columnWidths: [100, 100, 300])])
+        let block = try! XCTUnwrap(tableBlocks(in: out).first)
+        XCTAssertNotEqual(block.valueType(for: .width), .percentageValueType)
+    }
+
     /// The pre-sprint construction path (`Cell(spans:)`) leaves all four fields `nil` — the theme's
     /// existing defaults (no shading, `Palette.tableBorder` at 1pt, auto column layout) must be
     /// exactly what a cell with no shading/border/width info renders as.

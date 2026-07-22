@@ -91,8 +91,9 @@ enum OfficeTextBuilder {
                                theme: theme, orderedCounters: &orderedCounters, fontSizeScale: fontSizeScale,
                                format: format)
 
-            case let .table(rows, headerRows):
-                appendTable(rows, headerRows: headerRows, into: result, theme: theme, fontSizeScale: fontSizeScale)
+            case let .table(rows, headerRows, columnWidths):
+                appendTable(rows, headerRows: headerRows, columnWidths: columnWidths, into: result, theme: theme,
+                            fontSizeScale: fontSizeScale)
 
             case let .image(id, size):
                 appendImage(id: id, size: size, columnWidth: columnWidth, into: result)
@@ -544,7 +545,8 @@ enum OfficeTextBuilder {
     /// row was a header (see `OfficeBlock.table`; guessing "row one" would misrepresent a
     /// headerless table). A cell shorter than the widest row leaves its trailing columns empty
     /// rather than collapsing the row.
-    private static func appendTable(_ rows: [[Cell]], headerRows: Int, into result: NSMutableAttributedString,
+    private static func appendTable(_ rows: [[Cell]], headerRows: Int, columnWidths: [CGFloat] = [],
+                                    into result: NSMutableAttributedString,
                                     theme: RenderTheme, fontSizeScale: CGFloat = 1) {
         guard rows.contains(where: { !$0.isEmpty }) else {
             result.append(NSAttributedString(string: "\n"))
@@ -562,7 +564,8 @@ enum OfficeTextBuilder {
                                                       width: cell.width)
             }
         }
-        result.append(TableBlockBuilder.build(rows: cellRows, headerRows: headerRows, theme: theme))
+        result.append(TableBlockBuilder.build(rows: cellRows, headerRows: headerRows, theme: theme,
+                                              columnWidths: columnWidths))
         result.append(NSAttributedString(string: "\n"))
     }
 
@@ -610,7 +613,7 @@ enum OfficeTextBuilder {
                 if result.length > 0, result.string.hasSuffix("\n") {
                     result.deleteCharacters(in: NSRange(location: result.length - 1, length: 1))
                 }
-            case let .table(nestedRows, _):
+            case let .table(nestedRows, _, _):
                 result.append(flattenTableToText(nestedRows, baseFont: baseFont, theme: theme))
             case let .image(id, size):
                 appendImage(id: id, size: size, columnWidth: .greatestFiniteMagnitude, into: result)

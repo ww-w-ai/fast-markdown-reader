@@ -356,7 +356,7 @@ final class OdtReaderTests: XCTestCase {
           <table:table-row><table:table-cell><text:p>A</text:p></table:table-cell></table:table-row>
         </table:table>
         """)
-        guard case .table(_, let headerRows) = blocks.first else { return XCTFail("expected a table block") }
+        guard case .table(_, let headerRows, _) = blocks.first else { return XCTFail("expected a table block") }
         XCTAssertEqual(headerRows, 0)
     }
 
@@ -538,7 +538,7 @@ final class OdtReaderTests: XCTestCase {
           </table:table-row>
         </table:table>
         """)
-        guard case .table(let rows, _) = blocks.first else { return XCTFail("expected a table block") }
+        guard case .table(let rows, _, _) = blocks.first else { return XCTFail("expected a table block") }
         // `Cell` holds `blocks`, not `spans`, since S7 — the reader still flattens a nested table
         // into a single `.paragraph` at parse time, so pull its spans back out for this assertion.
         let allText = rows.flatMap { $0 }.flatMap { $0.blocks }.flatMap { block -> [Span] in
@@ -1303,7 +1303,7 @@ final class OdtReaderTests: XCTestCase {
               <style:table-cell-properties fo:background-color="#EEEEEE" fo:border="1pt solid #000000"/>
             </style:style>
             """)
-        guard case .table(let rows, _) = blocks[0], let cell = rows.first?.first else { return XCTFail("expected a table cell") }
+        guard case .table(let rows, _, _) = blocks[0], let cell = rows.first?.first else { return XCTFail("expected a table cell") }
         XCTAssertNotNil(cell.backgroundColor)
         XCTAssertEqual(cell.borderWidth, 1)
         XCTAssertNotNil(cell.borderColor)
@@ -1323,7 +1323,7 @@ final class OdtReaderTests: XCTestCase {
               <style:table-cell-properties fo:border-top="2pt solid #123456"/>
             </style:style>
             """)
-        guard case .table(let rows, _) = blocks[0], let cell = rows.first?.first else { return XCTFail("expected a table cell") }
+        guard case .table(let rows, _, _) = blocks[0], let cell = rows.first?.first else { return XCTFail("expected a table cell") }
         XCTAssertEqual(cell.borderWidth, 2)
         XCTAssertNotNil(cell.borderColor)
     }
@@ -1339,7 +1339,7 @@ final class OdtReaderTests: XCTestCase {
             <style:style style:name="Parent" style:family="table-cell"><style:table-cell-properties fo:background-color="#00FF00"/></style:style>
             <style:style style:name="Child" style:family="table-cell" style:parent-style-name="Parent"/>
             """)
-        guard case .table(let rows, _) = blocks[0], let cell = rows.first?.first else { return XCTFail("expected a table cell") }
+        guard case .table(let rows, _, _) = blocks[0], let cell = rows.first?.first else { return XCTFail("expected a table cell") }
         XCTAssertNotNil(cell.backgroundColor)
     }
 
@@ -1355,7 +1355,7 @@ final class OdtReaderTests: XCTestCase {
             <style:style style:name="A" style:family="table-cell" style:parent-style-name="B"><style:table-cell-properties fo:background-color="#00FF00"/></style:style>
             <style:style style:name="B" style:family="table-cell" style:parent-style-name="A"/>
             """)
-        guard case .table(let rows, _) = blocks[0], let cell = rows.first?.first else { return XCTFail("expected a table cell") }
+        guard case .table(let rows, _, _) = blocks[0], let cell = rows.first?.first else { return XCTFail("expected a table cell") }
         XCTAssertNotNil(cell.backgroundColor)
     }
 
@@ -1377,7 +1377,7 @@ final class OdtReaderTests: XCTestCase {
             <style:style style:name="Col1" style:family="table-column"><style:table-column-properties style:column-width="1in"/></style:style>
             <style:style style:name="Col2" style:family="table-column"><style:table-column-properties style:column-width="2in"/></style:style>
             """)
-        guard case .table(let rows, _) = blocks[0] else { return XCTFail("expected a table") }
+        guard case .table(let rows, _, _) = blocks[0] else { return XCTFail("expected a table") }
         XCTAssertEqual(rows[0][0].width, 72)
         XCTAssertEqual(rows[0][1].width, 144)
     }
@@ -1403,7 +1403,7 @@ final class OdtReaderTests: XCTestCase {
             <style:style style:name="Col2" style:family="table-column"><style:table-column-properties style:column-width="1in"/></style:style>
             <style:style style:name="Col3" style:family="table-column"><style:table-column-properties style:column-width="3in"/></style:style>
             """)
-        guard case .table(let rows, _) = blocks[0] else { return XCTFail("expected a table") }
+        guard case .table(let rows, _, _) = blocks[0] else { return XCTFail("expected a table") }
         XCTAssertEqual(rows[0][0].width, 72)
         XCTAssertEqual(rows[0][1].width, 216)
     }
@@ -1412,7 +1412,7 @@ final class OdtReaderTests: XCTestCase {
         let blocks = try read(body: """
         <table:table><table:table-row><table:table-cell><text:p>A</text:p></table:table-cell></table:table-row></table:table>
         """)
-        guard case .table(let rows, _) = blocks[0] else { return XCTFail("expected a table") }
+        guard case .table(let rows, _, _) = blocks[0] else { return XCTFail("expected a table") }
         XCTAssertNil(rows[0][0].width)
     }
 
@@ -1463,7 +1463,7 @@ final class OdtReaderTests: XCTestCase {
             """))
         let archive = try ZipArchive(data: zip)
         let blocks = try DocumentTypes.readOffice(archive, extension: "odt")
-        guard case .table(let rows, _) = blocks.first, let cell = rows.first?.first else {
+        guard case .table(let rows, _, _) = blocks.first, let cell = rows.first?.first else {
             return XCTFail("expected a table with a cell")
         }
         XCTAssertEqual(cell.width, 72)

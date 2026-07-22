@@ -251,7 +251,7 @@ final class OfficeDocumentTests: XCTestCase {
     /// `MarkdownDocument.read` itself, not only `DocxReader.read` called directly.
     func testTableCellImageReachesOfficeBlocksThroughTheFullReadPathDocx() throws {
         let (doc, _) = try openOffice(fixtureDocxWithTableImage())
-        guard case .table(let rows, _) = doc.officeBlocks.first else { return XCTFail("expected a table block") }
+        guard case .table(let rows, _, _) = doc.officeBlocks.first else { return XCTFail("expected a table block") }
         let cellBlocks = rows.first?.first?.blocks ?? []
         XCTAssertTrue(cellBlocks.contains { if case .image = $0 { return true }; return false },
                       "the cell's image must survive the full read path, not just DocxReader.read directly")
@@ -260,7 +260,7 @@ final class OfficeDocumentTests: XCTestCase {
     /// S8 invariant 29 (odt): same guard, `OdtReader` side.
     func testTableCellImageReachesOfficeBlocksThroughTheFullReadPathOdt() throws {
         let (doc, _) = try openOffice(fixtureOdtWithTableImage(), ext: "odt", uti: "org.oasis-open.opendocument.text")
-        guard case .table(let rows, _) = doc.officeBlocks.first else { return XCTFail("expected a table block") }
+        guard case .table(let rows, _, _) = doc.officeBlocks.first else { return XCTFail("expected a table block") }
         let cellBlocks = rows.first?.first?.blocks ?? []
         XCTAssertTrue(cellBlocks.contains { if case .image = $0 { return true }; return false },
                       "the cell's image must survive the full read path, not just OdtReader.read directly")

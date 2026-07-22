@@ -319,7 +319,18 @@ enum OfficeBlock: Equatable {
     /// when the format can't tell you. DEFAULT TO 0 WHEN UNKNOWN, never 1 — an un-styled table is a
     /// faithful rendering of the source; a wrongly-bolded row is a lie about it (real contracts
     /// commonly have zero header rows — guessing "row one" bolds ordinary text).
-    case table(rows: [[Cell]], headerRows: Int)
+    /// `columnWidths` is the table's own grid column widths in POINTS, in left-to-right grid
+    /// order (docx `w:tbl/w:tblGrid/w:gridCol/@w:w`, twips converted the same way `cellWidth`
+    /// converts a per-cell `w:tcW`; odt column widths, P4) — the AUTHORITATIVE proportions Word
+    /// itself fills the table's width with, which is why they win over a per-cell `Cell.width`
+    /// (that field is a fallback for when no grid was readable at all, see its own doc comment).
+    /// Empty means "no grid known" — every markdown table (GFM has no such concept) and any docx
+    /// table whose `w:tblGrid` couldn't be read — and `TableBlockBuilder` falls back to its
+    /// pre-this-field per-cell/auto layout exactly as before this field existed. When non-empty
+    /// its count is expected to equal the table's own derived column count; a caller that can't
+    /// establish that (a malformed grid) should pass `[]` rather than a mismatched array — a
+    /// mismatch is treated as "unusable" and ignored, never partially applied.
+    case table(rows: [[Cell]], headerRows: Int, columnWidths: [CGFloat] = [])
     /// `id` is an opaque key a later sprint resolves to pixels (a docx relationship id, an odt
     /// href, a markdown source path, …) — this sprint only reserves the LAYOUT area, exactly like
     /// a not-yet-loaded markdown image (invariant 1: reserved size must never depend on whether

@@ -1700,7 +1700,30 @@ enum DocxReader: OfficeDocumentReader {
             guard isHeader else { break }
             headerRows += 1
         }
-        return .table(rows: rows, headerRows: headerRows)
+        return .table(rows: rows, headerRows: headerRows, columnWidths: tableGridColumnWidths(tbl))
+    }
+
+    /// `w:tbl/w:tblGrid/w:gridCol/@w:w` — the table's OWN authoritative column widths (ECMA-376
+    /// §17.4.48/§17.4.49), in document order, twips converted to points the same way `cellWidth`
+    /// converts a per-cell `w:tcW` (÷20). This is what fixes jagged columns: `w:tcW` on individual
+    /// cells routinely fails to sum to the table's full width, but `w:tblGrid` is what Word itself
+    /// treats as the ground truth for how the columns are proportioned. No `w:tblGrid`, or one with
+    /// no `w:gridCol` children at all, returns `[]` — "no grid known" — so `TableBlockBuilder` falls
+    /// back to its pre-existing per-cell/auto layout rather than being handed an empty proportion
+    /// to normalise against a zero sum.
+    private static func tableGridColumnWidths(_ tbl: XMLNode) -> [CGFloat] {
+        guard let grid = tbl.child("w:tblGrid") else { return [] }
+        let cols = grid.children.filter { $0.name == "w:gridCol" }
+        guard !cols.isEmpty else { return [] }
+        // A malformed/unparseable width anywhere in the grid makes the WHOLE grid unusable —
+        // same posture as the count-mismatch case `OfficeBlock.table`'s doc comment describes:
+        // never partially apply an untrustworthy grid.
+        var widths: [CGFloat] = []
+        for col in cols {
+            guard let wStr = col.attributes["w:w"], let value = Double(wStr), value > 0 else { return [] }
+            widths.append(CGFloat(value / 20))
+        }
+        return widths
     }
 
     /// A cell's own shading — `w:tcPr/w:shd/@w:fill`, a literal hex colour, or the string

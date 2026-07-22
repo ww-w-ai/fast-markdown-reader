@@ -40,7 +40,14 @@ enum TableBlockBuilder {
     ///   - headerRows: how many LEADING rows are shaded/bold. `0` means none — a real contract can
     ///     be headerless, and shading row one anyway would misrepresent it (same reasoning
     ///     `OfficeTextBuilder.appendTable`'s doc comment gives for its own header handling).
-    static func build(rows: [[CellContent]], headerRows: Int, theme: RenderTheme) -> NSAttributedString {
+    ///   - columnWidths: the SOURCE's own grid column widths (points, left-to-right), authoritative
+    ///     over any per-cell `CellContent.width` — see `OfficeBlock.table`'s doc comment. Empty (the
+    ///     default, and every markdown table) or a count that doesn't match the grid derived below
+    ///     leaves this function's PRE-EXISTING per-cell/auto layout completely untouched; only a
+    ///     usable grid switches a placed cell's width source from `CellContent.width` (absolute) to
+    ///     a percentage of these ratios (see the per-placement loop below).
+    static func build(rows: [[CellContent]], headerRows: Int, theme: RenderTheme,
+                       columnWidths: [CGFloat] = []) -> NSAttributedString {
         let result = NSMutableAttributedString()
         guard !rows.isEmpty else { return result }
 
@@ -75,6 +82,22 @@ enum TableBlockBuilder {
             }
         }
         guard ncol > 0 else { return result }
+
+        // Normalise the source's grid widths to PERCENTAGES that sum to 100 — proportions of the
+        // already-100%-wide table, not absolute sizes, so they must never be scaled by
+        // `fontSizeScale` (unlike a font-derived size, invariant 24's zoom multiplies on top of
+        // these, not into them) and never fed in as raw twips (that would be the exact landmine
+        // `cellWidth`'s doc comment already warns about for absolute cell widths). Only used when
+        // the grid actually matches this table's own derived column count — a mismatch (a
+        // malformed/edited document) is treated exactly like "no grid known" rather than partially
+        // applied to the wrong columns.
+        var columnPercentages: [CGFloat] = []
+        if columnWidths.count == ncol {
+            let sum = columnWidths.reduce(0, +)
+            if sum > 0 {
+                columnPercentages = columnWidths.map { $0 / sum * 100 }
+            }
+        }
 
         // Pad the gaps. A row can carry fewer anchors than the grid is wide — which is exactly what a
         // vertically merged Word row looks like — and a position left with no block at all renders as
@@ -115,7 +138,18 @@ enum TableBlockBuilder {
             } else if header {
                 block.backgroundColor = Palette.tableHeaderBg
             }
-            if let width = placement.cell?.width {
+            if !columnPercentages.isEmpty {
+                // A spanned cell gets the SUM of every grid column it covers — that is what keeps
+                // a merged cell's width faithful to the columns underneath it (see
+                // `OfficeBlock.table`'s doc comment: `rows[row].count` is not the column count once
+                // a span is wider than 1, so this must sum `placement.colSpan` columns, not just
+                // read one). This REPLACES the absolute per-cell width below, not adds to it — a
+                // table can't be sized by both an absolute width and a percentage at once.
+                let coveredCols = min(placement.col + placement.colSpan, columnPercentages.count)
+                let pct = (placement.col..<max(placement.col, coveredCols))
+                    .reduce(CGFloat(0)) { $0 + columnPercentages[$1] }
+                block.setContentWidth(pct, type: .percentageValueType)
+            } else if let width = placement.cell?.width {
                 block.setContentWidth(width, type: .absoluteValueType)
             }
             let ps = NSMutableParagraphStyle()

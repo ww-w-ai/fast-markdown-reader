@@ -74,6 +74,26 @@ final class MarkdownRendererTests: XCTestCase {
         XCTAssertEqual(bodyRows, [1, 2])
     }
 
+    /// GFM tables have no `w:tblGrid`-equivalent concept, so `MarkdownRenderer` never constructs
+    /// an `OfficeBlock.table` at all — `visitTable` builds `TableBlockBuilder.CellContent` rows
+    /// directly and calls `TableBlockBuilder.build` with `columnWidths` at its default (`[]`).
+    /// This locks that in: a markdown table's cells must carry NO percentage-typed content width
+    /// (P3's grid-ratio fix is a docx-table-only change).
+    func testGFMTableUsesNoPerColumnPercentageWidth() {
+        let s = render("| A | B |\n|---|---|\n| 1 | 2 |")
+        var blocks: [NSTextTableBlock] = []
+        s.enumerateAttribute(.paragraphStyle, in: NSRange(location: 0, length: s.length)) { value, _, _ in
+            guard let ps = value as? NSParagraphStyle else { return }
+            for tb in ps.textBlocks {
+                if let block = tb as? NSTextTableBlock { blocks.append(block) }
+            }
+        }
+        XCTAssertFalse(blocks.isEmpty)
+        for block in blocks {
+            XCTAssertNotEqual(block.valueType(for: .width), .percentageValueType)
+        }
+    }
+
     func testHeadingIsTaggedWithMDAttr() {
         // Contract for keyboard heading-jump (C5): every heading run carries MDAttr.heading.
         let s = render("# One\n\nbody\n\n## Two")

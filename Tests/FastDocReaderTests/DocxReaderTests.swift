@@ -822,6 +822,38 @@ final class DocxReaderTests: XCTestCase {
         ], headerRows: 0)])
     }
 
+    // MARK: Tables — w:tblGrid → columnWidths (P3, jagged-column fix)
+
+    /// The table's own `w:tblGrid` is the AUTHORITATIVE column-width source — 2000/2000/6000
+    /// twips converted to 100/100/300 points (÷20, the same conversion `cellWidth` uses for a
+    /// per-cell `w:tcW`), in grid order.
+    func testTblGridColumnsAreReadAsPointsInGridOrder() throws {
+        let blocks = try read(document: """
+        <w:tbl>
+          <w:tblGrid>
+            <w:gridCol w:w="2000"/>
+            <w:gridCol w:w="2000"/>
+            <w:gridCol w:w="6000"/>
+          </w:tblGrid>
+          <w:tr>\(tc(para("A")))\(tc(para("B")))\(tc(para("C")))</w:tr>
+        </w:tbl>
+        """)
+        guard case .table(_, _, let columnWidths) = blocks.first else { return XCTFail("expected a table block") }
+        XCTAssertEqual(columnWidths, [100, 100, 300])
+    }
+
+    /// A table with no `w:tblGrid` at all reports `columnWidths: []` — "no grid known" — so the
+    /// builder falls back to its pre-existing per-cell/auto layout.
+    func testTableWithNoTblGridReportsEmptyColumnWidths() throws {
+        let blocks = try read(document: """
+        <w:tbl>
+          <w:tr>\(tc(para("A")))\(tc(para("B")))</w:tr>
+        </w:tbl>
+        """)
+        guard case .table(_, _, let columnWidths) = blocks.first else { return XCTFail("expected a table block") }
+        XCTAssertEqual(columnWidths, [])
+    }
+
     /// A content control inside a table cell — a very common Word form/template shape ("click
     /// here to enter a value" inside a template row) — must not make that cell's text disappear.
     /// This is the THIRD place `w:sdt` can wrap real content (body-level and inline-in-a-paragraph
@@ -948,7 +980,7 @@ final class DocxReaderTests: XCTestCase {
         // alongside a nested table whose own cell says "Nested" — both must survive somewhere.
         let cellContent = para("Outer") + "<w:tbl><w:tr>\(tc(para("Nested")))</w:tr></w:tbl>"
         let blocks = try read(document: "<w:tbl><w:tr>\(tc(cellContent))</w:tr></w:tbl>")
-        guard case .table(let rows, _) = blocks.first else { return XCTFail("expected a table block") }
+        guard case .table(let rows, _, _) = blocks.first else { return XCTFail("expected a table block") }
         // `Cell` holds `blocks`, not `spans`, since S7 — the reader still flattens a nested table
         // into a single `.paragraph` at parse time, so pull its spans back out for this assertion.
         let allText = rows.flatMap { $0 }.flatMap { $0.blocks }.flatMap { block -> [Span] in
@@ -2328,7 +2360,7 @@ final class DocxReaderTests: XCTestCase {
         let blocks = try read(document: """
         <w:tbl><w:tr><w:tc><w:tcPr><w:shd w:fill="FFCC00"/></w:tcPr><w:p><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
         """)
-        guard case .table(let rows, _) = blocks.first else { return XCTFail("expected a table") }
+        guard case .table(let rows, _, _) = blocks.first else { return XCTFail("expected a table") }
         XCTAssertEqual(rows[0][0].backgroundColor, rgb("FFCC00"))
     }
 
@@ -2336,7 +2368,7 @@ final class DocxReaderTests: XCTestCase {
         let blocks = try read(document: """
         <w:tbl><w:tr><w:tc><w:tcPr><w:shd w:fill="auto"/></w:tcPr><w:p><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
         """)
-        guard case .table(let rows, _) = blocks.first else { return XCTFail("expected a table") }
+        guard case .table(let rows, _, _) = blocks.first else { return XCTFail("expected a table") }
         XCTAssertNil(rows[0][0].backgroundColor)
     }
 
@@ -2344,7 +2376,7 @@ final class DocxReaderTests: XCTestCase {
         let blocks = try read(document: """
         <w:tbl><w:tr><w:tc><w:tcPr><w:tcBorders><w:top w:val="single" w:sz="8" w:color="336699"/></w:tcBorders></w:tcPr><w:p><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
         """)
-        guard case .table(let rows, _) = blocks.first else { return XCTFail("expected a table") }
+        guard case .table(let rows, _, _) = blocks.first else { return XCTFail("expected a table") }
         XCTAssertEqual(rows[0][0].borderColor, rgb("336699"))
         XCTAssertEqual(rows[0][0].borderWidth, 1)
     }
@@ -2355,7 +2387,7 @@ final class DocxReaderTests: XCTestCase {
         let blocks = try read(document: """
         <w:tbl><w:tr><w:tc><w:tcPr><w:tcBorders><w:top w:val="none"/><w:left w:val="single" w:sz="16" w:color="112233"/></w:tcBorders></w:tcPr><w:p><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
         """)
-        guard case .table(let rows, _) = blocks.first else { return XCTFail("expected a table") }
+        guard case .table(let rows, _, _) = blocks.first else { return XCTFail("expected a table") }
         XCTAssertEqual(rows[0][0].borderColor, rgb("112233"))
         XCTAssertEqual(rows[0][0].borderWidth, 2)
     }
@@ -2364,7 +2396,7 @@ final class DocxReaderTests: XCTestCase {
         let blocks = try read(document: """
         <w:tbl><w:tr><w:tc><w:tcPr><w:tcW w:w="2880" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
         """)
-        guard case .table(let rows, _) = blocks.first else { return XCTFail("expected a table") }
+        guard case .table(let rows, _, _) = blocks.first else { return XCTFail("expected a table") }
         XCTAssertEqual(rows[0][0].width, 144)
     }
 
@@ -2374,7 +2406,7 @@ final class DocxReaderTests: XCTestCase {
         let blocks = try read(document: """
         <w:tbl><w:tr><w:tc><w:tcPr><w:tcW w:w="2500" w:type="pct"/></w:tcPr><w:p><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
         """)
-        guard case .table(let rows, _) = blocks.first else { return XCTFail("expected a table") }
+        guard case .table(let rows, _, _) = blocks.first else { return XCTFail("expected a table") }
         XCTAssertNil(rows[0][0].width)
     }
 
