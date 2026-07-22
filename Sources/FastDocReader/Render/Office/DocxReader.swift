@@ -232,9 +232,26 @@ enum DocxReader: OfficeDocumentReader {
     /// `w:style`'s `w:pPr`. `tabStops == nil` means this style declared none (keep climbing);
     /// an EXPLICIT empty list never occurs from `parseTabStops` (see its own doc), so there is no
     /// "explicitly no tabs" state to lose by using `nil` for both meanings.
+    ///
+    /// The eight fields below (P2) are the SAME `w:pPr` reduced further, for the spacing/indent/
+    /// line-height/contextualSpacing cascade — each `nil` means "this level (docDefaults, one
+    /// style, or a paragraph's own direct `w:pPr`) didn't set that property", so the per-property
+    /// walk (`resolvedSpacingBefore` etc., and `resolvedParagraphFormat`'s docDefaults fallback)
+    /// keeps climbing for that one field alone, exactly like `alignment`/`tabStops` above.
+    /// `contextualSpacing` is `Bool?`, not `Bool`, for the same reason: a level that never mentions
+    /// `w:contextualSpacing` at all must be transparent to it (climb further), which a plain `Bool`
+    /// defaulting to `false` could never distinguish from an explicit `w:val="0"`.
     private struct ParaStyleProps {
         var alignment: NSTextAlignment?
         var tabStops: [CGFloat]?
+        var spacingBefore: CGFloat?
+        var spacingAfter: CGFloat?
+        var lineHeight: LineHeight?
+        var indentStart: CGFloat?
+        var indentEnd: CGFloat?
+        var firstLineIndent: CGFloat?
+        var hangingIndent: CGFloat?
+        var contextualSpacing: Bool?
     }
 
     private struct StyleInfo {
@@ -246,8 +263,16 @@ enum DocxReader: OfficeDocumentReader {
         var basedOn: [String: String] = [:]
         /// styleId → its own `w:rPr`, only for styles that set at least one of the four fields.
         var runProps: [String: RunStyleProps] = [:]
-        /// styleId → its own `w:pPr`'s `w:jc`/`w:tabs`, only for styles that set at least one.
+        /// styleId → its own `w:pPr`'s `w:jc`/`w:tabs`/spacing/indent/line-height/contextualSpacing,
+        /// only for styles that set at least one.
         var paraProps: [String: ParaStyleProps] = [:]
+        /// `word/styles.xml`'s `w:docDefaults/w:pPrDefault/w:pPr` — the document's absolute floor
+        /// for the P2 spacing/indent/line-height/contextualSpacing cascade (spec area 6, layer 1),
+        /// mirroring `documentDefaultBodyFontSize`'s own read of `w:rPrDefault/w:rPr/w:sz` a few
+        /// lines below. A document with no `styles.xml`, or one with no `w:docDefaults`/
+        /// `w:pPrDefault`, leaves every field of this `nil` — `resolvedParagraphFormat`'s floor
+        /// layer then simply contributes nothing, exactly like every other absent layer.
+        var docDefaultsParaProps: ParaStyleProps = ParaStyleProps()
         /// The document's theme colour scheme (`word/theme/theme1.xml`), keyed by scheme slot name
         /// (`"dk1"`, `"accent1"`, …) — carried ON `StyleInfo` rather than threaded as its own
         /// parameter through every function that already takes `styleInfo`, since every one of
@@ -277,6 +302,7 @@ enum DocxReader: OfficeDocumentReader {
               let data = try? archive.data(for: "word/styles.xml"),
               let root = try? buildTree(data)
         else { return info }
+        info.docDefaultsParaProps = parseParaStyleProps(root.child("w:docDefaults")?.child("w:pPrDefault")?.child("w:pPr"))
         for style in root.children where style.name == "w:style" {
             guard let id = style.attributes["w:styleId"] else { continue }
             if let val = style.child("w:pPr")?.child("w:outlineLvl")?.attributes["w:val"], let level = Int(val) {
@@ -290,7 +316,10 @@ enum DocxReader: OfficeDocumentReader {
                 info.runProps[id] = runProps
             }
             let paraProps = parseParaStyleProps(style.child("w:pPr"))
-            if paraProps.alignment != nil || paraProps.tabStops != nil {
+            if paraProps.alignment != nil || paraProps.tabStops != nil || paraProps.spacingBefore != nil
+                || paraProps.spacingAfter != nil || paraProps.lineHeight != nil || paraProps.indentStart != nil
+                || paraProps.indentEnd != nil || paraProps.firstLineIndent != nil || paraProps.hangingIndent != nil
+                || paraProps.contextualSpacing != nil {
                 info.paraProps[id] = paraProps
             }
         }
@@ -325,8 +354,18 @@ enum DocxReader: OfficeDocumentReader {
         return props
     }
 
-    /// One style's (or one paragraph's own) `w:pPr`, reduced to `w:jc`/`w:tabs` — shared by
-    /// `parseStyles` and `parseParagraph`'s direct-`pPr` read, the same way `parseRunStyleProps` is.
+    /// One style's (or one paragraph's own, or `w:docDefaults/w:pPrDefault`'s) `w:pPr`, reduced to
+    /// `w:jc`/`w:tabs` plus (P2) `w:spacing`'s before/after/line/lineRule, `w:ind`'s
+    /// start-or-left/end-or-right/firstLine/hanging, and `w:contextualSpacing` — shared by
+    /// `parseStyles` (a style's OWN `w:pPr`, and `w:docDefaults`' floor), and `resolvedParagraphFormat`'s
+    /// direct-`pPr` read, the same way `parseRunStyleProps` is shared across levels of its own cascade.
+    ///
+    /// Twips (`ST_TwipsMeasure`/`ST_SignedTwipsMeasure`, 20ths of a point) → points is `÷20`
+    /// throughout — spec area 5's `w:spacing`/`w:ind` table. `w:line`'s unit depends entirely on
+    /// `@w:lineRule` (spec area 5's "load-bearing fact for readable body text"): `auto` (the
+    /// default when `w:spacing` sets `@w:line` but omits `@w:lineRule`) is `line/240` as a
+    /// MULTIPLE of the font's own single-spaced height, never a point value; `exact`/`atLeast` are
+    /// both `line/20` points, differing only in whether the result is a hard cap or a floor.
     private static func parseParaStyleProps(_ pPr: XMLNode?) -> ParaStyleProps {
         var props = ParaStyleProps()
         if let val = pPr?.child("w:jc")?.attributes["w:val"] {
@@ -336,7 +375,49 @@ enum DocxReader: OfficeDocumentReader {
             let stops = parseTabStops(tabsNode)
             if !stops.isEmpty { props.tabStops = stops }
         }
+        if let spacing = pPr?.child("w:spacing") {
+            if let val = spacing.attributes["w:before"], let twips = Double(val) {
+                props.spacingBefore = CGFloat(twips / 20)
+            }
+            if let val = spacing.attributes["w:after"], let twips = Double(val) {
+                props.spacingAfter = CGFloat(twips / 20)
+            }
+            if let val = spacing.attributes["w:line"], let line = Double(val) {
+                switch spacing.attributes["w:lineRule"] {
+                case "exact": props.lineHeight = .exact(CGFloat(line / 20))
+                case "atLeast": props.lineHeight = .atLeast(CGFloat(line / 20))
+                default: props.lineHeight = .multiple(CGFloat(line / 240)) // absent or "auto"
+                }
+            }
+        }
+        if let ind = pPr?.child("w:ind") {
+            if let val = (ind.attributes["w:start"] ?? ind.attributes["w:left"]), let twips = Double(val) {
+                props.indentStart = CGFloat(twips / 20)
+            }
+            if let val = (ind.attributes["w:end"] ?? ind.attributes["w:right"]), let twips = Double(val) {
+                props.indentEnd = CGFloat(twips / 20)
+            }
+            if let val = ind.attributes["w:firstLine"], let twips = Double(val) {
+                props.firstLineIndent = CGFloat(twips / 20)
+            }
+            if let val = ind.attributes["w:hanging"], let twips = Double(val) {
+                props.hangingIndent = CGFloat(twips / 20)
+            }
+        }
+        props.contextualSpacing = onOffValue(pPr, "w:contextualSpacing")
         return props
+    }
+
+    /// A `Bool?` sibling of `isOn` (below): `nil` when the tag is entirely absent — "this level has
+    /// no opinion, keep climbing the cascade" — vs. an explicit `true`/`false` when it's present.
+    /// `isOn` itself can't express that middle state (it collapses "absent" and "explicitly off" to
+    /// the same `false`), which is fine for run toggles read at a single level (a run's OWN `w:rPr`)
+    /// but wrong for `w:contextualSpacing`'s per-property cascade, where "this style didn't mention
+    /// it" must be transparent rather than an implicit "off".
+    private static func onOffValue(_ pPr: XMLNode?, _ tag: String) -> Bool? {
+        guard let element = pPr?.child(tag) else { return nil }
+        guard let val = element.attributes["w:val"] else { return true }
+        return val != "0" && val != "false"
     }
 
     /// `w:jc`'s values per ECMA-376 §17.18.44 (`ST_Jc`): `"both"`/`"distribute"` are Word's two
@@ -411,6 +492,60 @@ enum DocxReader: OfficeDocumentReader {
 
     private static func resolvedTabStops(pStyleId: String?, styleInfo: StyleInfo) -> [CGFloat]? {
         walkStyleChain(pStyleId, styleInfo: styleInfo) { styleInfo.paraProps[$0]?.tabStops }
+    }
+
+    private static func resolvedSpacingBefore(pStyleId: String?, styleInfo: StyleInfo) -> CGFloat? {
+        walkStyleChain(pStyleId, styleInfo: styleInfo) { styleInfo.paraProps[$0]?.spacingBefore }
+    }
+
+    private static func resolvedSpacingAfter(pStyleId: String?, styleInfo: StyleInfo) -> CGFloat? {
+        walkStyleChain(pStyleId, styleInfo: styleInfo) { styleInfo.paraProps[$0]?.spacingAfter }
+    }
+
+    private static func resolvedLineHeight(pStyleId: String?, styleInfo: StyleInfo) -> LineHeight? {
+        walkStyleChain(pStyleId, styleInfo: styleInfo) { styleInfo.paraProps[$0]?.lineHeight }
+    }
+
+    private static func resolvedIndentStart(pStyleId: String?, styleInfo: StyleInfo) -> CGFloat? {
+        walkStyleChain(pStyleId, styleInfo: styleInfo) { styleInfo.paraProps[$0]?.indentStart }
+    }
+
+    private static func resolvedIndentEnd(pStyleId: String?, styleInfo: StyleInfo) -> CGFloat? {
+        walkStyleChain(pStyleId, styleInfo: styleInfo) { styleInfo.paraProps[$0]?.indentEnd }
+    }
+
+    private static func resolvedFirstLineIndent(pStyleId: String?, styleInfo: StyleInfo) -> CGFloat? {
+        walkStyleChain(pStyleId, styleInfo: styleInfo) { styleInfo.paraProps[$0]?.firstLineIndent }
+    }
+
+    private static func resolvedHangingIndent(pStyleId: String?, styleInfo: StyleInfo) -> CGFloat? {
+        walkStyleChain(pStyleId, styleInfo: styleInfo) { styleInfo.paraProps[$0]?.hangingIndent }
+    }
+
+    private static func resolvedContextualSpacing(pStyleId: String?, styleInfo: StyleInfo) -> Bool? {
+        walkStyleChain(pStyleId, styleInfo: styleInfo) { styleInfo.paraProps[$0]?.contextualSpacing }
+    }
+
+    /// The P2 cascade itself (spec area 9's `resolve_paragraph_properties`, restricted to the
+    /// spacing/indent/line-height/contextualSpacing fields this sprint covers): for EACH property
+    /// independently, low priority → high — `docDefaults` floor, then the style chain (`walkStyleChain`
+    /// already returns the NEAREST ancestor that set it, which is equivalent to applying root→leaf
+    /// and taking the last setter — see its own doc), then this paragraph's own direct `w:pPr` —
+    /// the first non-nil wins. `contextualSpacing`'s final "still unset" case defaults to `false`
+    /// (`ParagraphFormat`'s own default), matching every property this cascade never touches.
+    private static func resolvedParagraphFormat(pPr: XMLNode?, pStyleId: String?, styleInfo: StyleInfo) -> ParagraphFormat {
+        let direct = parseParaStyleProps(pPr)
+        let defaults = styleInfo.docDefaultsParaProps
+        var format = ParagraphFormat()
+        format.spacingBefore = direct.spacingBefore ?? resolvedSpacingBefore(pStyleId: pStyleId, styleInfo: styleInfo) ?? defaults.spacingBefore
+        format.spacingAfter = direct.spacingAfter ?? resolvedSpacingAfter(pStyleId: pStyleId, styleInfo: styleInfo) ?? defaults.spacingAfter
+        format.lineHeight = direct.lineHeight ?? resolvedLineHeight(pStyleId: pStyleId, styleInfo: styleInfo) ?? defaults.lineHeight
+        format.indentStart = direct.indentStart ?? resolvedIndentStart(pStyleId: pStyleId, styleInfo: styleInfo) ?? defaults.indentStart
+        format.indentEnd = direct.indentEnd ?? resolvedIndentEnd(pStyleId: pStyleId, styleInfo: styleInfo) ?? defaults.indentEnd
+        format.firstLineIndent = direct.firstLineIndent ?? resolvedFirstLineIndent(pStyleId: pStyleId, styleInfo: styleInfo) ?? defaults.firstLineIndent
+        format.hangingIndent = direct.hangingIndent ?? resolvedHangingIndent(pStyleId: pStyleId, styleInfo: styleInfo) ?? defaults.hangingIndent
+        format.contextualSpacing = direct.contextualSpacing ?? resolvedContextualSpacing(pStyleId: pStyleId, styleInfo: styleInfo) ?? defaults.contextualSpacing ?? false
+        return format
     }
 
     // MARK: word/theme/theme1.xml — theme colour scheme
@@ -1335,11 +1470,15 @@ enum DocxReader: OfficeDocumentReader {
         // for it would only make an unrelated LATER list item at the same numId/level skip a
         // value it never visibly used.
         let pStyleId = pPr?.child("w:pStyle")?.attributes["w:val"]
+        // The P2 cascade (docDefaults → style chain → this paragraph's own direct `w:pPr`) —
+        // resolved once per paragraph and reused for whichever of heading/listItem/paragraph this
+        // turns out to be, exactly like `alignment`/`tabStops` above.
+        let format = resolvedParagraphFormat(pPr: pPr, pStyleId: pStyleId, styleInfo: styleInfo)
         let textBlock: OfficeBlock?
         let skipEmptyText = spans.isEmpty && (!drawingBlocks.isEmpty || !formulaBlocks.isEmpty)
         if let level = headingLevel(pPr: pPr, pStyleId: pStyleId, styleInfo: styleInfo) {
             textBlock = skipEmptyText ? nil
-                : .heading(level: level, spans: spans, rtl: rtl, alignment: alignment, tabStops: tabStops)
+                : .heading(level: level, spans: spans, rtl: rtl, alignment: alignment, tabStops: tabStops, format: format)
         } else if let numPr = pPr?.child("w:numPr") {
             let ilvl = Int(numPr.child("w:ilvl")?.attributes["w:val"] ?? "") ?? 0
             let numId = numPr.child("w:numId")?.attributes["w:val"]
@@ -1349,14 +1488,14 @@ enum DocxReader: OfficeDocumentReader {
             if let info = numberedListInfo(numId: numId, ilvl: ilvl, info: numbering, state: listState) {
                 textBlock = skipEmptyText ? nil
                     : .listItem(level: ilvl, ordered: info.ordered, spans: spans, marker: info.marker, rtl: rtl,
-                                alignment: alignment, tabStops: tabStops)
+                                alignment: alignment, tabStops: tabStops, format: format)
             } else {
                 textBlock = skipEmptyText ? nil
-                    : .paragraph(spans: spans, rtl: rtl, alignment: alignment, tabStops: tabStops)
+                    : .paragraph(spans: spans, rtl: rtl, alignment: alignment, tabStops: tabStops, format: format)
             }
         } else {
             textBlock = skipEmptyText ? nil
-                : .paragraph(spans: spans, rtl: rtl, alignment: alignment, tabStops: tabStops)
+                : .paragraph(spans: spans, rtl: rtl, alignment: alignment, tabStops: tabStops, format: format)
         }
         var blocks: [OfficeBlock] = []
         if let textBlock { blocks.append(textBlock) }

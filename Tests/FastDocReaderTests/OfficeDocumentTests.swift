@@ -779,4 +779,48 @@ final class OfficeDocumentTests: XCTestCase {
         XCTAssertEqual(AnchorResolver.resolve(target: "_Toc1", bookmarks: bookmarks, headings: []), targetLoc)
         XCTAssertNil(AnchorResolver.resolve(target: "_Deleted", bookmarks: bookmarks, headings: []))
     }
+
+    // MARK: P2 invariant 29 — the spacing/indent/line-height cascade, through MarkdownDocument itself
+
+    /// A document declaring its own default body size (10pt) AND a paragraph's own `w:pPr/w:spacing`/
+    /// `w:ind` — reached through `MarkdownDocument.read(from:)`, not `DocxReader.read` called
+    /// directly, so this is invariant 29's own guard against the P2 wiring being reachable in the
+    /// parser but never actually invoked by the real dispatch. The reading size is set to DOUBLE the
+    /// document's own default, so a mutation that forgot to multiply P2's values by `fontSizeScale`
+    /// (leaving them at their authored, unscaled points) is distinguishable from the correct,
+    /// doubled result.
+    private func fixtureDocxWithParagraphFormatting() -> Data {
+        let styles = """
+        <?xml version="1.0" encoding="UTF-8"?><w:styles>
+          <w:docDefaults><w:rPrDefault><w:rPr><w:sz w:val="20"/></w:rPr></w:rPrDefault></w:docDefaults>
+        </w:styles>
+        """
+        let document = """
+        <?xml version="1.0" encoding="UTF-8"?><w:document><w:body>
+          <w:p><w:pPr><w:spacing w:before="240" w:after="120" w:line="360" w:lineRule="auto"/>
+            <w:ind w:start="720"/></w:pPr><w:r><w:t>Formatted</w:t></w:r></w:p>
+        </w:body></w:document>
+        """
+        return buildZip([
+            ("word/document.xml", Data(document.utf8)),
+            ("word/styles.xml", Data(styles.utf8)),
+        ])
+    }
+
+    func testParagraphSpacingIndentAndLineHeightReachTheRenderedStorageThroughMarkdownDocument() throws {
+        let originalSize = FontSizeStore.size
+        FontSizeStore.size = 20   // reading size == the document's own declared default (10pt) × 2
+        defer { FontSizeStore.size = originalSize }
+
+        let (_, wc) = try openOffice(fixtureDocxWithParagraphFormatting())
+        let storage = try XCTUnwrap(wc.textStorageRef)
+        let loc = (storage.string as NSString).range(of: "Formatted").location
+        let style = try XCTUnwrap(storage.attribute(.paragraphStyle, at: loc, effectiveRange: nil) as? NSParagraphStyle)
+        // scale = 2: 240 twips (12pt) before → 24; 120 twips (6pt) after → 12; 720 twips (36pt)
+        // indent → 72. `lineHeightMultiple` (360/240 = 1.5) is a unitless ratio, never scaled.
+        XCTAssertEqual(style.paragraphSpacingBefore, 24)
+        XCTAssertEqual(style.paragraphSpacing, 12)
+        XCTAssertEqual(style.headIndent, 72)
+        XCTAssertEqual(style.lineHeightMultiple, 1.5)
+    }
 }

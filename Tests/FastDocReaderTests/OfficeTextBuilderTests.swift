@@ -1161,4 +1161,188 @@ final class OfficeTextBuilderTests: XCTestCase {
         XCTAssertEqual(block.columnSpan, 2)
         XCTAssertEqual(block.backgroundColor, .systemOrange)
     }
+
+    // MARK: P2 — ParagraphFormat → NSParagraphStyle (spacing/line-height/indent/contextualSpacing)
+
+    private func paragraphStyle(in out: NSAttributedString, at index: Int = 0) -> NSParagraphStyle {
+        out.attribute(.paragraphStyle, at: index, effectiveRange: nil) as! NSParagraphStyle
+    }
+
+    /// `documentDefaultFontSize` matching `theme.baseFontSize` (16) gives `fontSizeScale == 1`, so
+    /// every expected number below is the SOURCE points value, unscaled — the cleanest fixture for
+    /// pinning the conversion itself, separately from the scaling multiplication tested afterwards.
+    private func buildUnscaled(_ blocks: [OfficeBlock]) -> NSAttributedString {
+        OfficeTextBuilder.build(blocks, theme: theme, documentDefaultFontSize: theme.baseFontSize)
+    }
+
+    /// `spacingBefore`/`spacingAfter` reach `paragraphSpacingBefore`/`paragraphSpacing` unscaled at
+    /// `fontSizeScale == 1` — the spec's own worked example (12pt/6pt, already twips→points
+    /// converted by the reader; the reader-side conversion itself is `DocxReaderTests`' job).
+    func testSpacingBeforeAndAfterReachParagraphSpacingAttributesUnscaled() {
+        var format = ParagraphFormat()
+        format.spacingBefore = 12
+        format.spacingAfter = 6
+        let out = buildUnscaled([.paragraph(spans: [span("Body")], format: format)])
+        let style = paragraphStyle(in: out)
+        XCTAssertEqual(style.paragraphSpacingBefore, 12)
+        XCTAssertEqual(style.paragraphSpacing, 6)
+    }
+
+    /// The SAME format, scaled: `documentDefaultFontSize` half `theme.baseFontSize` makes
+    /// `fontSizeScale == 2`, so 12pt/6pt authored becomes 24pt/12pt rendered — proving the P2
+    /// values ride the SAME reading-size ratio `Span.fontSize` already does.
+    func testSpacingBeforeAndAfterScaleWithFontSizeScale() {
+        var format = ParagraphFormat()
+        format.spacingBefore = 12
+        format.spacingAfter = 6
+        let out = OfficeTextBuilder.build([.paragraph(spans: [span("Body")], format: format)],
+                                          theme: theme, documentDefaultFontSize: theme.baseFontSize / 2)
+        let style = paragraphStyle(in: out)
+        XCTAssertEqual(style.paragraphSpacingBefore, 24)
+        XCTAssertEqual(style.paragraphSpacing, 12)
+    }
+
+    /// `.multiple` is a unitless RATIO (`w:lineRule="auto"`'s `line/240`) — it must land on
+    /// `lineHeightMultiple` UNCHANGED regardless of `fontSizeScale`, unlike every point-valued field.
+    func testLineHeightMultipleSetsLineHeightMultipleUnscaled() {
+        var format = ParagraphFormat()
+        format.lineHeight = .multiple(1.5)
+        let out = OfficeTextBuilder.build([.paragraph(spans: [span("Body")], format: format)],
+                                          theme: theme, documentDefaultFontSize: theme.baseFontSize / 2)
+        XCTAssertEqual(paragraphStyle(in: out).lineHeightMultiple, 1.5)
+    }
+
+    /// `.exact` sets BOTH `minimumLineHeight` and `maximumLineHeight` to the same scaled point
+    /// value — the hard cap the spec's `lineRule="exact"` describes (tall content clips rather than
+    /// growing the line).
+    func testLineHeightExactSetsMinimumAndMaximumToTheSameScaledValue() {
+        var format = ParagraphFormat()
+        format.lineHeight = .exact(20)
+        let out = OfficeTextBuilder.build([.paragraph(spans: [span("Body")], format: format)],
+                                          theme: theme, documentDefaultFontSize: theme.baseFontSize / 2)
+        let style = paragraphStyle(in: out)
+        XCTAssertEqual(style.minimumLineHeight, 40)
+        XCTAssertEqual(style.maximumLineHeight, 40)
+    }
+
+    /// `.atLeast` sets `minimumLineHeight` to the scaled floor and clears `maximumLineHeight` back
+    /// to 0 (AppKit's "no maximum") — a mutation that left the body-style token's own
+    /// `maximumLineHeight` in place would silently reintroduce a cap `atLeast` explicitly forbids.
+    func testLineHeightAtLeastSetsFloorAndClearsAnyCap() {
+        var format = ParagraphFormat()
+        format.lineHeight = .atLeast(20)
+        let out = buildUnscaled([.paragraph(spans: [span("Body")], format: format)])
+        let style = paragraphStyle(in: out)
+        XCTAssertEqual(style.minimumLineHeight, 20)
+        XCTAssertEqual(style.maximumLineHeight, 0)
+    }
+
+    /// The full indent formula (spec area 5's `NSParagraphStyle` mapping): `headIndent = indentStart`,
+    /// `tailIndent = -indentEnd` (AppKit's own right-margin-relative convention, already used by the
+    /// markdown code-card header/footer), `firstLineHeadIndent = indentStart + firstLineIndent`.
+    func testIndentStartEndAndFirstLineCombineIntoHeadTailAndFirstLineIndent() {
+        var format = ParagraphFormat()
+        format.indentStart = 10
+        format.indentEnd = 5
+        format.firstLineIndent = 6
+        let out = buildUnscaled([.paragraph(spans: [span("Body")], format: format)])
+        let style = paragraphStyle(in: out)
+        XCTAssertEqual(style.headIndent, 10)
+        XCTAssertEqual(style.tailIndent, -5)
+        XCTAssertEqual(style.firstLineHeadIndent, 16)
+    }
+
+    /// `hangingIndent` SUBTRACTS from `firstLineHeadIndent` (the classic bullet/numbered shape: the
+    /// first line sits LEFT of the body) — the opposite sign from `firstLineIndent`.
+    func testHangingIndentSubtractsFromFirstLineHeadIndent() {
+        var format = ParagraphFormat()
+        format.indentStart = 10
+        format.hangingIndent = 4
+        let out = buildUnscaled([.paragraph(spans: [span("Body")], format: format)])
+        XCTAssertEqual(paragraphStyle(in: out).firstLineHeadIndent, 6)
+    }
+
+    /// A `ParagraphFormat` with every field `nil` (the default) must leave `headIndent` at its
+    /// pre-P2 token default (0 for an ordinary body paragraph) — "unspecified = identical".
+    func testDefaultParagraphFormatLeavesIndentAtTheTokenDefault() {
+        let out = buildUnscaled([.paragraph(spans: [span("Body")], format: ParagraphFormat())])
+        XCTAssertEqual(paragraphStyle(in: out).headIndent, 0)
+    }
+
+    /// A heading block's format is resolved through the SAME `applyParagraphFormat` path as a
+    /// plain paragraph's — proving the wiring reaches `headingParagraphStyle`, not only
+    /// `bodyParagraphStyle`.
+    func testHeadingBlockAlsoAppliesItsOwnParagraphFormat() {
+        var format = ParagraphFormat()
+        format.spacingBefore = 30
+        let out = buildUnscaled([.heading(level: 1, spans: [span("Title")], format: format)])
+        XCTAssertEqual(paragraphStyle(in: out).paragraphSpacingBefore, 30)
+    }
+
+    /// A list item's DIRECT format still wins over the marker/hang-indent geometry
+    /// `listParagraphStyle` otherwise computes from `level` — proving `applyParagraphFormat` is
+    /// wired into the list path too, not only body/heading.
+    func testListItemsOwnDirectIndentOverridesTheMarkerGeometry() {
+        var format = ParagraphFormat()
+        format.indentStart = 50
+        let out = buildUnscaled([.listItem(level: 0, ordered: false, spans: [span("Item")], format: format)])
+        XCTAssertEqual(paragraphStyle(in: out).headIndent, 50)
+    }
+
+    // MARK: P2 — contextualSpacing adjacency (spec area 5)
+
+    /// Two CONSECUTIVE paragraphs sharing an EQUAL `ParagraphFormat` with `contextualSpacing: true`
+    /// must have the shared edge's spacing zeroed on BOTH sides (the first's `spacingAfter`, the
+    /// second's `spacingBefore`) while each paragraph's OUTER edge (nothing to suppress against)
+    /// keeps its authored value — Word's own "no gap within a run of the same style" rule.
+    func testConsecutiveSameStyleContextualSpacingParagraphsSuppressTheSharedEdge() {
+        var format = ParagraphFormat()
+        format.spacingBefore = 10
+        format.spacingAfter = 8
+        format.contextualSpacing = true
+        let out = buildUnscaled([
+            .paragraph(spans: [span("First")], format: format),
+            .paragraph(spans: [span("Second")], format: format),
+        ])
+        let firstRange = (out.string as NSString).range(of: "First")
+        let secondRange = (out.string as NSString).range(of: "Second")
+        let first = paragraphStyle(in: out, at: firstRange.location)
+        let second = paragraphStyle(in: out, at: secondRange.location)
+        XCTAssertEqual(first.paragraphSpacingBefore, 10, "the first item's own leading edge is untouched")
+        XCTAssertEqual(first.paragraphSpacing, 0, "suppressed — the next block shares its format")
+        XCTAssertEqual(second.paragraphSpacingBefore, 0, "suppressed — the previous block shares its format")
+        XCTAssertEqual(second.paragraphSpacing, 8, "the second item's own trailing edge is untouched")
+    }
+
+    /// Mutation check: if the NEXT block's format DIFFERS (a real style change, not the same list/
+    /// style continuing), contextualSpacing must NOT suppress anything — proving the adjacency
+    /// check compares actual format equality, not merely "both set contextualSpacing".
+    func testContextualSpacingDoesNotSuppressWhenTheNeighboursFormatDiffers() {
+        var format = ParagraphFormat()
+        format.spacingAfter = 8
+        format.contextualSpacing = true
+        var differentFormat = format
+        differentFormat.spacingAfter = 99
+        let out = buildUnscaled([
+            .paragraph(spans: [span("First")], format: format),
+            .paragraph(spans: [span("Second")], format: differentFormat),
+        ])
+        let firstRange = (out.string as NSString).range(of: "First")
+        XCTAssertEqual(paragraphStyle(in: out, at: firstRange.location).paragraphSpacing, 8,
+                       "a differently-formatted neighbour must never trigger suppression")
+    }
+
+    /// A block whose `contextualSpacing` is `false` (the pre-P2 default) must never be suppressed,
+    /// even sitting next to an identically-formatted neighbour — the rule is opt-in per the source.
+    func testContextualSpacingFalseNeverSuppressesEvenWithAnIdenticalNeighbour() {
+        var format = ParagraphFormat()
+        format.spacingAfter = 8
+        format.contextualSpacing = false
+        let out = buildUnscaled([
+            .paragraph(spans: [span("First")], format: format),
+            .paragraph(spans: [span("Second")], format: format),
+        ])
+        let firstRange = (out.string as NSString).range(of: "First")
+        XCTAssertEqual(paragraphStyle(in: out, at: firstRange.location).paragraphSpacing, 8)
+    }
 }

@@ -2366,4 +2366,154 @@ final class DocxReaderTests: XCTestCase {
         let blocks = try DocumentTypes.readOffice(archive, extension: "docx")
         XCTAssertEqual(blocks, [.paragraph(spans: [Span(text: "Theme", textColor: rgb("4F81BD"))])])
     }
+
+    // MARK: P2 — the spacing/indent/line-height/contextualSpacing cascade (spec areas 5/6/9)
+
+    /// The spec's own worked example (sprint brief): `w:before="240" w:after="120" w:line="360"
+    /// w:lineRule="auto"` → `12pt`/`6pt` (twips ÷ 20) and `lineHeightMultiple == 1.5` (`360 / 240`).
+    /// Set entirely at `w:docDefaults/w:pPrDefault/w:pPr` — the cascade's absolute floor — with no
+    /// style and no direct `w:pPr` at all, proving the floor layer alone is enough to reach a plain
+    /// paragraph.
+    func testDocDefaultsAloneSuppliesSpacingAndLineHeightWithNoStyleOrDirectPPr() throws {
+        let styles = """
+        <w:styles>
+          <w:docDefaults><w:pPrDefault><w:pPr>
+            <w:spacing w:before="240" w:after="120" w:line="360" w:lineRule="auto"/>
+          </w:pPr></w:pPrDefault></w:docDefaults>
+        </w:styles>
+        """
+        let blocks = try read(document: "<w:p><w:r><w:t>Plain</w:t></w:r></w:p>", styles: styles)
+        guard case .paragraph(_, _, _, _, let format) = blocks.first else { return XCTFail("expected a paragraph") }
+        XCTAssertEqual(format.spacingBefore, 12)
+        XCTAssertEqual(format.spacingAfter, 6)
+        XCTAssertEqual(format.lineHeight, .multiple(1.5))
+    }
+
+    /// `w:ind/@w:start` set on `Normal` (the root of the chain) must reach a paragraph styled
+    /// `Body`, `w:basedOn="Normal"`, that never mentions indentation at all — proving the style
+    /// chain layer (not just docDefaults or a paragraph's own direct `pPr`) resolves a property.
+    /// `720` twips → `36`pt.
+    func testIndentInheritsThroughTheBasedOnChainWhenNeitherTheLeafStyleNorTheParagraphSetsIt() throws {
+        let styles = """
+        <w:styles>
+          <w:style w:type="paragraph" w:styleId="Normal"><w:pPr><w:ind w:start="720"/></w:pPr></w:style>
+          <w:style w:type="paragraph" w:styleId="Body"><w:basedOn w:val="Normal"/></w:style>
+        </w:styles>
+        """
+        let blocks = try read(
+            document: "<w:p><w:pPr><w:pStyle w:val=\"Body\"/></w:pPr><w:r><w:t>Inherited</w:t></w:r></w:p>",
+            styles: styles)
+        guard case .paragraph(_, _, _, _, let format) = blocks.first else { return XCTFail("expected a paragraph") }
+        XCTAssertEqual(format.indentStart, 36)
+    }
+
+    /// The paragraph's OWN direct `w:pPr/w:ind` (`360` twips → `18`pt) must win over its style's
+    /// `720` twips → `36`pt — direct-wins-highest, the top of the cascade.
+    func testParagraphsOwnDirectIndentWinsOverItsStylesIndent() throws {
+        let styles = """
+        <w:styles>
+          <w:style w:type="paragraph" w:styleId="Body"><w:pPr><w:ind w:start="720"/></w:pPr></w:style>
+        </w:styles>
+        """
+        let blocks = try read(document: """
+        <w:p><w:pPr><w:pStyle w:val="Body"/><w:ind w:start="360"/></w:pPr><w:r><w:t>Direct</w:t></w:r></w:p>
+        """, styles: styles)
+        guard case .paragraph(_, _, _, _, let format) = blocks.first else { return XCTFail("expected a paragraph") }
+        XCTAssertEqual(format.indentStart, 18)
+    }
+
+    /// A malformed `w:basedOn` CYCLE must not hang the P2 cascade either — `resolvedParagraphFormat`
+    /// reuses `walkStyleChain`'s existing cycle guard (proven for outline levels above), and this
+    /// is the same guard exercised for the spacing/indent walk specifically. NEITHER style in the
+    /// cycle sets any spacing/indent/line-height/contextualSpacing at all, so a walk that failed to
+    /// terminate would hang this test rather than merely return a wrong value — the guard is what
+    /// lets this test complete (and complete FAST, asserted below) instead of timing out.
+    func testBasedOnCycleDoesNotHangTheParagraphFormatCascadeEither() throws {
+        let styles = """
+        <w:styles>
+          <w:style w:type="paragraph" w:styleId="A"><w:basedOn w:val="B"/></w:style>
+          <w:style w:type="paragraph" w:styleId="B"><w:basedOn w:val="A"/></w:style>
+        </w:styles>
+        """
+        let start = Date()
+        let blocks = try read(
+            document: "<w:p><w:pPr><w:pStyle w:val=\"A\"/></w:pPr><w:r><w:t>Cycle</w:t></w:r></w:p>",
+            styles: styles)
+        XCTAssertLessThan(Date().timeIntervalSince(start), 1, "a cycle must be guarded, not looped forever")
+        guard case .paragraph(_, _, _, _, let format) = blocks.first else { return XCTFail("expected a paragraph") }
+        XCTAssertEqual(format, ParagraphFormat())
+    }
+
+    /// The SAME cycle, but with a real value sitting on the far side of it (`A`, discoverable by
+    /// climbing FROM `B`) — proving the guard only stops a walk that revisits a style, not a walk
+    /// that legitimately reaches a style it hasn't seen yet. `100` twips → `5`pt.
+    func testBasedOnCycleStillResolvesARealValueReachableBeforeTheRevisit() throws {
+        let styles = """
+        <w:styles>
+          <w:style w:type="paragraph" w:styleId="A"><w:basedOn w:val="B"/><w:pPr><w:spacing w:before="100"/></w:pPr></w:style>
+          <w:style w:type="paragraph" w:styleId="B"><w:basedOn w:val="A"/></w:style>
+        </w:styles>
+        """
+        let blocks = try read(
+            document: "<w:p><w:pPr><w:pStyle w:val=\"B\"/></w:pPr><w:r><w:t>Cycle</w:t></w:r></w:p>",
+            styles: styles)
+        guard case .paragraph(_, _, _, _, let format) = blocks.first else { return XCTFail("expected a paragraph") }
+        XCTAssertEqual(format.spacingBefore, 5)
+    }
+
+    /// Mutation check for twips→points: `÷20` must actually run — `480` twips must become `24`pt,
+    /// not `480`pt (forgetting the divisor) and not `10`pt (an off-by-factor error the other way).
+    func testSpacingTwipsToPointsConversionIsDivisionByTwentyNotSomeOtherFactor() throws {
+        let styles = """
+        <w:styles>
+          <w:docDefaults><w:pPrDefault><w:pPr><w:spacing w:before="480"/></w:pPr></w:pPrDefault></w:docDefaults>
+        </w:styles>
+        """
+        let blocks = try read(document: "<w:p><w:r><w:t>X</w:t></w:r></w:p>", styles: styles)
+        guard case .paragraph(_, _, _, _, let format) = blocks.first else { return XCTFail("expected a paragraph") }
+        XCTAssertEqual(format.spacingBefore, 24)
+    }
+
+    /// `w:lineRule="exact"`/`"atLeast"` are `line/20` points, NOT `line/240` (the `"auto"` ratio) —
+    /// a mutation that dropped the `switch` on `@w:lineRule` and always used the `auto` formula
+    /// would turn `480` twips-as-exact into a `2.0` ratio instead of `24`pt; this pins the actual
+    /// spec-correct unit for both non-`auto` rules in one fixture.
+    func testExactAndAtLeastLineRulesAreTwentiethsOfAPointNotThe240thsAutoRatio() throws {
+        let blocks = try read(document: """
+        <w:p><w:pPr><w:spacing w:line="480" w:lineRule="exact"/></w:pPr><w:r><w:t>Exact</w:t></w:r></w:p>
+        <w:p><w:pPr><w:spacing w:line="300" w:lineRule="atLeast"/></w:pPr><w:r><w:t>Floor</w:t></w:r></w:p>
+        """)
+        guard case .paragraph(_, _, _, _, let exactFormat) = blocks[0] else { return XCTFail("expected a paragraph") }
+        guard case .paragraph(_, _, _, _, let floorFormat) = blocks[1] else { return XCTFail("expected a paragraph") }
+        XCTAssertEqual(exactFormat.lineHeight, .exact(24))
+        XCTAssertEqual(floorFormat.lineHeight, .atLeast(15))
+    }
+
+    /// `w:contextualSpacing` is a bare-tag on/off toggle exactly like `w:b`/`w:i` — its mere
+    /// presence, with no `@w:val`, must read as ON.
+    func testBareContextualSpacingTagWithNoValReadsAsOn() throws {
+        let blocks = try read(document: """
+        <w:p><w:pPr><w:contextualSpacing/></w:pPr><w:r><w:t>Tight</w:t></w:r></w:p>
+        """)
+        guard case .paragraph(_, _, _, _, let format) = blocks.first else { return XCTFail("expected a paragraph") }
+        XCTAssertTrue(format.contextualSpacing)
+    }
+
+    /// `w:contextualSpacing` unset anywhere in the cascade must default to `false` — matching
+    /// `ParagraphFormat`'s own default and every pre-P2 paragraph's implicit behaviour.
+    func testUnspecifiedContextualSpacingDefaultsToFalse() throws {
+        let blocks = try read(document: "<w:p><w:r><w:t>Plain</w:t></w:r></w:p>")
+        guard case .paragraph(_, _, _, _, let format) = blocks.first else { return XCTFail("expected a paragraph") }
+        XCTAssertFalse(format.contextualSpacing)
+    }
+
+    /// A paragraph whose cascade resolves EVERY field to `nil` (no docDefaults, no style, no
+    /// direct `w:pPr` formatting at all) must produce the exact default `ParagraphFormat()` —
+    /// the "unspecified = identical" invariant the sprint brief requires: this is what makes every
+    /// pre-P2 fixture in this file (none of which declare `w:spacing`/`w:ind`) still pass unchanged.
+    func testFullyUnspecifiedCascadeProducesTheDefaultParagraphFormat() throws {
+        let blocks = try read(document: "<w:p><w:r><w:t>Untouched</w:t></w:r></w:p>")
+        guard case .paragraph(_, _, _, _, let format) = blocks.first else { return XCTFail("expected a paragraph") }
+        XCTAssertEqual(format, ParagraphFormat())
+    }
 }

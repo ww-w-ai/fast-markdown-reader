@@ -47,8 +47,16 @@ enum OfficeTextBuilder {
             blockSeq += 1
         }
 
-        for block in blocks {
+        for (index, block) in blocks.enumerated() {
             let start = result.length
+            // P2's `w:contextualSpacing` adjacency rule (spec area 5): suppress THIS paragraph's
+            // spacing-before when the PREVIOUS block is the same style (its `ParagraphFormat` is
+            // EQUAL — the vocabulary carries no style id, so equal resolved format is the proxy),
+            // and symmetric for spacing-after against the NEXT block. Only ever narrows a format
+            // (zeroes spacing that was otherwise set) — a block with no format at all (`nil`, every
+            // non-paragraph-shaped case) is untouched, and a paragraph whose OWN contextualSpacing
+            // is `false`/unset never has this rule applied regardless of its neighbours.
+            let format = contextualSpacingAdjustedFormat(for: block, at: index, in: blocks)
             switch block {
             case let .heading(level, spans, rtl, alignment, tabStops, _):
                 result.append(spansAttributedString(spans, baseFont: theme.headingFont(level: level),
@@ -62,7 +70,8 @@ enum OfficeTextBuilder {
                 result.append(NSAttributedString(string: "\n"))
                 result.addAttribute(.paragraphStyle,
                                     value: headingParagraphStyle(level: level, theme: theme, rtl: rtl,
-                                                                  alignment: alignment, tabStops: tabStops),
+                                                                  alignment: alignment, tabStops: tabStops,
+                                                                  format: format, fontSizeScale: fontSizeScale),
                                     range: NSRange(location: start, length: result.length - start))
 
             case let .paragraph(spans, rtl, alignment, tabStops, _):
@@ -72,13 +81,15 @@ enum OfficeTextBuilder {
                 result.append(NSAttributedString(string: "\n"))
                 result.addAttribute(.paragraphStyle,
                                     value: bodyParagraphStyle(theme: theme, rtl: rtl, alignment: alignment,
-                                                               tabStops: tabStops),
+                                                               tabStops: tabStops, format: format,
+                                                               fontSizeScale: fontSizeScale),
                                     range: NSRange(location: start, length: result.length - start))
 
             case let .listItem(level, ordered, spans, marker, rtl, alignment, tabStops, _):
                 appendListItem(level: level, ordered: ordered, spans: spans, marker: marker, rtl: rtl,
                                alignment: alignment, tabStops: tabStops, into: result,
-                               theme: theme, orderedCounters: &orderedCounters, fontSizeScale: fontSizeScale)
+                               theme: theme, orderedCounters: &orderedCounters, fontSizeScale: fontSizeScale,
+                               format: format)
 
             case let .table(rows, headerRows):
                 appendTable(rows, headerRows: headerRows, into: result, theme: theme, fontSizeScale: fontSizeScale)
@@ -95,6 +106,39 @@ enum OfficeTextBuilder {
             tagBlock(from: start)
         }
         return result
+    }
+
+    /// The `format` carried by a heading/paragraph/list-item block — `nil` for every other case
+    /// (table/image/unsupportedGraphic/formula), which carries no `ParagraphFormat` at all.
+    private static func paragraphFormat(of block: OfficeBlock) -> ParagraphFormat? {
+        switch block {
+        case let .heading(_, _, _, _, _, format): return format
+        case let .paragraph(_, _, _, _, format): return format
+        case let .listItem(_, _, _, _, _, _, _, format): return format
+        case .table, .image, .unsupportedGraphic, .formula: return nil
+        }
+    }
+
+    /// `block`'s own resolved `ParagraphFormat`, with `spacingBefore`/`spacingAfter` zeroed when
+    /// P2's `w:contextualSpacing` adjacency rule applies — see `build`'s call site doc. `nil` in,
+    /// `nil` out (a block with no `ParagraphFormat` never gets one invented).
+    private static func contextualSpacingAdjustedFormat(
+        for block: OfficeBlock, at index: Int, in blocks: [OfficeBlock]
+    ) -> ParagraphFormat? {
+        guard let resolved = paragraphFormat(of: block), resolved.contextualSpacing else {
+            return paragraphFormat(of: block)
+        }
+        // Both neighbour comparisons are against `resolved` — the UNMUTATED format — so zeroing
+        // `spacingBefore` for the "previous block matches" check can never change what the
+        // "next block matches" check compares against (and vice versa).
+        var adjusted = resolved
+        if index > 0, paragraphFormat(of: blocks[index - 1]) == resolved {
+            adjusted.spacingBefore = 0
+        }
+        if index + 1 < blocks.count, paragraphFormat(of: blocks[index + 1]) == resolved {
+            adjusted.spacingAfter = 0
+        }
+        return adjusted
     }
 
     // MARK: Spans → attributed runs
@@ -258,7 +302,9 @@ enum OfficeTextBuilder {
     /// changes nothing.
     private static func bodyParagraphStyle(theme: RenderTheme, rtl: Bool = false,
                                             alignment: NSTextAlignment? = nil,
-                                            tabStops: [CGFloat] = []) -> NSParagraphStyle {
+                                            tabStops: [CGFloat] = [],
+                                            format: ParagraphFormat? = nil,
+                                            fontSizeScale: CGFloat = 1) -> NSParagraphStyle {
         let p = NSMutableParagraphStyle()
         let lh = (theme.baseFontSize * theme.lineHeightRatio).rounded()
         p.minimumLineHeight = lh
@@ -267,12 +313,15 @@ enum OfficeTextBuilder {
         if rtl { p.baseWritingDirection = .rightToLeft }
         if let alignment { p.alignment = alignment }
         if !tabStops.isEmpty { p.tabStops = tabStops.map { NSTextTab(textAlignment: .left, location: $0) } }
+        applyParagraphFormat(format, fontSizeScale: fontSizeScale, to: p)
         return p.copy() as! NSParagraphStyle
     }
 
     private static func headingParagraphStyle(level: Int, theme: RenderTheme, rtl: Bool = false,
                                                alignment: NSTextAlignment? = nil,
-                                               tabStops: [CGFloat] = []) -> NSParagraphStyle {
+                                               tabStops: [CGFloat] = [],
+                                               format: ParagraphFormat? = nil,
+                                               fontSizeScale: CGFloat = 1) -> NSParagraphStyle {
         let b = theme.baseFontSize
         let style = OfficeStyle(theme: theme)
         let p = NSMutableParagraphStyle()
@@ -284,7 +333,60 @@ enum OfficeTextBuilder {
         if rtl { p.baseWritingDirection = .rightToLeft }
         if let alignment { p.alignment = alignment }
         if !tabStops.isEmpty { p.tabStops = tabStops.map { NSTextTab(textAlignment: .left, location: $0) } }
+        applyParagraphFormat(format, fontSizeScale: fontSizeScale, to: p)
         return p.copy() as! NSParagraphStyle
+    }
+
+    /// Applies the P2 cascade's resolved `ParagraphFormat` on top of whatever theme-token defaults
+    /// the caller already set on `p` — per-field, only when the source specified that field (`nil`
+    /// leaves the token value exactly as it was, which is what makes a paragraph with an entirely
+    /// unspecified cascade render byte-identical to the pre-P2 token path). Order matters: this
+    /// runs AFTER the caller's own token defaults, since `lineRule="atLeast"` must explicitly clear
+    /// the `maximumLineHeight` cap those defaults set (a plain unset would leave the old cap active,
+    /// silently reintroducing the very clipping `atLeast` exists to prevent).
+    ///
+    /// `fontSizeScale` is `theme.baseFontSize / documentDefaultFontSize` (see `build`'s doc) — every
+    /// POINT value the source declared is scaled by it, exactly like `Span.fontSize`, so a
+    /// document's own spacing/indent stays proportional at any reading-size setting.
+    /// `lineHeightMultiple` is NOT scaled — `LineHeight.multiple` is already a unitless ratio
+    /// (`w:lineRule="auto"`'s `line/240`), not a point value.
+    private static func applyParagraphFormat(_ format: ParagraphFormat?, fontSizeScale: CGFloat,
+                                              to p: NSMutableParagraphStyle) {
+        guard let format else { return }
+        if let before = format.spacingBefore { p.paragraphSpacingBefore = before * fontSizeScale }
+        if let after = format.spacingAfter { p.paragraphSpacing = after * fontSizeScale }
+        if let lineHeight = format.lineHeight {
+            switch lineHeight {
+            case .multiple(let ratio):
+                p.lineHeightMultiple = ratio
+            case .exact(let pt):
+                let v = pt * fontSizeScale
+                p.minimumLineHeight = v
+                p.maximumLineHeight = v
+            case .atLeast(let pt):
+                p.minimumLineHeight = pt * fontSizeScale
+                p.maximumLineHeight = 0 // a floor, not a cap — clears the token's own maximum.
+            }
+        }
+        if format.indentStart != nil || format.indentEnd != nil || format.firstLineIndent != nil
+            || format.hangingIndent != nil {
+            // `NSParagraphStyle.headIndent`/`firstLineHeadIndent` per the spec's own mapping (area
+            // 5): unspecified components read as 0, so a level that sets ONLY `spacingBefore`
+            // (say) never reaches this block at all, and a level that sets exactly one indent
+            // component still combines correctly with the other three at their neutral value.
+            let start = (format.indentStart ?? 0) * fontSizeScale
+            let firstLine = (format.firstLineIndent ?? 0) * fontSizeScale
+            let hanging = (format.hangingIndent ?? 0) * fontSizeScale
+            p.headIndent = start
+            p.firstLineHeadIndent = start + firstLine - hanging
+            if let end = format.indentEnd {
+                // AppKit's own convention (already used by the markdown code-card header/footer,
+                // `MarkdownRenderer.swift`'s `tailIndent = -CodeCardMetrics.textInset`): a positive
+                // `tailIndent` measures from the LEFT margin, so the OOXML "distance from the right
+                // edge" must be negated to land in the same place.
+                p.tailIndent = -(end * fontSizeScale)
+            }
+        }
     }
 
     // MARK: Lists
@@ -307,7 +409,9 @@ enum OfficeTextBuilder {
     /// custom tab stop must coexist with, not break, list indentation).
     private static func listParagraphStyle(markerX: CGFloat, textX: CGFloat, theme: RenderTheme,
                                             rtl: Bool = false, alignment: NSTextAlignment? = nil,
-                                            extraTabStops: [CGFloat] = []) -> NSParagraphStyle {
+                                            extraTabStops: [CGFloat] = [],
+                                            format: ParagraphFormat? = nil,
+                                            fontSizeScale: CGFloat = 1) -> NSParagraphStyle {
         let p = NSMutableParagraphStyle()
         let lh = (theme.baseFontSize * theme.lineHeightRatio).rounded()
         p.minimumLineHeight = lh
@@ -324,6 +428,12 @@ enum OfficeTextBuilder {
         // enough for TextKit to draw the text right-to-left, just still left-indented.
         if rtl { p.baseWritingDirection = .rightToLeft }
         if let alignment { p.alignment = alignment }
+        // Applied LAST, same as the body/heading paths — a list item's own direct `w:pPr` spacing/
+        // line-height/indent (P2's cascade) wins over the marker/hang-indent geometry above when
+        // the source specified it; an unspecified cascade (the overwhelming common case — Word's
+        // numbering, not a paragraph's own `w:ind`, usually carries a list's indentation) leaves
+        // `markerX`/`textX` exactly as before this sprint.
+        applyParagraphFormat(format, fontSizeScale: fontSizeScale, to: p)
         return p.copy() as! NSParagraphStyle
     }
 
@@ -346,7 +456,7 @@ enum OfficeTextBuilder {
                                        rtl: Bool = false, alignment: NSTextAlignment? = nil,
                                        tabStops: [CGFloat] = [], into result: NSMutableAttributedString,
                                        theme: RenderTheme, orderedCounters: inout [Int: Int],
-                                       fontSizeScale: CGFloat = 1) {
+                                       fontSizeScale: CGFloat = 1, format: ParagraphFormat? = nil) {
         let marker: String
         if let suppliedMarker {
             marker = suppliedMarker + "\t"
@@ -377,7 +487,8 @@ enum OfficeTextBuilder {
         result.append(NSAttributedString(string: "\n"))
         result.addAttribute(.paragraphStyle,
                             value: listParagraphStyle(markerX: markerX, textX: textX, theme: theme, rtl: rtl,
-                                                       alignment: alignment, extraTabStops: tabStops),
+                                                       alignment: alignment, extraTabStops: tabStops,
+                                                       format: format, fontSizeScale: fontSizeScale),
                             range: NSRange(location: start, length: result.length - start))
     }
 
