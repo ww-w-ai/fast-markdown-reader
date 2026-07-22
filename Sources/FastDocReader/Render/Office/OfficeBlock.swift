@@ -110,6 +110,23 @@ struct Cell: Equatable {
     /// positions have no `Cell` of their own to carry a width at all (see `OfficeBlock.table`'s doc
     /// comment on anchor-only rows).
     var width: CGFloat? = nil
+    /// The cell's own vertical alignment (docx `w:tcPr/w:vAlign/@w:val` — `top`/`center`/`bottom`;
+    /// ODT, P4, carries no equivalent yet) — `nil` means the source didn't say, which is also
+    /// Word's own default (`top`), so `TableBlockBuilder` leaves `NSTextTableBlock`'s already-`.top`
+    /// vertical alignment untouched rather than setting it explicitly. `CellVAlign` is a closed
+    /// three-case vocabulary rather than reusing `NSTextBlock.VerticalAlignment` directly so the
+    /// reader stays free of AppKit's own `.baseline` case, which no source format expresses.
+    var verticalAlignment: CellVAlign? = nil
+    /// The cell's own resolved cell margin/padding, in POINTS, ALREADY resolved by the reader
+    /// against the table's default before reaching this struct (docx: per-cell `w:tcPr/w:tcMar` →
+    /// table-wide `w:tblPr/w:tblCellMar` → `nil`; ODT, P4, carries no equivalent yet) — `nil` means
+    /// neither the cell nor its table said anything, and `TableBlockBuilder` keeps its own
+    /// pre-existing 7pt default exactly as before this field existed. A uniform value, mirroring
+    /// `borderColor`/`borderWidth`'s same simplification: `w:tcMar`/`w:tblCellMar` can express four
+    /// independent edges, and this reader takes the START/left edge as representative (the same
+    /// edge `ParagraphFormat.indentStart` reads for indentation) rather than inventing a four-field
+    /// per-edge model nothing here would consistently fill in.
+    var padding: CGFloat? = nil
 
     /// Back-compat convenience for the many construction sites (both readers' plain-text cells,
     /// most existing tests) that only ever need a cell of formatted text — wraps the spans in a
@@ -124,7 +141,7 @@ struct Cell: Equatable {
 
     init(blocks: [OfficeBlock], rowSpan: Int = 1, colSpan: Int = 1,
          backgroundColor: NSColor? = nil, borderColor: NSColor? = nil, borderWidth: CGFloat? = nil,
-         width: CGFloat? = nil) {
+         width: CGFloat? = nil, verticalAlignment: CellVAlign? = nil, padding: CGFloat? = nil) {
         self.blocks = blocks
         self.rowSpan = rowSpan
         self.colSpan = colSpan
@@ -132,7 +149,31 @@ struct Cell: Equatable {
         self.borderColor = borderColor
         self.borderWidth = borderWidth
         self.width = width
+        self.verticalAlignment = verticalAlignment
+        self.padding = padding
     }
+}
+
+/// A cell's vertical alignment — docx `w:tcPr/w:vAlign/@w:val`. See `Cell.verticalAlignment`'s own
+/// doc comment for why this is a closed three-case vocabulary rather than AppKit's own
+/// `NSTextBlock.VerticalAlignment`.
+enum CellVAlign: Equatable {
+    case top, center, bottom
+}
+
+/// A table's OWN default border/shading — docx `w:tbl/w:tblPr/w:tblBorders` and
+/// `w:tbl/w:tblPr/w:shd/@w:fill` — that every cell in the table inherits unless it declares its
+/// own (see `Cell.borderColor`/`.backgroundColor`). Mirrors `Cell`'s own uniform-border
+/// simplification: `w:tblBorders` can express four edges (plus `insideH`/`insideV`) independently,
+/// and this reader takes the first drawn edge, same as `Cell`'s own border reading. `nil` in any
+/// field means the table didn't declare one — `TableBlockBuilder` falls through past it to its
+/// existing theme default (`Palette.tableBorder`/1pt/header shading), exactly as before this
+/// struct existed. A table with no `w:tblPr` at all (every markdown table; any docx table that
+/// declares neither) constructs the all-`nil` default, which renders BYTE-IDENTICAL to before.
+struct TableFormat: Equatable {
+    var defaultBorderColor: NSColor? = nil
+    var defaultBorderWidth: CGFloat? = nil
+    var defaultShading: NSColor? = nil
 }
 
 /// A paragraph's line-spacing mode — docx `w:pPr/w:spacing/@w:lineRule` (`auto`/`exact`/`atLeast`)
@@ -330,7 +371,11 @@ enum OfficeBlock: Equatable {
     /// its count is expected to equal the table's own derived column count; a caller that can't
     /// establish that (a malformed grid) should pass `[]` rather than a mismatched array — a
     /// mismatch is treated as "unusable" and ignored, never partially applied.
-    case table(rows: [[Cell]], headerRows: Int, columnWidths: [CGFloat] = [])
+    /// `format` (trailing, defaulted — see `TableFormat` above) is this sprint's (P3b) table-level
+    /// default border/shading, inherited by any cell that doesn't declare its own. A
+    /// default-constructed `TableFormat()` — every markdown table, and every existing call site that
+    /// never mentions this parameter — renders BYTE-IDENTICAL to before this field existed.
+    case table(rows: [[Cell]], headerRows: Int, columnWidths: [CGFloat] = [], format: TableFormat = TableFormat())
     /// `id` is an opaque key a later sprint resolves to pixels (a docx relationship id, an odt
     /// href, a markdown source path, …) — this sprint only reserves the LAYOUT area, exactly like
     /// a not-yet-loaded markdown image (invariant 1: reserved size must never depend on whether

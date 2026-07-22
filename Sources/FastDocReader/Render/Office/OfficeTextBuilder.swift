@@ -91,9 +91,9 @@ enum OfficeTextBuilder {
                                theme: theme, orderedCounters: &orderedCounters, fontSizeScale: fontSizeScale,
                                format: format)
 
-            case let .table(rows, headerRows, columnWidths):
-                appendTable(rows, headerRows: headerRows, columnWidths: columnWidths, into: result, theme: theme,
-                            fontSizeScale: fontSizeScale)
+            case let .table(rows, headerRows, columnWidths, tableFormat):
+                appendTable(rows, headerRows: headerRows, columnWidths: columnWidths, tableFormat: tableFormat,
+                            into: result, theme: theme, fontSizeScale: fontSizeScale)
 
             case let .image(id, size):
                 appendImage(id: id, size: size, columnWidth: columnWidth, into: result)
@@ -546,6 +546,7 @@ enum OfficeTextBuilder {
     /// headerless table). A cell shorter than the widest row leaves its trailing columns empty
     /// rather than collapsing the row.
     private static func appendTable(_ rows: [[Cell]], headerRows: Int, columnWidths: [CGFloat] = [],
+                                    tableFormat: TableFormat = TableFormat(),
                                     into result: NSMutableAttributedString,
                                     theme: RenderTheme, fontSizeScale: CGFloat = 1) {
         guard rows.contains(where: { !$0.isEmpty }) else {
@@ -561,11 +562,15 @@ enum OfficeTextBuilder {
                 return TableBlockBuilder.CellContent(content: content, rowSpan: cell.rowSpan, columnSpan: cell.colSpan,
                                                       backgroundColor: cell.backgroundColor,
                                                       borderColor: cell.borderColor, borderWidth: cell.borderWidth,
-                                                      width: cell.width)
+                                                      width: cell.width, verticalAlignment: cell.verticalAlignment,
+                                                      padding: cell.padding)
             }
         }
         result.append(TableBlockBuilder.build(rows: cellRows, headerRows: headerRows, theme: theme,
-                                              columnWidths: columnWidths))
+                                              columnWidths: columnWidths,
+                                              tableBorderColor: tableFormat.defaultBorderColor,
+                                              tableBorderWidth: tableFormat.defaultBorderWidth,
+                                              tableShading: tableFormat.defaultShading))
         result.append(NSAttributedString(string: "\n"))
     }
 
@@ -613,7 +618,7 @@ enum OfficeTextBuilder {
                 if result.length > 0, result.string.hasSuffix("\n") {
                     result.deleteCharacters(in: NSRange(location: result.length - 1, length: 1))
                 }
-            case let .table(nestedRows, _, _):
+            case let .table(nestedRows, _, _, _):
                 result.append(flattenTableToText(nestedRows, baseFont: baseFont, theme: theme))
             case let .image(id, size):
                 appendImage(id: id, size: size, columnWidth: .greatestFiniteMagnitude, into: result)

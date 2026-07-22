@@ -1627,6 +1627,11 @@ enum DocxReader: OfficeDocumentReader {
         notes: NoteNumbering, listState: ListNumberingState
     ) -> OfficeBlock {
         let rowNodes = tbl.children.filter { $0.name == "w:tr" }
+        let tblPr = tbl.child("w:tblPr")
+        // The table's own default cell margin (`w:tblPr/w:tblCellMar`) — the MIDDLE layer a
+        // per-cell `w:tcPr/w:tcMar` (read below, per cell) falls back to before `Cell.padding`
+        // itself falls back to `nil` (and `TableBlockBuilder`'s pre-existing 7pt default).
+        let tableDefaultMargin = cellMargin(tblPr?.child("w:tblCellMar"))
         var rows: [[Cell]] = []
         // Grid column → where in `rows` its currently-open vertical-merge anchor lives, so a
         // `continue` cell several rows down can find the top cell and extend ITS `rowSpan` instead
@@ -1661,10 +1666,13 @@ enum DocxReader: OfficeDocumentReader {
                         tc, styleInfo: styleInfo, numbering: numbering, relationships: relationships, notes: notes,
                         listState: listState)
                     let (borderColor, borderWidth) = cellBorder(tcPr)
+                    // Own `w:tcMar` wins; a cell that says nothing inherits the table's own default
+                    // (already resolved above) rather than falling straight to `nil`.
+                    let resolvedMargin = cellMargin(tcPr?.child("w:tcMar")) ?? tableDefaultMargin
                     rowCells.append(Cell(
                         blocks: blocks, rowSpan: 1, colSpan: colSpan,
                         backgroundColor: cellShading(tcPr), borderColor: borderColor, borderWidth: borderWidth,
-                        width: cellWidth(tcPr)))
+                        width: cellWidth(tcPr), verticalAlignment: cellVAlign(tcPr), padding: resolvedMargin))
                     if vMerge != nil {
                         // `val="restart"` — the top of a genuine new vertical-merge chain; later
                         // `continue` cells at this column extend THIS cell's `rowSpan`.
@@ -1700,7 +1708,10 @@ enum DocxReader: OfficeDocumentReader {
             guard isHeader else { break }
             headerRows += 1
         }
-        return .table(rows: rows, headerRows: headerRows, columnWidths: tableGridColumnWidths(tbl))
+        let (tableBorderColor, tableBorderWidth) = tableBorder(tblPr)
+        let format = TableFormat(defaultBorderColor: tableBorderColor, defaultBorderWidth: tableBorderWidth,
+                                 defaultShading: cellShading(tblPr))
+        return .table(rows: rows, headerRows: headerRows, columnWidths: tableGridColumnWidths(tbl), format: format)
     }
 
     /// `w:tbl/w:tblGrid/w:gridCol/@w:w` — the table's OWN authoritative column widths (ECMA-376
@@ -1748,7 +1759,30 @@ enum DocxReader: OfficeDocumentReader {
     /// despite sharing a name). `w:color="auto"` resolves to `nil` (theme decides), same as
     /// `w:fill`'s identical sentinel above.
     private static func cellBorder(_ tcPr: XMLNode?) -> (color: NSColor?, width: CGFloat?) {
-        guard let borders = tcPr?.child("w:tcBorders") else { return (nil, nil) }
+        resolveBorder(tcPr?.child("w:tcBorders"))
+    }
+
+    /// The table's OWN default border — `w:tbl/w:tblPr/w:tblBorders` — that every cell inherits
+    /// unless its own `w:tcBorders` (`cellBorder`, above) says otherwise; see `TableFormat`'s own
+    /// doc for the resolution chain this feeds. Shares `resolveBorder` with `cellBorder` because
+    /// `w:tblBorders` and `w:tcBorders` are the SAME edge-element shape (`w:top`/`w:left`/
+    /// `w:bottom`/`w:right`, each with `@w:val`/`@w:color`/`@w:sz`), just declared on the table
+    /// instead of the cell.
+    private static func tableBorder(_ tblPr: XMLNode?) -> (color: NSColor?, width: CGFloat?) {
+        resolveBorder(tblPr?.child("w:tblBorders"))
+    }
+
+    /// Shared by `cellBorder`/`tableBorder` — the ONE colour/width `Cell`/`TableFormat` have room
+    /// for (see `Cell.borderColor`'s own doc: a real per-edge model is out of this sprint's scope),
+    /// taken from the first of the four edges, checked top/left/bottom/right, that is actually
+    /// drawn (`w:val` present and neither `"nil"` nor `"none"`, OOXML's two ways of saying "no
+    /// border on this edge"). Real tables overwhelmingly border all four edges identically, so "the
+    /// first drawn edge" and "the table's/cell's border" agree in practice. `w:sz` is in EIGHTHS of
+    /// a point (ECMA-376 §17.4.66) — divided by 8, not 2 (that's `w:sz`'s OTHER unit, half-points,
+    /// used for run/paragraph mark sizes — the two `w:sz` attributes are unrelated despite sharing
+    /// a name). `w:color="auto"` resolves to `nil` (theme decides).
+    private static func resolveBorder(_ borders: XMLNode?) -> (color: NSColor?, width: CGFloat?) {
+        guard let borders else { return (nil, nil) }
         for edge in ["w:top", "w:left", "w:bottom", "w:right"] {
             guard let e = borders.child(edge), let val = e.attributes["w:val"], val != "nil", val != "none" else { continue }
             let color = e.attributes["w:color"].flatMap { $0.lowercased() == "auto" ? nil : colorFromHex($0) }
@@ -1756,6 +1790,33 @@ enum DocxReader: OfficeDocumentReader {
             return (color, width)
         }
         return (nil, nil)
+    }
+
+    /// A cell's own vertical alignment — `w:tcPr/w:vAlign/@w:val` (`"top"`/`"center"`/`"bottom"`;
+    /// any other/absent value, including Word's own `"both"` which this vocabulary has no case
+    /// for, reads as `nil` — see `Cell.verticalAlignment`'s own doc for why `nil` already means
+    /// Word's own default).
+    private static func cellVAlign(_ tcPr: XMLNode?) -> CellVAlign? {
+        switch tcPr?.child("w:vAlign")?.attributes["w:val"] {
+        case "top": return .top
+        case "center": return .center
+        case "bottom": return .bottom
+        default: return nil
+        }
+    }
+
+    /// A resolved cell margin — `w:tcMar` (per cell) or `w:tblCellMar` (table default), both the
+    /// SAME shape (`w:top`/`w:start`(or `w:left`)/`w:bottom`/`w:end`(or `w:right`), each an
+    /// `w:w`-in-twips element) — reduced to the ONE uniform value `Cell.padding` has room for (see
+    /// its own doc: the START/left edge, mirroring `ParagraphFormat.indentStart`'s same edge
+    /// choice). `nil` when the element itself is absent, or when its start/left edge is, so a
+    /// margin element that only sets OTHER edges is honestly read as "nothing here" rather than a
+    /// wrong edge's value smuggled in as the uniform one.
+    private static func cellMargin(_ marNode: XMLNode?) -> CGFloat? {
+        guard let marNode else { return nil }
+        let edge = marNode.child("w:start") ?? marNode.child("w:left")
+        guard let wStr = edge?.attributes["w:w"], let value = Double(wStr), value >= 0 else { return nil }
+        return CGFloat(value / 20)
     }
 
     /// A cell's own declared column width — `w:tcPr/w:tcW`, whose `@w:type` names which of THREE

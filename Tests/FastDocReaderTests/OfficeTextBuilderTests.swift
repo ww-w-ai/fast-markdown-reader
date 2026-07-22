@@ -1269,6 +1269,82 @@ final class OfficeTextBuilderTests: XCTestCase {
         XCTAssertEqual(block.backgroundColor, .systemOrange)
     }
 
+    // MARK: P3b — table-level default border/shading, cell vertical alignment, cell margins
+
+    /// A table-level default border/width (`TableFormat`, from a `w:tblBorders` the reader read)
+    /// is applied to a cell that declares no border of its own — the MIDDLE layer between the
+    /// cell's own value and the theme default.
+    func testTableDefaultBorderAppliesWhenTheCellDeclaresNoBorderOfItsOwn() {
+        let rows: [[Cell]] = [[Cell(spans: [span("A")])]]
+        let out = build([.table(rows: rows, headerRows: 0,
+                                format: TableFormat(defaultBorderColor: .systemPurple, defaultBorderWidth: 3))])
+        let block = try! XCTUnwrap(tableBlocks(in: out).first)
+        XCTAssertEqual(block.borderColor(for: .minX), .systemPurple)
+        XCTAssertEqual(block.width(for: .border, edge: .minX), 3)
+    }
+
+    /// A cell's OWN border still wins over a table-level default that exists alongside it.
+    func testCellOwnBorderWinsOverTheTableDefaultBorder() {
+        let rows: [[Cell]] = [[Cell(blocks: [.paragraph(spans: [span("A")])], borderColor: .systemRed, borderWidth: 5)]]
+        let out = build([.table(rows: rows, headerRows: 0,
+                                format: TableFormat(defaultBorderColor: .systemPurple, defaultBorderWidth: 3))])
+        let block = try! XCTUnwrap(tableBlocks(in: out).first)
+        XCTAssertEqual(block.borderColor(for: .minX), .systemRed)
+        XCTAssertEqual(block.width(for: .border, edge: .minX), 5)
+    }
+
+    /// A table-level default shading applies to a cell with no shading of its own — including a
+    /// HEADER cell, where it wins over the theme's own header shading too (a source-authored
+    /// table default is more specific than the app's synthetic header colour).
+    func testTableDefaultShadingAppliesToCellsWithNoShadingOfTheirOwnIncludingHeaderRows() {
+        let rows: [[Cell]] = [[Cell(spans: [span("H")])]]
+        let out = build([.table(rows: rows, headerRows: 1, format: TableFormat(defaultShading: .systemYellow))])
+        let block = try! XCTUnwrap(tableBlocks(in: out).first)
+        XCTAssertEqual(block.backgroundColor, .systemYellow)
+    }
+
+    /// A cell's OWN shading still wins over a table-level default.
+    func testCellOwnShadingWinsOverTheTableDefaultShading() {
+        let rows: [[Cell]] = [[Cell(blocks: [.paragraph(spans: [span("A")])], backgroundColor: .systemGreen)]]
+        let out = build([.table(rows: rows, headerRows: 0, format: TableFormat(defaultShading: .systemYellow))])
+        let block = try! XCTUnwrap(tableBlocks(in: out).first)
+        XCTAssertEqual(block.backgroundColor, .systemGreen)
+    }
+
+    /// `Cell.verticalAlignment == .center` becomes `NSTextTableBlock.verticalAlignment == .middleAlignment`.
+    func testCellVerticalAlignmentCenterBecomesMiddleAlignment() {
+        let rows: [[Cell]] = [[Cell(blocks: [.paragraph(spans: [span("A")])], verticalAlignment: .center)]]
+        let out = build([.table(rows: rows, headerRows: 0)])
+        let block = try! XCTUnwrap(tableBlocks(in: out).first)
+        XCTAssertEqual(block.verticalAlignment, .middleAlignment)
+    }
+
+    /// `nil` (the pre-sprint default) leaves AppKit's own already-`.topAlignment` untouched.
+    func testCellWithNoVerticalAlignmentKeepsTheDefaultTopAlignment() {
+        let rows: [[Cell]] = [[Cell(spans: [span("A")])]]
+        let out = build([.table(rows: rows, headerRows: 0)])
+        let block = try! XCTUnwrap(tableBlocks(in: out).first)
+        XCTAssertEqual(block.verticalAlignment, .topAlignment)
+    }
+
+    /// `Cell.padding` (already resolved by the reader against any table default) replaces the
+    /// hardcoded 7pt when present.
+    func testCellPaddingReplacesTheHardcodedSevenPointDefault() {
+        let rows: [[Cell]] = [[Cell(blocks: [.paragraph(spans: [span("A")])], padding: 12)]]
+        let out = build([.table(rows: rows, headerRows: 0)])
+        let block = try! XCTUnwrap(tableBlocks(in: out).first)
+        XCTAssertEqual(block.width(for: .padding, edge: .minX), 12)
+    }
+
+    /// `nil` (every markdown table, and a docx table/cell with no declared margin) keeps the
+    /// pre-sprint 7pt default exactly as before this field existed.
+    func testCellWithNoPaddingKeepsTheHardcodedSevenPointDefault() {
+        let rows: [[Cell]] = [[Cell(spans: [span("A")])]]
+        let out = build([.table(rows: rows, headerRows: 0)])
+        let block = try! XCTUnwrap(tableBlocks(in: out).first)
+        XCTAssertEqual(block.width(for: .padding, edge: .minX), 7)
+    }
+
     // MARK: P2 — ParagraphFormat → NSParagraphStyle (spacing/line-height/indent/contextualSpacing)
 
     private func paragraphStyle(in out: NSAttributedString, at index: Int = 0) -> NSParagraphStyle {

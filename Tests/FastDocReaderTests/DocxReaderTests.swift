@@ -838,7 +838,7 @@ final class DocxReaderTests: XCTestCase {
           <w:tr>\(tc(para("A")))\(tc(para("B")))\(tc(para("C")))</w:tr>
         </w:tbl>
         """)
-        guard case .table(_, _, let columnWidths) = blocks.first else { return XCTFail("expected a table block") }
+        guard case .table(_, _, let columnWidths, _) = blocks.first else { return XCTFail("expected a table block") }
         XCTAssertEqual(columnWidths, [100, 100, 300])
     }
 
@@ -850,7 +850,7 @@ final class DocxReaderTests: XCTestCase {
           <w:tr>\(tc(para("A")))\(tc(para("B")))</w:tr>
         </w:tbl>
         """)
-        guard case .table(_, _, let columnWidths) = blocks.first else { return XCTFail("expected a table block") }
+        guard case .table(_, _, let columnWidths, _) = blocks.first else { return XCTFail("expected a table block") }
         XCTAssertEqual(columnWidths, [])
     }
 
@@ -980,7 +980,7 @@ final class DocxReaderTests: XCTestCase {
         // alongside a nested table whose own cell says "Nested" — both must survive somewhere.
         let cellContent = para("Outer") + "<w:tbl><w:tr>\(tc(para("Nested")))</w:tr></w:tbl>"
         let blocks = try read(document: "<w:tbl><w:tr>\(tc(cellContent))</w:tr></w:tbl>")
-        guard case .table(let rows, _, _) = blocks.first else { return XCTFail("expected a table block") }
+        guard case .table(let rows, _, _, _) = blocks.first else { return XCTFail("expected a table block") }
         // `Cell` holds `blocks`, not `spans`, since S7 — the reader still flattens a nested table
         // into a single `.paragraph` at parse time, so pull its spans back out for this assertion.
         let allText = rows.flatMap { $0 }.flatMap { $0.blocks }.flatMap { block -> [Span] in
@@ -2360,7 +2360,7 @@ final class DocxReaderTests: XCTestCase {
         let blocks = try read(document: """
         <w:tbl><w:tr><w:tc><w:tcPr><w:shd w:fill="FFCC00"/></w:tcPr><w:p><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
         """)
-        guard case .table(let rows, _, _) = blocks.first else { return XCTFail("expected a table") }
+        guard case .table(let rows, _, _, _) = blocks.first else { return XCTFail("expected a table") }
         XCTAssertEqual(rows[0][0].backgroundColor, rgb("FFCC00"))
     }
 
@@ -2368,7 +2368,7 @@ final class DocxReaderTests: XCTestCase {
         let blocks = try read(document: """
         <w:tbl><w:tr><w:tc><w:tcPr><w:shd w:fill="auto"/></w:tcPr><w:p><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
         """)
-        guard case .table(let rows, _, _) = blocks.first else { return XCTFail("expected a table") }
+        guard case .table(let rows, _, _, _) = blocks.first else { return XCTFail("expected a table") }
         XCTAssertNil(rows[0][0].backgroundColor)
     }
 
@@ -2376,7 +2376,7 @@ final class DocxReaderTests: XCTestCase {
         let blocks = try read(document: """
         <w:tbl><w:tr><w:tc><w:tcPr><w:tcBorders><w:top w:val="single" w:sz="8" w:color="336699"/></w:tcBorders></w:tcPr><w:p><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
         """)
-        guard case .table(let rows, _, _) = blocks.first else { return XCTFail("expected a table") }
+        guard case .table(let rows, _, _, _) = blocks.first else { return XCTFail("expected a table") }
         XCTAssertEqual(rows[0][0].borderColor, rgb("336699"))
         XCTAssertEqual(rows[0][0].borderWidth, 1)
     }
@@ -2387,7 +2387,7 @@ final class DocxReaderTests: XCTestCase {
         let blocks = try read(document: """
         <w:tbl><w:tr><w:tc><w:tcPr><w:tcBorders><w:top w:val="none"/><w:left w:val="single" w:sz="16" w:color="112233"/></w:tcBorders></w:tcPr><w:p><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
         """)
-        guard case .table(let rows, _, _) = blocks.first else { return XCTFail("expected a table") }
+        guard case .table(let rows, _, _, _) = blocks.first else { return XCTFail("expected a table") }
         XCTAssertEqual(rows[0][0].borderColor, rgb("112233"))
         XCTAssertEqual(rows[0][0].borderWidth, 2)
     }
@@ -2396,7 +2396,7 @@ final class DocxReaderTests: XCTestCase {
         let blocks = try read(document: """
         <w:tbl><w:tr><w:tc><w:tcPr><w:tcW w:w="2880" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
         """)
-        guard case .table(let rows, _, _) = blocks.first else { return XCTFail("expected a table") }
+        guard case .table(let rows, _, _, _) = blocks.first else { return XCTFail("expected a table") }
         XCTAssertEqual(rows[0][0].width, 144)
     }
 
@@ -2406,8 +2406,125 @@ final class DocxReaderTests: XCTestCase {
         let blocks = try read(document: """
         <w:tbl><w:tr><w:tc><w:tcPr><w:tcW w:w="2500" w:type="pct"/></w:tcPr><w:p><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
         """)
-        guard case .table(let rows, _, _) = blocks.first else { return XCTFail("expected a table") }
+        guard case .table(let rows, _, _, _) = blocks.first else { return XCTFail("expected a table") }
         XCTAssertNil(rows[0][0].width)
+    }
+
+    // MARK: P3b — table-level default border/shading (w:tblPr/w:tblBorders, w:tblPr/w:shd)
+
+    /// A table-level `w:tblBorders` is carried as `TableFormat.defaultBorderColor`/`.defaultBorderWidth`
+    /// — a cell that declares no `w:tcBorders` of its own must NOT see it baked into `Cell.borderColor`/
+    /// `.borderWidth` (those stay `nil`, exactly as before this sprint); the table default is a
+    /// separate, later-resolved layer (`TableBlockBuilder`'s job), not something the reader smears
+    /// onto every cell.
+    func testTableLevelBordersAreCarriedOnTableFormatNotSmearedOntoEveryCell() throws {
+        let blocks = try read(document: """
+        <w:tbl><w:tblPr><w:tblBorders><w:top w:val="single" w:sz="8" w:color="336699"/></w:tblBorders></w:tblPr>
+        <w:tr><w:tc><w:p><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+        """)
+        guard case .table(let rows, _, _, let format) = blocks.first else { return XCTFail("expected a table") }
+        XCTAssertNil(rows[0][0].borderColor)
+        XCTAssertNil(rows[0][0].borderWidth)
+        XCTAssertEqual(format.defaultBorderColor, rgb("336699"))
+        XCTAssertEqual(format.defaultBorderWidth, 1)
+    }
+
+    /// A cell's own `w:tcBorders` is unaffected by a table-level default existing alongside it —
+    /// still read exactly as `testCellBorderColorAndWidthAreReadFromTheTopEdge` already covers.
+    func testCellOwnBorderIsStillReadWhenATableLevelDefaultAlsoExists() throws {
+        let blocks = try read(document: """
+        <w:tbl><w:tblPr><w:tblBorders><w:top w:val="single" w:sz="8" w:color="336699"/></w:tblBorders></w:tblPr>
+        <w:tr><w:tc><w:tcPr><w:tcBorders><w:top w:val="single" w:sz="16" w:color="112233"/></w:tcBorders></w:tcPr>
+        <w:p><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+        """)
+        guard case .table(let rows, _, _, let format) = blocks.first else { return XCTFail("expected a table") }
+        XCTAssertEqual(rows[0][0].borderColor, rgb("112233"))
+        XCTAssertEqual(rows[0][0].borderWidth, 2)
+        XCTAssertEqual(format.defaultBorderColor, rgb("336699"))
+    }
+
+    func testTableLevelShadingIsCarriedOnTableFormat() throws {
+        let blocks = try read(document: """
+        <w:tbl><w:tblPr><w:shd w:fill="FFCC00"/></w:tblPr>
+        <w:tr><w:tc><w:p><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+        """)
+        guard case .table(let rows, _, _, let format) = blocks.first else { return XCTFail("expected a table") }
+        XCTAssertNil(rows[0][0].backgroundColor)
+        XCTAssertEqual(format.defaultShading, rgb("FFCC00"))
+    }
+
+    /// A table with no `w:tblPr` at all — every markdown table, and most docx tables — constructs
+    /// the all-`nil` `TableFormat()` default.
+    func testTableWithNoTblPrGetsAnAllNilTableFormat() throws {
+        let blocks = try read(document: """
+        <w:tbl><w:tr><w:tc><w:p><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+        """)
+        guard case .table(_, _, _, let format) = blocks.first else { return XCTFail("expected a table") }
+        XCTAssertEqual(format, TableFormat())
+    }
+
+    // MARK: P3b — cell vertical alignment (w:tcPr/w:vAlign)
+
+    func testCellVAlignCenterIsReadAsCellVAlignCenter() throws {
+        let blocks = try read(document: """
+        <w:tbl><w:tr><w:tc><w:tcPr><w:vAlign w:val="center"/></w:tcPr><w:p><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+        """)
+        guard case .table(let rows, _, _, _) = blocks.first else { return XCTFail("expected a table") }
+        XCTAssertEqual(rows[0][0].verticalAlignment, .center)
+    }
+
+    func testCellWithNoVAlignHasNilVerticalAlignment() throws {
+        let blocks = try read(document: """
+        <w:tbl><w:tr><w:tc><w:p><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+        """)
+        guard case .table(let rows, _, _, _) = blocks.first else { return XCTFail("expected a table") }
+        XCTAssertNil(rows[0][0].verticalAlignment)
+    }
+
+    // MARK: P3b — cell margins (w:tcPr/w:tcMar, w:tblPr/w:tblCellMar)
+
+    /// `w:tcMar/w:start` in TWIPS converts to points the same way every other twips field does
+    /// (÷20) — 200 twips → 10pt.
+    func testCellOwnTcMarConvertsTwipsToPoints() throws {
+        let blocks = try read(document: """
+        <w:tbl><w:tr><w:tc><w:tcPr><w:tcMar><w:start w:w="200" w:type="dxa"/></w:tcMar></w:tcPr>
+        <w:p><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+        """)
+        guard case .table(let rows, _, _, _) = blocks.first else { return XCTFail("expected a table") }
+        XCTAssertEqual(rows[0][0].padding, 10)
+    }
+
+    /// A cell with no `w:tcMar` of its own inherits the table's `w:tblPr/w:tblCellMar` — 160
+    /// twips → 8pt, deliberately NOT `TableBlockBuilder`'s own 7pt fallback, so this test can't
+    /// pass by accident if the inheritance chain were dropped and `Cell.padding` stayed `nil`.
+    func testCellWithNoOwnTcMarInheritsTheTableDefaultCellMargin() throws {
+        let blocks = try read(document: """
+        <w:tbl><w:tblPr><w:tblCellMar><w:start w:w="160" w:type="dxa"/></w:tblCellMar></w:tblPr>
+        <w:tr><w:tc><w:p><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+        """)
+        guard case .table(let rows, _, _, _) = blocks.first else { return XCTFail("expected a table") }
+        XCTAssertEqual(rows[0][0].padding, 8)
+    }
+
+    /// A cell's OWN `w:tcMar` wins over the table's default when both are present.
+    func testCellOwnTcMarWinsOverTheTableDefaultCellMargin() throws {
+        let blocks = try read(document: """
+        <w:tbl><w:tblPr><w:tblCellMar><w:start w:w="140" w:type="dxa"/></w:tblCellMar></w:tblPr>
+        <w:tr><w:tc><w:tcPr><w:tcMar><w:start w:w="200" w:type="dxa"/></w:tcMar></w:tcPr>
+        <w:p><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+        """)
+        guard case .table(let rows, _, _, _) = blocks.first else { return XCTFail("expected a table") }
+        XCTAssertEqual(rows[0][0].padding, 10)
+    }
+
+    /// Neither the cell nor the table declares a margin — `Cell.padding` stays `nil`, exactly as
+    /// before this field existed (`TableBlockBuilder` keeps its own 7pt default).
+    func testCellWithNeitherOwnNorTableMarginHasNilPadding() throws {
+        let blocks = try read(document: """
+        <w:tbl><w:tr><w:tc><w:p><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+        """)
+        guard case .table(let rows, _, _, _) = blocks.first else { return XCTFail("expected a table") }
+        XCTAssertNil(rows[0][0].padding)
     }
 
     // MARK: Invariant 29 — reached through `MarkdownDocument`'s own read path

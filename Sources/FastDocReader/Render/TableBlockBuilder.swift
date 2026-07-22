@@ -28,6 +28,12 @@ enum TableBlockBuilder {
         var borderColor: NSColor? = nil
         var borderWidth: CGFloat? = nil
         var width: CGFloat? = nil
+        /// Mirrors `Cell.verticalAlignment` — `nil` leaves `NSTextTableBlock`'s already-`.top`
+        /// vertical alignment untouched.
+        var verticalAlignment: CellVAlign? = nil
+        /// Mirrors `Cell.padding` — already resolved by the caller against any table default;
+        /// `nil` means neither said anything, and `build` keeps its own pre-existing 7pt default.
+        var padding: CGFloat? = nil
     }
 
     /// - Parameters:
@@ -46,8 +52,15 @@ enum TableBlockBuilder {
     ///     leaves this function's PRE-EXISTING per-cell/auto layout completely untouched; only a
     ///     usable grid switches a placed cell's width source from `CellContent.width` (absolute) to
     ///     a percentage of these ratios (see the per-placement loop below).
+    ///   - tableBorderColor/tableBorderWidth/tableShading: the table's OWN default border/shading
+    ///     (see `TableFormat`) — the MIDDLE layer of the resolution chain a placed cell now goes
+    ///     through: its own value, then these table defaults, then (only if both are `nil`) this
+    ///     function's pre-existing theme default. All three default to `nil`, so a caller that never
+    ///     mentions them (every markdown table) renders BYTE-IDENTICAL to before these parameters
+    ///     existed.
     static func build(rows: [[CellContent]], headerRows: Int, theme: RenderTheme,
-                       columnWidths: [CGFloat] = []) -> NSAttributedString {
+                       columnWidths: [CGFloat] = [], tableBorderColor: NSColor? = nil,
+                       tableBorderWidth: CGFloat? = nil, tableShading: NSColor? = nil) -> NSAttributedString {
         let result = NSMutableAttributedString()
         guard !rows.isEmpty else { return result }
 
@@ -127,16 +140,30 @@ enum TableBlockBuilder {
             let header = placement.row < headerRows
             let block = NSTextTableBlock(table: textTable, startingRow: placement.row, rowSpan: placement.rowSpan,
                                          startingColumn: placement.col, columnSpan: placement.colSpan)
-            // An authored border/width/background on the ANCHOR cell wins over the theme default —
-            // a covered position (`placement.cell == nil`, padding the grid) never has one to win
-            // with, so it always gets the plain theme look.
-            block.setBorderColor(placement.cell?.borderColor ?? Palette.tableBorder)
-            block.setWidth(placement.cell?.borderWidth ?? 1, type: .absoluteValueType, for: .border)
-            block.setWidth(7, type: .absoluteValueType, for: .padding)
+            // An authored border/width/background on the ANCHOR cell wins over the table's own
+            // default, which in turn wins over the theme default — a covered position
+            // (`placement.cell == nil`, padding the grid) never has a cell OR table value to win
+            // with, so it always gets the plain theme look. (`tableBorderColor`/`tableBorderWidth`/
+            // `tableShading` are `nil` for every markdown table and any docx table with no
+            // `w:tblPr` default, so this chain collapses to exactly the old two-step lookup then.)
+            block.setBorderColor(placement.cell?.borderColor ?? tableBorderColor ?? Palette.tableBorder)
+            block.setWidth(placement.cell?.borderWidth ?? tableBorderWidth ?? 1, type: .absoluteValueType, for: .border)
+            block.setWidth(placement.cell?.padding ?? 7, type: .absoluteValueType, for: .padding)
             if let bg = placement.cell?.backgroundColor {
                 block.backgroundColor = bg
+            } else if let tableShading {
+                block.backgroundColor = tableShading
             } else if header {
                 block.backgroundColor = Palette.tableHeaderBg
+            }
+            // `nil` leaves AppKit's own already-`.top` default untouched — see
+            // `Cell.verticalAlignment`'s doc comment for why there's no table-level default to fall
+            // through to here (only a per-cell `w:vAlign` exists in the source spec).
+            switch placement.cell?.verticalAlignment {
+            case .top: block.verticalAlignment = .topAlignment
+            case .center: block.verticalAlignment = .middleAlignment
+            case .bottom: block.verticalAlignment = .bottomAlignment
+            case nil: break
             }
             if !columnPercentages.isEmpty {
                 // A spanned cell gets the SUM of every grid column it covers — that is what keeps
