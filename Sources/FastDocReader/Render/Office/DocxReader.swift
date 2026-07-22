@@ -290,6 +290,48 @@ enum DocxReader: OfficeDocumentReader {
         /// `word/theme/theme1.xml` is absent or malformed — every theme-colour lookup then simply
         /// misses, degrading to "no colour" (`resolvedColorElement`), never a crash.
         var themeColors: [String: NSColor] = [:]
+        /// styleId → the TABLE style it declares (`w:style w:type="table"`) — P5's table-STYLE
+        /// shading/border cascade (`w:tblStylePr` conditional formatting). Only styles that
+        /// declare a whole-table default OR at least one conditional region are present; a
+        /// `w:basedOn` on a table style is recorded in the SAME `basedOn` map above (that field
+        /// is not itself type-scoped — see `parseStyles`'s unconditional read of it), so
+        /// `walkStyleChain` climbs a table style's ancestry exactly like every other style kind.
+        var tableStyles: [String: TableStyle] = [:]
+    }
+
+    /// One resolved layer of a table style's conditional formatting — either the style's own
+    /// whole-table default (`w:tblPr`/`w:tcPr` directly on the `w:style`) or one `w:tblStylePr`
+    /// region block's shading/border. `nil` fields mean this level didn't say — the SAME
+    /// transparent-cascade reading every other style-chain resolver in this reader uses.
+    private struct TableConditionalStyle {
+        var shading: NSColor?
+        var borderColor: NSColor?
+        var borderWidth: CGFloat?
+    }
+
+    /// One `w:style w:type="table"` — a whole-table default plus a region→conditional map keyed
+    /// by `w:tblStylePr`'s own `@w:type` (`"firstRow"`, `"lastRow"`, `"firstCol"`, `"lastCol"`,
+    /// `"band1Horz"`/`"band2Horz"`, `"band1Vert"`/`"band2Vert"`, the four corner cells). See
+    /// `resolveCellTableStyle` for how a cell's grid position picks which of these apply and in
+    /// what precedence.
+    private struct TableStyle {
+        var wholeTable = TableConditionalStyle()
+        var regions: [String: TableConditionalStyle] = [:]
+    }
+
+    /// A table's `w:tblPr/w:tblLook` — which of the named style's conditional regions are ACTIVE
+    /// for this particular table (ECMA-376 §17.4.63/§17.4.64). Two authoring forms exist and this
+    /// reads either: modern Word emits explicit `w:firstRow`/`w:lastRow`/`w:firstColumn`/
+    /// `w:lastColumn`/`w:noHBand`/`w:noVBand` boolean attributes; older documents instead carry
+    /// only a hex `@w:val` bitmask (`0x0020` firstRow, `0x0040` lastRow, `0x0080` firstColumn,
+    /// `0x0100` lastColumn, `0x0200` noHBand, `0x0400` noVBand) — see `parseTblLook`.
+    private struct TblLook {
+        var firstRow = false
+        var lastRow = false
+        var firstColumn = false
+        var lastColumn = false
+        var noHBand = false
+        var noVBand = false
     }
 
     /// Reads every per-style signal this reader now resolves through the `w:basedOn` chain:
@@ -331,8 +373,163 @@ enum DocxReader: OfficeDocumentReader {
                 || paraProps.contextualSpacing != nil || paraProps.shading != nil || paraProps.border != nil {
                 info.paraProps[id] = paraProps
             }
+            if style.attributes["w:type"] == "table" {
+                var tableStyle = TableStyle()
+                tableStyle.wholeTable = parseTableConditionalStyle(style)
+                for pr in style.children where pr.name == "w:tblStylePr" {
+                    guard let region = pr.attributes["w:type"] else { continue }
+                    let cond = parseTableConditionalStyle(pr)
+                    if cond.shading != nil || cond.borderColor != nil || cond.borderWidth != nil {
+                        tableStyle.regions[region] = cond
+                    }
+                }
+                let wt = tableStyle.wholeTable
+                if wt.shading != nil || wt.borderColor != nil || wt.borderWidth != nil || !tableStyle.regions.isEmpty {
+                    info.tableStyles[id] = tableStyle
+                }
+            }
         }
         return info
+    }
+
+    /// One level of a table style's conditional formatting — either the `w:style` element itself
+    /// (its own whole-table `w:tblPr`/`w:tcPr`) or one of its `w:tblStylePr` children (a region's
+    /// `w:tcPr`/`w:tblPr`). Shading and border are each read cell-level (`w:tcPr/w:shd`,
+    /// `w:tcPr/w:tcBorders`) FIRST, falling to the rarer table-level spelling
+    /// (`w:tblPr/w:shd`/`w:tblPr/w:tblBorders`) only when the cell-level one is entirely absent —
+    /// mirroring `cellShading`/`cellBorder`'s own "auto"/absent-edge sentinel reading via
+    /// `colorFromHex`/`resolveBorder`, reused here rather than re-implemented.
+    private static func parseTableConditionalStyle(_ node: XMLNode) -> TableConditionalStyle {
+        var result = TableConditionalStyle()
+        let tcPr = node.child("w:tcPr")
+        let tblPr = node.child("w:tblPr")
+        if let fill = tcPr?.child("w:shd")?.attributes["w:fill"], fill.lowercased() != "auto" {
+            result.shading = colorFromHex(fill)
+        } else if let fill = tblPr?.child("w:shd")?.attributes["w:fill"], fill.lowercased() != "auto" {
+            result.shading = colorFromHex(fill)
+        }
+        let cellBorder = resolveBorder(tcPr?.child("w:tcBorders"))
+        if cellBorder.color != nil || cellBorder.width != nil {
+            result.borderColor = cellBorder.color
+            result.borderWidth = cellBorder.width
+        } else {
+            let tableBorder = resolveBorder(tblPr?.child("w:tblBorders"))
+            result.borderColor = tableBorder.color
+            result.borderWidth = tableBorder.width
+        }
+        return result
+    }
+
+    /// `w:tblPr/w:tblLook` — see `TblLook`'s own doc for the two authoring forms. The attribute
+    /// form wins whenever ANY of the six boolean attributes is present (a document that authors
+    /// even one of them is using the modern form; a missing attribute among those six then means
+    /// an explicit `false`, not "fall to the hex bitmask"). Only when NONE of the six attributes
+    /// is present does the hex `@w:val` bitmask apply. No `w:tblLook` at all — most hand-authored
+    /// or older documents — leaves every flag `false`, meaning no conditional region of the named
+    /// style is active and a cell's resolved style format collapses to the whole-table default
+    /// alone (see `resolveCellTableStyle`).
+    private static func parseTblLook(_ tblPr: XMLNode?) -> TblLook {
+        var look = TblLook()
+        guard let node = tblPr?.child("w:tblLook") else { return look }
+        let attrKeys = ["w:firstRow", "w:lastRow", "w:firstColumn", "w:lastColumn", "w:noHBand", "w:noVBand"]
+        if attrKeys.contains(where: { node.attributes[$0] != nil }) {
+            look.firstRow = tblLookFlag(node, "w:firstRow")
+            look.lastRow = tblLookFlag(node, "w:lastRow")
+            look.firstColumn = tblLookFlag(node, "w:firstColumn")
+            look.lastColumn = tblLookFlag(node, "w:lastColumn")
+            look.noHBand = tblLookFlag(node, "w:noHBand")
+            look.noVBand = tblLookFlag(node, "w:noVBand")
+        } else if let hex = node.attributes["w:val"], let bits = UInt16(hex, radix: 16) {
+            look.firstRow = bits & 0x0020 != 0
+            look.lastRow = bits & 0x0040 != 0
+            look.firstColumn = bits & 0x0080 != 0
+            look.lastColumn = bits & 0x0100 != 0
+            look.noHBand = bits & 0x0200 != 0
+            look.noVBand = bits & 0x0400 != 0
+        }
+        return look
+    }
+
+    private static func tblLookFlag(_ node: XMLNode, _ key: String) -> Bool {
+        guard let val = node.attributes[key] else { return false }
+        return val != "0" && val.lowercased() != "false"
+    }
+
+    /// Resolves ONE region's (or the whole-table default's, when `region` is `nil`) conditional
+    /// style by climbing `styleId`'s `w:basedOn` chain (`walkStyleChain` — the same cycle-guarded
+    /// walk every other per-property resolver in this reader shares) until a style in the chain
+    /// declares SOMETHING for that region. A style with no `tableStyles` entry at all (an
+    /// empty style that exists only to declare `w:basedOn`) is transparent — the walk keeps
+    /// climbing past it rather than stopping — but the granularity beyond that is per REGION,
+    /// not per individual field within one: a style that sets ONLY that region's shading (leaving
+    /// its border unset) still wins outright over an ancestor that set the region's border, rather
+    /// than the two merging field-by-field. Mirrors `Cell.borderColor`'s own documented
+    /// simplification (one uniform value, not a four-edge model) — a real per-field cascade WITHIN
+    /// one region is out of this sprint's scope; `resolveCellTableStyle`'s own layering (below) is
+    /// what still gives per-field precedence ACROSS different regions on the same cell.
+    private static func resolvedTableConditional(
+        _ region: String?, styleId: String, styleInfo: StyleInfo
+    ) -> TableConditionalStyle? {
+        walkStyleChain(styleId, styleInfo: styleInfo) { id -> TableConditionalStyle? in
+            guard let tableStyle = styleInfo.tableStyles[id] else { return nil }
+            guard let region else {
+                let wt = tableStyle.wholeTable
+                return (wt.shading != nil || wt.borderColor != nil || wt.borderWidth != nil) ? wt : nil
+            }
+            return tableStyle.regions[region]
+        }
+    }
+
+    /// Resolves a single cell's table-STYLE shading/border (P5) — the layer `Cell.styleShading`/
+    /// `.styleBorderColor`/`.styleBorderWidth` carry — from the table's named style
+    /// (`w:tblPr/w:tblStyle`) and this cell's position in the grid. Layers every APPLICABLE
+    /// conditional region onto the whole-table default, LOW to HIGH precedence, overriding
+    /// per-FIELD (not as a whole-object swap) so a region that only sets shading, say, still
+    /// leaves a higher layer's untouched border in place from whatever set it: `wholeTable` <
+    /// vertical banding < horizontal banding < `firstCol`/`lastCol` < `firstRow`/`lastRow` <
+    /// the four corner cells — the corners winning over everything else because a document that
+    /// bothers to style them (`nwCell` etc.) is deliberately calling out that ONE cell.
+    ///
+    /// Banding counts BODY rows/columns — rows after `headerRows` (the table's OWN declared
+    /// header rows, `w:tblHeader`, independent of `look.firstRow`) and columns after column 0
+    /// when `look.firstColumn` is active — so band 1 is always the first body row/column, band 2
+    /// the second, alternating from there; `look.noHBand`/`.noVBand` disables the corresponding
+    /// axis entirely rather than just skipping the alternation.
+    private static func resolveCellTableStyle(
+        styleId: String, styleInfo: StyleInfo, look: TblLook,
+        row: Int, col: Int, rowCount: Int, colCount: Int, headerRows: Int
+    ) -> (shading: NSColor?, borderColor: NSColor?, borderWidth: CGFloat?) {
+        var order: [String?] = [nil] // whole-table default, lowest precedence
+        let bodyColStart = look.firstColumn ? 1 : 0
+        if !look.noVBand, col >= bodyColStart {
+            order.append((col - bodyColStart) % 2 == 0 ? "band1Vert" : "band2Vert")
+        }
+        if !look.noHBand, row >= headerRows {
+            order.append((row - headerRows) % 2 == 0 ? "band1Horz" : "band2Horz")
+        }
+        let isFirstCol = look.firstColumn && col == 0
+        let isLastCol = look.lastColumn && colCount > 1 && col == colCount - 1
+        let isFirstRow = look.firstRow && row == 0
+        let isLastRow = look.lastRow && rowCount > 1 && row == rowCount - 1
+        if isFirstCol { order.append("firstCol") }
+        if isLastCol { order.append("lastCol") }
+        if isFirstRow { order.append("firstRow") }
+        if isLastRow { order.append("lastRow") }
+        if isFirstRow && isFirstCol { order.append("nwCell") }
+        if isFirstRow && isLastCol { order.append("neCell") }
+        if isLastRow && isFirstCol { order.append("swCell") }
+        if isLastRow && isLastCol { order.append("seCell") }
+
+        var shading: NSColor?
+        var borderColor: NSColor?
+        var borderWidth: CGFloat?
+        for region in order {
+            guard let cond = resolvedTableConditional(region, styleId: styleId, styleInfo: styleInfo) else { continue }
+            if let s = cond.shading { shading = s }
+            if let bc = cond.borderColor { borderColor = bc }
+            if let bw = cond.borderWidth { borderWidth = bw }
+        }
+        return (shading, borderColor, borderWidth)
     }
 
     /// One style's (or one run's own) `w:rPr`, reduced to the four fields this sprint resolves —
@@ -1668,12 +1865,24 @@ enum DocxReader: OfficeDocumentReader {
         // itself falls back to `nil` (and `TableBlockBuilder`'s pre-existing 7pt default).
         let tableDefaultMargin = cellMargin(tblPr?.child("w:tblCellMar"))
         var rows: [[Cell]] = []
+        // Parallel to `rows` — each anchor cell's own starting grid column, so a second pass
+        // (below, after the grid's full row/column extent is known) can resolve its table-STYLE
+        // shading/border (P5) by POSITION. Kept separate from `Cell` itself rather than folded
+        // into it: a covered (merge-continued) position never gets an entry here either, exactly
+        // mirroring `rows`' own anchor-only shape.
+        var positions: [[Int]] = []
+        // The grid's total column count, discovered as the row walk below encounters `w:tc`/
+        // `w:gridSpan` — the same quantity `tableGridColumnWidths` derives independently from
+        // `w:tblGrid` when that part exists; this is the fallback for tables that don't declare
+        // one (an un-styled table never needs it, so it costs nothing there).
+        var maxGridCol = 0
         // Grid column → where in `rows` its currently-open vertical-merge anchor lives, so a
         // `continue` cell several rows down can find the top cell and extend ITS `rowSpan` instead
         // of becoming a cell of its own.
         var openMerge: [Int: (row: Int, cell: Int)] = [:]
         for row in rowNodes {
             var rowCells: [Cell] = []
+            var rowPositions: [Int] = []
             var gridCol = 0
             for tc in row.children where tc.name == "w:tc" {
                 let tcPr = tc.child("w:tcPr")
@@ -1708,6 +1917,7 @@ enum DocxReader: OfficeDocumentReader {
                         blocks: blocks, rowSpan: 1, colSpan: colSpan,
                         backgroundColor: cellShading(tcPr), borderColor: borderColor, borderWidth: borderWidth,
                         width: cellWidth(tcPr), verticalAlignment: cellVAlign(tcPr), padding: resolvedMargin))
+                    rowPositions.append(gridCol)
                     if vMerge != nil {
                         // `val="restart"` — the top of a genuine new vertical-merge chain; later
                         // `continue` cells at this column extend THIS cell's `rowSpan`.
@@ -1721,8 +1931,10 @@ enum DocxReader: OfficeDocumentReader {
                     }
                 }
                 gridCol += colSpan
+                maxGridCol = max(maxGridCol, gridCol)
             }
             rows.append(rowCells)
+            positions.append(rowPositions)
         }
         // Defensive clamp: an anchor's `rowSpan` can never claim more rows than the table actually
         // has left below it. This reader's own construction above can't overshoot (it only grows a
@@ -1746,7 +1958,31 @@ enum DocxReader: OfficeDocumentReader {
         let (tableBorderColor, tableBorderWidth) = tableBorder(tblPr)
         let format = TableFormat(defaultBorderColor: tableBorderColor, defaultBorderWidth: tableBorderWidth,
                                  defaultShading: cellShading(tblPr))
-        return .table(rows: rows, headerRows: headerRows, columnWidths: tableGridColumnWidths(tbl), format: format)
+        // P5 — table-STYLE shading/border cascade (`w:tblStyle` + `w:tblStylePr` + `w:tblLook`).
+        // A table with no named style (every markdown-sourced table, and most plain docx tables)
+        // skips this entirely, leaving every cell's `styleShading`/`styleBorderColor`/
+        // `styleBorderWidth` at their default `nil` — BYTE-IDENTICAL to before this cascade
+        // existed. `rowCount`/`colCount` are the grid's own dimensions (not `rows.count`'s literal
+        // anchor tally, which undercounts once any span is wider than 1 — see `positions`' doc).
+        let gridWidths = tableGridColumnWidths(tbl)
+        if let tblStyleId = tblPr?.child("w:tblStyle")?.attributes["w:val"], !rows.isEmpty {
+            let colCount = gridWidths.isEmpty ? maxGridCol : gridWidths.count
+            if colCount > 0 {
+                let look = parseTblLook(tblPr)
+                for r in rows.indices {
+                    for c in rows[r].indices {
+                        let resolved = resolveCellTableStyle(
+                            styleId: tblStyleId, styleInfo: styleInfo, look: look,
+                            row: r, col: positions[r][c], rowCount: rowNodes.count, colCount: colCount,
+                            headerRows: headerRows)
+                        rows[r][c].styleShading = resolved.shading
+                        rows[r][c].styleBorderColor = resolved.borderColor
+                        rows[r][c].styleBorderWidth = resolved.borderWidth
+                    }
+                }
+            }
+        }
+        return .table(rows: rows, headerRows: headerRows, columnWidths: gridWidths, format: format)
     }
 
     /// `w:tbl/w:tblGrid/w:gridCol/@w:w` — the table's OWN authoritative column widths (ECMA-376

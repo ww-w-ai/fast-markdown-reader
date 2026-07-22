@@ -155,6 +155,19 @@ struct Cell: Equatable {
     /// per-edge model nothing here would consistently fill in.
     var padding: CGFloat? = nil
 
+    /// The cell's shading RESOLVED from the table's named STYLE (docx `w:tbl/w:tblPr/w:tblStyle`
+    /// cascaded through that style's `w:tblStylePr` conditional blocks for this cell's grid
+    /// position — P5) — `nil` means the table either has no named style, or that style has no
+    /// shading applicable to this position. A LOWER-priority layer than `backgroundColor`
+    /// (this cell's own direct `w:tcPr/w:shd`) and the table's own DIRECT default
+    /// (`TableFormat.defaultShading`): `TableBlockBuilder` only falls to this when both of those
+    /// are `nil`, and falls further still to the header theme colour when this is `nil` too.
+    var styleShading: NSColor? = nil
+    /// The cell's border colour/width RESOLVED from the table's named STYLE, mirroring
+    /// `styleShading`'s doc — same lower-priority layer, same position-conditional resolution.
+    var styleBorderColor: NSColor? = nil
+    var styleBorderWidth: CGFloat? = nil
+
     /// Back-compat convenience for the many construction sites (both readers' plain-text cells,
     /// most existing tests) that only ever need a cell of formatted text — wraps the spans in a
     /// single `.paragraph`, which `OfficeTextBuilder` renders BYTE-IDENTICAL to the pre-sprint

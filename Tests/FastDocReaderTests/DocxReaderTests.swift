@@ -2650,6 +2650,148 @@ final class DocxReaderTests: XCTestCase {
         XCTAssertNil(rows[0][0].padding)
     }
 
+    // MARK: P5 — table-STYLE shading/border cascade (w:tblStyle + w:tblStylePr + w:tblLook)
+
+    /// A table style with a whole-table border, a `firstRow` shading and `band1Horz`/`band2Horz`
+    /// shadings, referenced by a table whose `w:tblLook` enables `firstRow` + banding: the header
+    /// cell gets the `firstRow` shading, body row 1 gets `band1Horz`, body row 2 gets `band2Horz`,
+    /// and every cell gets the whole-table border — MUST-have coverage per the sprint brief.
+    private let gridTableStyles = """
+    <w:styles>
+      <w:style w:type="table" w:styleId="TestGrid">
+        <w:tblPr><w:tblBorders><w:top w:val="single" w:sz="8" w:color="336699"/></w:tblBorders></w:tblPr>
+        <w:tblStylePr w:type="firstRow"><w:tcPr><w:shd w:fill="FFCC00"/></w:tcPr></w:tblStylePr>
+        <w:tblStylePr w:type="band1Horz"><w:tcPr><w:shd w:fill="EEEEEE"/></w:tcPr></w:tblStylePr>
+        <w:tblStylePr w:type="band2Horz"><w:tcPr><w:shd w:fill="CCCCCC"/></w:tcPr></w:tblStylePr>
+      </w:style>
+    </w:styles>
+    """
+
+    private func gridTable(extraTblPr: String = "") -> String {
+        """
+        <w:tbl>
+          <w:tblPr><w:tblStyle w:val="TestGrid"/>
+            <w:tblLook w:firstRow="1" w:lastRow="0" w:firstColumn="0" w:lastColumn="0" w:noHBand="0" w:noVBand="0"/>
+            \(extraTblPr)
+          </w:tblPr>
+          <w:tr><w:trPr><w:tblHeader/></w:trPr><w:tc><w:p><w:r><w:t>H</w:t></w:r></w:p></w:tc></w:tr>
+          <w:tr><w:tc><w:p><w:r><w:t>R1</w:t></w:r></w:p></w:tc></w:tr>
+          <w:tr><w:tc><w:p><w:r><w:t>R2</w:t></w:r></w:p></w:tc></w:tr>
+        </w:tbl>
+        """
+    }
+
+    func testHeaderRowGetsFirstRowStyleShadingAndEveryRowGetsTheWholeTableStyleBorder() throws {
+        let blocks = try read(document: gridTable(), styles: gridTableStyles)
+        guard case .table(let rows, _, _, _) = blocks.first else { return XCTFail("expected a table") }
+        XCTAssertEqual(rows[0][0].styleShading, rgb("FFCC00"))
+        for r in 0..<3 {
+            XCTAssertEqual(rows[r][0].styleBorderColor, rgb("336699"), "row \(r)")
+            XCTAssertEqual(rows[r][0].styleBorderWidth, 1, "row \(r)")
+        }
+    }
+
+    func testBodyRowsAlternateBand1AndBand2HorzStyleShading() throws {
+        let blocks = try read(document: gridTable(), styles: gridTableStyles)
+        guard case .table(let rows, _, _, _) = blocks.first else { return XCTFail("expected a table") }
+        XCTAssertEqual(rows[1][0].styleShading, rgb("EEEEEE"), "first body row = band1Horz")
+        XCTAssertEqual(rows[2][0].styleShading, rgb("CCCCCC"), "second body row = band2Horz")
+    }
+
+    /// A cell's OWN direct `w:tcPr/w:shd` still wins over the table-style layer — precedence is
+    /// resolved downstream (`TableBlockBuilder`), so the reader must still carry BOTH values
+    /// through rather than suppressing the style one because a direct one exists.
+    func testCellOwnDirectShadingCoexistsWithButOutrPrioritizesTheStyleLayer() throws {
+        let blocks = try read(document: """
+        <w:tbl>
+          <w:tblPr><w:tblStyle w:val="TestGrid"/>
+            <w:tblLook w:firstRow="1" w:lastRow="0" w:firstColumn="0" w:lastColumn="0" w:noHBand="0" w:noVBand="0"/>
+          </w:tblPr>
+          <w:tr><w:trPr><w:tblHeader/></w:trPr>
+          <w:tc><w:tcPr><w:shd w:fill="FF0000"/></w:tcPr><w:p><w:r><w:t>H</w:t></w:r></w:p></w:tc></w:tr>
+        </w:tbl>
+        """, styles: gridTableStyles)
+        guard case .table(let rows, _, _, _) = blocks.first else { return XCTFail("expected a table") }
+        XCTAssertEqual(rows[0][0].backgroundColor, rgb("FF0000"))
+        XCTAssertEqual(rows[0][0].styleShading, rgb("FFCC00"))
+    }
+
+    /// `w:tblLook`'s `noHBand="1"` disables horizontal banding entirely — a body row that would
+    /// otherwise get `band1Horz` gets no table-style shading at all.
+    func testTblLookNoHBandDisablesHorizontalBandingEntirely() throws {
+        let blocks = try read(document: """
+        <w:tbl>
+          <w:tblPr><w:tblStyle w:val="TestGrid"/>
+            <w:tblLook w:firstRow="0" w:lastRow="0" w:firstColumn="0" w:lastColumn="0" w:noHBand="1" w:noVBand="0"/>
+          </w:tblPr>
+          <w:tr><w:tc><w:p><w:r><w:t>R1</w:t></w:r></w:p></w:tc></w:tr>
+          <w:tr><w:tc><w:p><w:r><w:t>R2</w:t></w:r></w:p></w:tc></w:tr>
+        </w:tbl>
+        """, styles: gridTableStyles)
+        guard case .table(let rows, _, _, _) = blocks.first else { return XCTFail("expected a table") }
+        XCTAssertNil(rows[0][0].styleShading)
+        XCTAssertNil(rows[1][0].styleShading)
+    }
+
+    /// `w:tblLook`'s older HEX `@w:val` bitmask form (no boolean attributes at all) — exercises
+    /// `parseTblLook`'s hex branch, which every other P5 test leaves untouched. `0x0620` =
+    /// `0x0020`(firstRow) | `0x0200`(noHBand) | `0x0400`(noVBand): row 0 still gets the `firstRow`
+    /// style shading (proves the firstRow BIT is read), and both body rows get none at all — even
+    /// though `TestGrid` defines `band1Horz`/`band2Horz` — because the `noHBand` BIT is SET (proves
+    /// the inversion: a set bit means banding is OFF, not on).
+    func testTblLookHexValBitmaskFormIsReadTheSameAsTheAttributeForm() throws {
+        let blocks = try read(document: """
+        <w:tbl>
+          <w:tblPr><w:tblStyle w:val="TestGrid"/>
+            <w:tblLook w:val="0620"/>
+          </w:tblPr>
+          <w:tr><w:trPr><w:tblHeader/></w:trPr><w:tc><w:p><w:r><w:t>H</w:t></w:r></w:p></w:tc></w:tr>
+          <w:tr><w:tc><w:p><w:r><w:t>R1</w:t></w:r></w:p></w:tc></w:tr>
+          <w:tr><w:tc><w:p><w:r><w:t>R2</w:t></w:r></w:p></w:tc></w:tr>
+        </w:tbl>
+        """, styles: gridTableStyles)
+        guard case .table(let rows, _, _, _) = blocks.first else { return XCTFail("expected a table") }
+        XCTAssertEqual(rows[0][0].styleShading, rgb("FFCC00"), "0x0020 firstRow bit must apply")
+        XCTAssertNil(rows[1][0].styleShading, "0x0200 noHBand bit must disable banding")
+        XCTAssertNil(rows[2][0].styleShading, "0x0200 noHBand bit must disable banding")
+    }
+
+    /// A table style with NO content of its own beyond `w:basedOn` inherits its whole-table
+    /// shading from the parent style it's based on — the `walkStyleChain` climb this cascade
+    /// shares with every other style-chain resolver in this reader.
+    func testTableStyleWithNoOwnContentInheritsWholeTableShadingFromItsBasedOnParent() throws {
+        let styles = """
+        <w:styles>
+          <w:style w:type="table" w:styleId="ParentGrid">
+            <w:tblPr><w:shd w:fill="00FF00"/></w:tblPr>
+          </w:style>
+          <w:style w:type="table" w:styleId="ChildGrid">
+            <w:basedOn w:val="ParentGrid"/>
+          </w:style>
+        </w:styles>
+        """
+        let blocks = try read(document: """
+        <w:tbl>
+          <w:tblPr><w:tblStyle w:val="ChildGrid"/></w:tblPr>
+          <w:tr><w:tc><w:p><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr>
+        </w:tbl>
+        """, styles: styles)
+        guard case .table(let rows, _, _, _) = blocks.first else { return XCTFail("expected a table") }
+        XCTAssertEqual(rows[0][0].styleShading, rgb("00FF00"))
+    }
+
+    /// A table with no `w:tblStyle` at all — every markdown table, and most docx tables — leaves
+    /// every cell's style-layer fields `nil`, byte-identical to before this cascade existed.
+    func testTableWithNoTblStyleLeavesEveryCellsStyleLayerFieldsNil() throws {
+        let blocks = try read(document: """
+        <w:tbl><w:tr><w:tc><w:p><w:r><w:t>Cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+        """, styles: gridTableStyles)
+        guard case .table(let rows, _, _, _) = blocks.first else { return XCTFail("expected a table") }
+        XCTAssertNil(rows[0][0].styleShading)
+        XCTAssertNil(rows[0][0].styleBorderColor)
+        XCTAssertNil(rows[0][0].styleBorderWidth)
+    }
+
     // MARK: Invariant 29 — reached through `MarkdownDocument`'s own read path
 
     /// A theme-coloured run must resolve identically through `DocumentTypes.readOffice` — not

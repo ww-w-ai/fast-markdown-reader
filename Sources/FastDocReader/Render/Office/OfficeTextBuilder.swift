@@ -601,7 +601,9 @@ enum OfficeTextBuilder {
                                                       backgroundColor: cell.backgroundColor,
                                                       borderColor: cell.borderColor, borderWidth: cell.borderWidth,
                                                       width: cell.width, verticalAlignment: cell.verticalAlignment,
-                                                      padding: cell.padding)
+                                                      padding: cell.padding, styleShading: cell.styleShading,
+                                                      styleBorderColor: cell.styleBorderColor,
+                                                      styleBorderWidth: cell.styleBorderWidth)
             }
         }
         result.append(TableBlockBuilder.build(rows: cellRows, headerRows: headerRows, theme: theme,

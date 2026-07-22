@@ -1383,6 +1383,18 @@ final class OfficeTextBuilderTests: XCTestCase {
         XCTAssertEqual(block.backgroundColor, .systemGreen)
     }
 
+    /// P5 — a cell carrying BOTH its own direct `backgroundColor` AND a table-STYLE-resolved
+    /// `styleShading` renders with the DIRECT value: `TableBlockBuilder.build`'s resolution chain
+    /// is `cell-direct > table-direct > table-style > theme`, and this is the top of that chain
+    /// actually reaching `NSTextTableBlock.backgroundColor`, not just read from source.
+    func testCellOwnDirectShadingWinsOverItsOwnStyleShadingAtBuildLevel() {
+        var cell = Cell(blocks: [.paragraph(spans: [span("A")])], backgroundColor: .systemRed)
+        cell.styleShading = .systemYellow
+        let out = build([.table(rows: [[cell]], headerRows: 0)])
+        let block = try! XCTUnwrap(tableBlocks(in: out).first)
+        XCTAssertEqual(block.backgroundColor, .systemRed)
+    }
+
     /// `Cell.verticalAlignment == .center` becomes `NSTextTableBlock.verticalAlignment == .middleAlignment`.
     func testCellVerticalAlignmentCenterBecomesMiddleAlignment() {
         let rows: [[Cell]] = [[Cell(blocks: [.paragraph(spans: [span("A")])], verticalAlignment: .center)]]

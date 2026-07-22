@@ -34,6 +34,14 @@ enum TableBlockBuilder {
         /// Mirrors `Cell.padding` — already resolved by the caller against any table default;
         /// `nil` means neither said anything, and `build` keeps its own pre-existing 7pt default.
         var padding: CGFloat? = nil
+        /// The cell's shading/border RESOLVED from the table's named STYLE (`Cell.styleShading`/
+        /// `.styleBorderColor`/`.styleBorderWidth` — P5), a LOWER-priority layer than the direct
+        /// fields above and the table's own direct default (`tableShading`/`tableBorderColor`/
+        /// `tableBorderWidth` on `build`) but a HIGHER-priority one than the theme default — see
+        /// `build`'s resolution chain below.
+        var styleShading: NSColor? = nil
+        var styleBorderColor: NSColor? = nil
+        var styleBorderWidth: CGFloat? = nil
     }
 
     /// - Parameters:
@@ -146,13 +154,19 @@ enum TableBlockBuilder {
             // with, so it always gets the plain theme look. (`tableBorderColor`/`tableBorderWidth`/
             // `tableShading` are `nil` for every markdown table and any docx table with no
             // `w:tblPr` default, so this chain collapses to exactly the old two-step lookup then.)
-            block.setBorderColor(placement.cell?.borderColor ?? tableBorderColor ?? Palette.tableBorder)
-            block.setWidth(placement.cell?.borderWidth ?? tableBorderWidth ?? 1, type: .absoluteValueType, for: .border)
+            // Full chain, most to least specific: cell-direct > table-direct > table-STYLE
+            // (`styleBorderColor`/`styleShading` — P5) > theme default.
+            block.setBorderColor(placement.cell?.borderColor ?? tableBorderColor
+                                  ?? placement.cell?.styleBorderColor ?? Palette.tableBorder)
+            block.setWidth(placement.cell?.borderWidth ?? tableBorderWidth
+                            ?? placement.cell?.styleBorderWidth ?? 1, type: .absoluteValueType, for: .border)
             block.setWidth(placement.cell?.padding ?? 7, type: .absoluteValueType, for: .padding)
             if let bg = placement.cell?.backgroundColor {
                 block.backgroundColor = bg
             } else if let tableShading {
                 block.backgroundColor = tableShading
+            } else if let styleBg = placement.cell?.styleShading {
+                block.backgroundColor = styleBg
             } else if header {
                 block.backgroundColor = Palette.tableHeaderBg
             }
