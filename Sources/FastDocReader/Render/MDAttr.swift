@@ -86,4 +86,15 @@ enum MDAttr {
     /// only while the panel is open, so setting this attribute never changes layout (invariant
     /// 1/24) and a comment-free document (or one whose panel is closed) never differs on screen.
     static let commentMark = NSAttributedString.Key("mdCommentMark")
+    /// Value = `FillMarginTabInfo` (`OfficeTextBuilder`) — set on an office paragraph/heading
+    /// whose authored tab stops end in a right- or decimal-aligned "fill to margin" tab (the
+    /// dominant real case: a Word Table of Contents entry's page number, authored against the
+    /// SOURCE document's own page right margin). That margin has nothing to do with this reader's
+    /// window-width reading column, so `DocumentWindowController.updateTextInset` re-anchors the
+    /// tab to the CURRENT column on every reflow using this attribute — the same "fill the
+    /// window" treatment the office tables already get, extended to a plain right-aligned tab
+    /// stop, which otherwise has no idea the column even changed. A paragraph whose rightmost tab
+    /// is left/center-aligned (an ordinary tab) never gets this attribute, and neither does any
+    /// markdown/plain-text block (they have no tab-stop vocabulary at all).
+    static let fillMarginTab = NSAttributedString.Key("mdFillMarginTab")
 }

@@ -1,5 +1,18 @@
 import AppKit
 
+/// What a "fill to margin" paragraph (see `OfficeTextBuilder.fillMarginTabInfo`) needs to rebuild
+/// its trailing tab at any width: the OTHER (non-margin) tab stops, preserved verbatim in their
+/// own authored positions, plus the margin tab's own alignment/leader — never its `position`,
+/// which is supplied fresh every time by `OfficeTextBuilder.fillMarginTabStops` (that's the whole
+/// point of carrying this instead of just keeping the original `TabStop`). Carried as
+/// `MDAttr.fillMarginTab`'s attribute value, so it rides along in the text storage from build
+/// time through every later reflow.
+struct FillMarginTabInfo: Equatable {
+    var marginAlignment: TabAlignment
+    var marginLeader: TabLeader
+    var otherTabs: [TabStop]
+}
+
 /// Turns a format-neutral `[OfficeBlock]` into styled `NSAttributedString`, the same way
 /// `MarkdownRenderer` turns a parsed markdown tree into one and `PlainTextRenderer` turns raw text
 /// into one. Every TOP-LEVEL block is exactly one navigation stop: it gets its own `MDAttr.blockId`
@@ -81,22 +94,32 @@ enum OfficeTextBuilder {
                 result.addAttribute(MDAttr.heading, value: level,
                                      range: NSRange(location: start, length: result.length - start))
                 result.append(NSAttributedString(string: "\n"))
+                let headingRange = NSRange(location: start, length: result.length - start)
                 result.addAttribute(.paragraphStyle,
                                     value: headingParagraphStyle(level: level, theme: theme, rtl: rtl,
                                                                   alignment: alignment, tabStops: tabStops,
-                                                                  format: format, fontSizeScale: fontSizeScale),
-                                    range: NSRange(location: start, length: result.length - start))
+                                                                  format: format, fontSizeScale: fontSizeScale,
+                                                                  columnWidth: columnWidth),
+                                    range: headingRange)
+                if let info = OfficeTextBuilder.fillMarginTabInfo(from: tabStops) {
+                    result.addAttribute(MDAttr.fillMarginTab, value: info, range: headingRange)
+                }
 
             case let .paragraph(spans, rtl, alignment, tabStops, _):
                 result.append(spansAttributedString(spans, baseFont: theme.bodyFont,
                                                      baseColor: theme.textColor, theme: theme,
                                                      fontSizeScale: fontSizeScale, commentNumbers: commentNumbers))
                 result.append(NSAttributedString(string: "\n"))
+                let paragraphRange = NSRange(location: start, length: result.length - start)
                 result.addAttribute(.paragraphStyle,
                                     value: bodyParagraphStyle(theme: theme, rtl: rtl, alignment: alignment,
                                                                tabStops: tabStops, format: format,
-                                                               fontSizeScale: fontSizeScale),
-                                    range: NSRange(location: start, length: result.length - start))
+                                                               fontSizeScale: fontSizeScale,
+                                                               columnWidth: columnWidth),
+                                    range: paragraphRange)
+                if let info = OfficeTextBuilder.fillMarginTabInfo(from: tabStops) {
+                    result.addAttribute(MDAttr.fillMarginTab, value: info, range: paragraphRange)
+                }
 
             case let .listItem(level, ordered, spans, marker, rtl, alignment, tabStops, _):
                 appendListItem(level: level, ordered: ordered, spans: spans, marker: marker, rtl: rtl,
@@ -386,11 +409,15 @@ enum OfficeTextBuilder {
     /// tab stops `NSMutableParagraphStyle()` already carries; empty (every pre-sprint call site)
     /// changes nothing. Each authored stop's OWN alignment (P2b) is carried into the built
     /// `NSTextTab` — see `officeTextTab`'s doc for exactly how.
+    /// `columnWidth` (same meaning as `build`'s own parameter) supplies the placeholder width for
+    /// a fill-margin tab (see `fillMarginTabInfo`/`fillMarginTabStops`) — it is otherwise unused
+    /// here, since every other tab stop renders exactly as it always has.
     private static func bodyParagraphStyle(theme: RenderTheme, rtl: Bool = false,
                                             alignment: NSTextAlignment? = nil,
                                             tabStops: [TabStop] = [],
                                             format: ParagraphFormat? = nil,
-                                            fontSizeScale: CGFloat = 1) -> NSParagraphStyle {
+                                            fontSizeScale: CGFloat = 1,
+                                            columnWidth: CGFloat = .greatestFiniteMagnitude) -> NSParagraphStyle {
         let p = NSMutableParagraphStyle()
         let lh = (theme.baseFontSize * theme.lineHeightRatio).rounded()
         p.minimumLineHeight = lh
@@ -398,7 +425,7 @@ enum OfficeTextBuilder {
         p.paragraphSpacing = theme.baseFontSize * theme.paragraphSpacingRatio
         if rtl { p.baseWritingDirection = .rightToLeft }
         if let alignment { p.alignment = alignment }
-        if !tabStops.isEmpty { p.tabStops = tabStops.map(officeTextTab) }
+        if !tabStops.isEmpty { p.tabStops = resolvedTabStops(tabStops, columnWidth: columnWidth) }
         applyParagraphFormat(format, fontSizeScale: fontSizeScale, to: p)
         return p.copy() as! NSParagraphStyle
     }
@@ -407,7 +434,8 @@ enum OfficeTextBuilder {
                                                alignment: NSTextAlignment? = nil,
                                                tabStops: [TabStop] = [],
                                                format: ParagraphFormat? = nil,
-                                               fontSizeScale: CGFloat = 1) -> NSParagraphStyle {
+                                               fontSizeScale: CGFloat = 1,
+                                               columnWidth: CGFloat = .greatestFiniteMagnitude) -> NSParagraphStyle {
         let b = theme.baseFontSize
         let style = OfficeStyle(theme: theme)
         let p = NSMutableParagraphStyle()
@@ -418,9 +446,68 @@ enum OfficeTextBuilder {
         p.paragraphSpacingBefore = style.headingSpacingBefore(level: level)
         if rtl { p.baseWritingDirection = .rightToLeft }
         if let alignment { p.alignment = alignment }
-        if !tabStops.isEmpty { p.tabStops = tabStops.map(officeTextTab) }
+        if !tabStops.isEmpty { p.tabStops = resolvedTabStops(tabStops, columnWidth: columnWidth) }
         applyParagraphFormat(format, fontSizeScale: fontSizeScale, to: p)
         return p.copy() as! NSParagraphStyle
+    }
+
+    /// Turns a paragraph's authored `tabStops` into `NSTextTab`s for build time ONLY — an ordinary
+    /// paragraph (no fill-margin tab, `fillMarginTabInfo` returns nil) maps every stop straight
+    /// through via `officeTextTab`, byte-identical to before this attribute existed. A fill-margin
+    /// paragraph instead gets `fillMarginTabStops` at a PLACEHOLDER width: the real `columnWidth`
+    /// minus `fillMarginTrailingInset` when the caller supplied one (every real render call —
+    /// `MarkdownDocument.render(into:)` always does), or the tab's own authored `position`
+    /// otherwise (every test/cell-content call site that builds with the default sentinel column,
+    /// where "no reflow will ever correct this" makes the original position the honest answer).
+    /// Either way this is only ever a STARTING point — `DocumentWindowController.updateTextInset`
+    /// re-anchors it to the actual reading column on first layout and every reflow after.
+    private static func resolvedTabStops(_ tabStops: [TabStop], columnWidth: CGFloat) -> [NSTextTab] {
+        guard let info = fillMarginTabInfo(from: tabStops) else { return tabStops.map(officeTextTab) }
+        let hasRealColumn = columnWidth < .greatestFiniteMagnitude
+        let width: CGFloat
+        if hasRealColumn {
+            width = max(0, columnWidth - fillMarginTrailingInset)
+        } else {
+            width = tabStops.max(by: { $0.position < $1.position })?.position ?? 0
+        }
+        return fillMarginTabStops(info, width: width)
+    }
+
+    /// Trailing gap (points) between a fill-margin tab (a TOC page number, say) and the reading
+    /// column's own right edge — small enough the number still reads flush-right, not crowded
+    /// against the very edge. Shared with `DocumentWindowController.updateTextInset`, which
+    /// re-anchors this tab to the CURRENT column on every reflow (see `MDAttr.fillMarginTab`).
+    static let fillMarginTrailingInset: CGFloat = 6
+
+    /// The rightmost tab in `tabStops`, when it is right- or decimal-aligned, marks the paragraph
+    /// as "fill to margin": a right tab exists to push text — a TOC page number, a right-aligned
+    /// header — out to the paragraph's own trailing edge, and that edge was authored against the
+    /// SOURCE document's page margin, not this reader's window-width reading column (see
+    /// `MDAttr.fillMarginTab`'s doc for the width mismatch this exists to correct). A LEFT- or
+    /// CENTER-aligned rightmost tab is an ordinary tab stop and is left alone (returns `nil`) —
+    /// this only ever narrows behaviour onto paragraphs that authored a real trailing right/
+    /// decimal tab; every other paragraph (the overwhelming common case, and every markdown/
+    /// plain-text block, which carries no tab-stop vocabulary at all) is unaffected.
+    static func fillMarginTabInfo(from tabStops: [TabStop]) -> FillMarginTabInfo? {
+        guard let (i, rightmost) = tabStops.enumerated().max(by: { $0.element.position < $1.element.position })
+        else { return nil }
+        guard rightmost.alignment == .right || rightmost.alignment == .decimal else { return nil }
+        var others = tabStops
+        others.remove(at: i)
+        return FillMarginTabInfo(marginAlignment: rightmost.alignment, marginLeader: rightmost.leader,
+                                  otherTabs: others)
+    }
+
+    /// Rebuilds tab stops so the fill-margin tab sits at `width` — an absolute point, already the
+    /// caller's chosen right edge (minus whatever inset it wants) — while every OTHER authored tab
+    /// stop keeps its own original position. This is the ONE place that turns `FillMarginTabInfo`
+    /// back into real `NSTextTab`s, called both at build time (`resolvedTabStops`, a placeholder
+    /// width) and on every later reflow (`DocumentWindowController.reanchorFillMarginTabs`, the
+    /// reading column's CURRENT width) — so a TOC's page numbers track the window instead of
+    /// staying pinned to the document's own page margin.
+    static func fillMarginTabStops(_ info: FillMarginTabInfo, width: CGFloat) -> [NSTextTab] {
+        let margin = TabStop(position: width, alignment: info.marginAlignment, leader: info.marginLeader)
+        return (info.otherTabs + [margin]).map(officeTextTab)
     }
 
     /// Builds ONE `NSTextTab` from an authored `TabStop` — `.left`/`.center`/`.right` map straight

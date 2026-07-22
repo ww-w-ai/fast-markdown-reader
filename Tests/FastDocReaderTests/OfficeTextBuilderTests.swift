@@ -1210,6 +1210,114 @@ final class OfficeTextBuilderTests: XCTestCase {
         XCTAssertEqual(style.tabStops.first?.alignment, .right)
     }
 
+    // MARK: P8 — TOC / fill-to-margin tabs
+
+    /// A paragraph whose rightmost tab is RIGHT-aligned (the TOC case: title, then a tab, then a
+    /// page number pushed to the source's own page margin) gets `MDAttr.fillMarginTab`, carrying
+    /// the OTHER tabs (none, here) plus the margin tab's own alignment/leader.
+    func testParagraphWithARightmostRightTabGetsFillMarginTabAttribute() {
+        let out = build([.paragraph(spans: [span("Chapter One\t3")],
+                                     tabStops: [TabStop(position: 481, alignment: .right)])])
+        let info = out.attribute(MDAttr.fillMarginTab, at: 0, effectiveRange: nil) as? FillMarginTabInfo
+        let info2 = try! XCTUnwrap(info)
+        XCTAssertEqual(info2.marginAlignment, .right)
+        XCTAssertTrue(info2.otherTabs.isEmpty)
+    }
+
+    /// Same case, headings — a TOC's own title style, or a right-aligned header, must be detected
+    /// through the heading path too, not just plain paragraphs.
+    func testHeadingWithARightmostDecimalTabGetsFillMarginTabAttribute() {
+        let out = build([.heading(level: 1, spans: [span("Title\t3")],
+                                   tabStops: [TabStop(position: 481, alignment: .decimal)])])
+        let info = try! XCTUnwrap(out.attribute(MDAttr.fillMarginTab, at: 0, effectiveRange: nil) as? FillMarginTabInfo)
+        XCTAssertEqual(info.marginAlignment, .decimal)
+    }
+
+    /// A rightmost LEFT-aligned tab is an ordinary tab stop — never marked, never rebuilt. This is
+    /// the "unspecified = identical" guarantee: an everyday tab-using paragraph gets no attribute
+    /// and its tab position is untouched.
+    func testParagraphWithARightmostLeftTabDoesNotGetFillMarginTabAttribute() {
+        let out = build([.paragraph(spans: [span("a\tb")], tabStops: [TabStop(position: 200, alignment: .left)])])
+        XCTAssertNil(out.attribute(MDAttr.fillMarginTab, at: 0, effectiveRange: nil))
+        let locations = (out.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle)?
+            .tabStops.map(\.location) ?? []
+        XCTAssertEqual(locations, [200], "an ordinary left tab's position must be untouched")
+    }
+
+    /// A paragraph with NO tab stops at all never gets the attribute either.
+    func testParagraphWithNoTabStopsDoesNotGetFillMarginTabAttribute() {
+        let out = build([.paragraph(spans: [span("plain text")])])
+        XCTAssertNil(out.attribute(MDAttr.fillMarginTab, at: 0, effectiveRange: nil))
+    }
+
+    /// A fill-margin tab preserves every OTHER authored tab stop alongside it — e.g. a left-
+    /// aligned tab followed by the trailing right-aligned page-number tab.
+    func testFillMarginTabPreservesTheOtherAuthoredTabStopsAlongsideIt() {
+        let out = build([.paragraph(spans: [span("a\tb\tc")],
+                                     tabStops: [TabStop(position: 50, alignment: .left),
+                                                TabStop(position: 481, alignment: .right)])])
+        let info = try! XCTUnwrap(out.attribute(MDAttr.fillMarginTab, at: 0, effectiveRange: nil) as? FillMarginTabInfo)
+        XCTAssertEqual(info.otherTabs, [TabStop(position: 50, alignment: .left)])
+        let style = try! XCTUnwrap(out.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle)
+        let locations = style.tabStops.map(\.location)
+        XCTAssertTrue(locations.contains(50), "the other tab stop must still be built into the style")
+    }
+
+    /// With NO real `columnWidth` supplied (every test/cell-content call site's default), the
+    /// margin tab's placeholder position is the tab's OWN authored position — unchanged from
+    /// before this attribute existed. This is what keeps the pre-existing alignment tests
+    /// (`testTabStopAlignmentReachesTheBuiltNSTextTabsAlignment` etc.) passing byte-for-byte.
+    func testFillMarginTabWithNoColumnWidthKeepsItsOwnAuthoredPosition() {
+        let out = build([.paragraph(spans: [span("a\tb")], tabStops: [TabStop(position: 481, alignment: .right)])])
+        let style = try! XCTUnwrap(out.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle)
+        XCTAssertEqual(style.tabStops.first?.location, 481)
+    }
+
+    /// With a REAL `columnWidth`, the margin tab's placeholder is anchored to that column (minus
+    /// `OfficeTextBuilder.fillMarginTrailingInset`), NOT the document's own authored margin — this
+    /// is the actual bug fix: a TOC built for a 1000pt-wide window no longer places the page
+    /// number at the source's 481pt page margin.
+    func testFillMarginTabWithARealColumnWidthAnchorsToTheColumnNotTheDocumentMargin() {
+        let out = OfficeTextBuilder.build([.paragraph(spans: [span("Chapter One\t3")],
+                                                        tabStops: [TabStop(position: 481, alignment: .right)])],
+                                          theme: theme, columnWidth: 1000)
+        let style = try! XCTUnwrap(out.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle)
+        XCTAssertEqual(style.tabStops.first?.location, 1000 - OfficeTextBuilder.fillMarginTrailingInset)
+    }
+
+    // MARK: P8 — `fillMarginTabStops` (the pure reflow helper)
+
+    /// Mutation-tested: `fillMarginTabStops` places ONLY the margin tab at `width`, preserving the
+    /// other tabs' own positions/alignments verbatim — this is exactly what
+    /// `DocumentWindowController.reanchorFillMarginTabs` calls on every resize/reflow.
+    func testFillMarginTabStopsPlacesOnlyTheMarginTabAtTheGivenWidth() {
+        let info = FillMarginTabInfo(marginAlignment: .right, marginLeader: .none,
+                                      otherTabs: [TabStop(position: 50, alignment: .left)])
+        let tabs = OfficeTextBuilder.fillMarginTabStops(info, width: 900)
+        XCTAssertEqual(tabs.map(\.location).sorted(), [50, 900])
+        let margin = try! XCTUnwrap(tabs.first { $0.location == 900 })
+        XCTAssertEqual(margin.alignment, .right)
+    }
+
+    /// Mutation: a `.decimal` margin still carries the `.` column terminator after being rebuilt
+    /// at a new width — the decimal-alignment emulation (`officeTextTab`'s own doc) must survive
+    /// the reflow rebuild, not just the initial build.
+    func testFillMarginTabStopsKeepsTheDecimalColumnTerminatorAfterRebuild() {
+        let info = FillMarginTabInfo(marginAlignment: .decimal, marginLeader: .none, otherTabs: [])
+        let tabs = OfficeTextBuilder.fillMarginTabStops(info, width: 700)
+        XCTAssertEqual(tabs.first?.location, 700)
+        XCTAssertEqual(tabs.first?.alignment, .right)
+        XCTAssertNotNil(tabs.first?.options[.columnTerminators])
+    }
+
+    /// `fillMarginTabInfo` itself: rightmost-by-position wins even when it is not the LAST array
+    /// element — an author could list tab stops out of position order.
+    func testFillMarginTabInfoPicksTheRightmostByPositionNotByArrayOrder() {
+        let info = try! XCTUnwrap(OfficeTextBuilder.fillMarginTabInfo(
+            from: [TabStop(position: 481, alignment: .right), TabStop(position: 50, alignment: .left)]))
+        XCTAssertEqual(info.otherTabs, [TabStop(position: 50, alignment: .left)])
+    }
+
     // MARK: P2b — paragraph shading / border MDAttrs
 
     /// A resolved `ParagraphFormat.shading` must reach `MDAttr.paraShading` over the block's full

@@ -285,6 +285,44 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         textView.textContainerInset = NSSize(width: minSideInset, height: verticalInset)
         textView.textContainer?.containerSize = NSSize(width: column, height: CGFloat.greatestFiniteMagnitude)
         var f = textView.frame; f.size.width = clipWidth; textView.frame = f
+        reanchorFillMarginTabs(toColumn: column)
+    }
+
+    /// Office-only (markdown/plain never carry `MDAttr.fillMarginTab`): re-anchors a paragraph's
+    /// "fill to margin" tab — a Word Table of Contents entry's page number, most commonly — to
+    /// THIS reading column's right edge. The source authored that tab against its own page's
+    /// margin, which is unrelated to this reader's window-width column; office TABLES already
+    /// track the window this way (`OfficeTextBuilder.appendTable`'s column widths are resolved
+    /// against the same column), and this extends the same "fill the window" behaviour to a plain
+    /// right-aligned tab stop, which has no size of its own to track anything with. Runs every
+    /// time `updateTextInset` does — display, resize, sidebar toggle — so the anchor never lags
+    /// the column it targets.
+    ///
+    /// This mutates ONLY `.paragraphStyle` on already-rendered storage — a display attribute, not
+    /// a document edit — so it must never mark the document dirty. It doesn't: dirty tracking here
+    /// goes through `MarkdownDocument.applySourceEdit` registering undo actions (see invariant 17
+    /// in CLAUDE.md), and this path never touches the undo manager or `applySourceEdit` at all.
+    ///
+    /// Two passes, not one: collecting `(range, info)` first and applying after avoids mutating
+    /// `.paragraphStyle` attributes while `enumerateAttribute` is still walking `.fillMarginTab`
+    /// ranges over the same storage.
+    private func reanchorFillMarginTabs(toColumn column: CGFloat) {
+        guard let storage = textView.textStorage, storage.length > 0 else { return }
+        let full = NSRange(location: 0, length: storage.length)
+        let width = max(0, column - OfficeTextBuilder.fillMarginTrailingInset)
+        var targets: [(NSRange, FillMarginTabInfo)] = []
+        storage.enumerateAttribute(MDAttr.fillMarginTab, in: full, options: []) { value, range, _ in
+            guard let info = value as? FillMarginTabInfo else { return }
+            targets.append((range, info))
+        }
+        guard !targets.isEmpty else { return }
+        for (range, info) in targets {
+            guard let base = storage.attribute(.paragraphStyle, at: range.location,
+                                                effectiveRange: nil) as? NSParagraphStyle else { continue }
+            let p = (base.mutableCopy() as! NSMutableParagraphStyle)
+            p.tabStops = OfficeTextBuilder.fillMarginTabStops(info, width: width)
+            storage.addAttribute(.paragraphStyle, value: p.copy() as! NSParagraphStyle, range: range)
+        }
     }
 
     // MARK: - Table of contents (⌥⌘T)
