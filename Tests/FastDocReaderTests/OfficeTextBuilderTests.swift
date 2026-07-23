@@ -305,33 +305,66 @@ final class OfficeTextBuilderTests: XCTestCase {
 
     // MARK: Tables
 
-    /// Every placed `TableGridCell` in `out`, in reading order (row, then column) — office tables now
-    /// build ONE `NSTextAttachment` whose `TableAttachmentCell` carries the whole grid, so a cell's
-    /// shading/border/span/alignment is read off the cell struct rather than an `NSTextTableBlock`.
-    /// The count still equals the old block count (padding cells for genuinely-empty positions are
-    /// included), so shape/count assertions map straight across.
-    private func tableGridCells(in out: NSAttributedString) -> [TableGridCell] {
-        var found: [TableGridCell] = []
-        out.enumerateAttribute(.attachment, in: NSRange(location: 0, length: out.length)) { value, _, _ in
-            if let att = value as? NSTextAttachment, let cell = att.attachmentCell as? TableAttachmentCell {
-                found.append(contentsOf: cell.cells)
-            }
-        }
-        return found
+    /// One placed cell of a real `NSTextTable`: the `NSTextTableBlock` (position/span/shading/border/
+    /// vertical-alignment/padding), the cell's concatenated text, and its full contiguous range in
+    /// `out` — so a test reads the cell content's font/paragraph-style straight from the top-level
+    /// string (a cell's content is now real, selectable text there, not a drawn attachment).
+    private struct PlacedCell {
+        let block: NSTextTableBlock
+        let text: String
+        let range: NSRange
+        var row: Int { block.startingRow }
+        var col: Int { block.startingColumn }
+        var rowSpan: Int { block.rowSpan }
+        var colSpan: Int { block.columnSpan }
+        var background: NSColor? { block.backgroundColor }
+        var borderColor: NSColor? { block.borderColor(for: .minX) }
+        var borderWidth: CGFloat { block.width(for: .border, edge: .minX) }
+        var padding: CGFloat { block.width(for: .padding, edge: .minX) }
+        var verticalAlignment: NSTextBlock.VerticalAlignment { block.verticalAlignment }
     }
 
-    /// The one `TableAttachmentCell` in `out` (the whole table). Column-width assertions read its
-    /// `columnRatios` — a cell's width fraction is the sum of `columnRatios[col ..< col+colSpan]`.
-    private func tableAttachmentCell(in out: NSAttributedString) -> TableAttachmentCell? {
-        var result: TableAttachmentCell?
-        out.enumerateAttribute(.attachment, in: NSRange(location: 0, length: out.length)) { value, _, _ in
-            if let att = value as? NSTextAttachment, let cell = att.attachmentCell as? TableAttachmentCell { result = cell }
+    /// Every placed cell in `out`, in reading order (row, then column), deduped by block identity so
+    /// a multi-paragraph cell is ONE entry (its paragraphs' text concatenated). The count equals the
+    /// old placed-cell count — padding cells for genuinely-empty positions carry their own block too,
+    /// so shape/count assertions map straight across from the former custom-engine helper.
+    private func tableCells(in out: NSAttributedString) -> [PlacedCell] {
+        var order: [ObjectIdentifier] = []
+        var byId: [ObjectIdentifier: (block: NSTextTableBlock, text: String, start: Int, end: Int)] = [:]
+        let ns = out.string as NSString
+        out.enumerateAttribute(.paragraphStyle, in: NSRange(location: 0, length: out.length)) { value, range, _ in
+            guard let ps = value as? NSParagraphStyle, let block = ps.textBlocks.first as? NSTextTableBlock else { return }
+            let id = ObjectIdentifier(block)
+            if var e = byId[id] {
+                e.text += ns.substring(with: range)
+                e.start = min(e.start, range.location)
+                e.end = max(e.end, range.location + range.length)
+                byId[id] = e
+            } else {
+                byId[id] = (block, ns.substring(with: range), range.location, range.location + range.length)
+                order.append(id)
+            }
         }
-        return result
+        return order.map {
+            let e = byId[$0]!
+            return PlacedCell(block: e.block, text: e.text, range: NSRange(location: e.start, length: e.end - e.start))
+        }
+    }
+
+    /// The one `GridTextTable` in `out`. Column-width assertions read its `columnProportions` — a
+    /// cell's width fraction is the sum of `columnProportions[col ..< col+colSpan]`.
+    private func firstGridTable(in out: NSAttributedString) -> GridTextTable? {
+        tableCells(in: out).compactMap { $0.block.table as? GridTextTable }.first
+    }
+
+    /// The number of rows the placed cells cover (max `startingRow + rowSpan`) — the old
+    /// an `NSTextTable`'s row count, derived from the placed blocks rather than a stored engine object.
+    private func tableRowCount(in out: NSAttributedString) -> Int {
+        tableCells(in: out).map { $0.row + $0.rowSpan }.max() ?? 0
     }
 
     /// A 2x2 table where one cell is empty must keep both rows at the same column count — the
-    /// empty cell still occupies its own placed `TableGridCell`, it doesn't collapse the row or
+    /// empty cell still occupies its own placed cell block, it doesn't collapse the row or
     /// shift the remaining column. `headerRows: 1` is today's asserted shape behaviour, kept as-is.
     func testTableWithHeaderRowAndAnEmptyCellKeepsItsRowAndColumnShape() {
         let rows: [[Cell]] = [
@@ -339,7 +372,7 @@ final class OfficeTextBuilderTests: XCTestCase {
             [Cell(spans: []), Cell(spans: [span("42")])],
         ]
         let out = build([.table(rows: rows, headerRows: 1)])
-        let cells = tableGridCells(in: out)
+        let cells = tableCells(in: out)
         XCTAssertEqual(cells.count, 4, "2 header cells + 2 body cells, empty cell included")
         let bodyRowCols = Set(cells.filter { $0.row == 1 }.map(\.col))
         XCTAssertEqual(bodyRowCols, [0, 1], "the empty first cell must still keep its column in place")
@@ -353,7 +386,7 @@ final class OfficeTextBuilderTests: XCTestCase {
             [Cell(spans: [span("Name")]), Cell(spans: [span("Score")])],
         ]
         let out = build([.table(rows: rows, headerRows: 0)])
-        let cells = tableGridCells(in: out)
+        let cells = tableCells(in: out)
         XCTAssertEqual(cells.count, 4)
         let firstRowCols = Set(cells.filter { $0.row == 0 }.map(\.col))
         XCTAssertEqual(firstRowCols, [0, 1], "the empty first cell must still keep its column in place")
@@ -364,7 +397,7 @@ final class OfficeTextBuilderTests: XCTestCase {
             [Cell(spans: [span("H1")]), Cell(spans: [span("H2")])],
             [Cell(spans: [span("v1")]), Cell(spans: [span("v2")])],
         ], headerRows: 1)])
-        let cells = tableGridCells(in: out)
+        let cells = tableCells(in: out)
         let headerBgs = cells.filter { $0.row == 0 }.compactMap(\.background)
         XCTAssertEqual(headerBgs.count, 2)
         XCTAssertTrue(headerBgs.allSatisfy { $0 == Palette.tableHeaderBg })
@@ -380,9 +413,9 @@ final class OfficeTextBuilderTests: XCTestCase {
             [Cell(spans: [span("H1")]), Cell(spans: [span("H2")])],
             [Cell(spans: [span("v1")]), Cell(spans: [span("v2")])],
         ], headerRows: 0)])
-        let cells = tableGridCells(in: out)
+        let cells = tableCells(in: out)
         let firstCell = try! XCTUnwrap(cells.first { $0.row == 0 && $0.col == 0 })
-        let font = firstCell.content.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+        let font = out.attribute(.font, at: firstCell.range.location, effectiveRange: nil) as? NSFont
         XCTAssertFalse(font!.fontDescriptor.symbolicTraits.contains(.bold), "headerRows: 0 must not bold row 0")
         XCTAssertTrue(cells.allSatisfy { $0.background == nil }, "headerRows: 0 must not shade any row")
     }
@@ -390,7 +423,7 @@ final class OfficeTextBuilderTests: XCTestCase {
     /// The point of this whole sprint: a Word table and a markdown table with the same logical
     /// content (2 columns, 1 header row, 2 body rows) must produce structurally EQUIVALENT tables —
     /// same cell count, same row/column placement, same border colour, same header shading — because
-    /// both now go through `TableBlockBuilder` into one `TableAttachmentCell`. Font/text differ
+    /// both now go through `TableBlockBuilder` into one `NSTextTable`. Font/text differ
     /// (different source pipelines feed the cell content), so this compares grid STRUCTURE.
     func testOfficeAndMarkdownTablesWithSameContentProduceStructurallyEquivalentBlocks() {
         let officeOut = build([.table(rows: [
@@ -399,20 +432,20 @@ final class OfficeTextBuilderTests: XCTestCase {
         ], headerRows: 1)])
         let markdownOut = MarkdownRenderer.render("| A | B |\n|---|---|\n| 1 | 2 |", theme: theme)
 
-        let officeCells = tableGridCells(in: officeOut)
-        let markdownCells = tableGridCells(in: markdownOut)
+        let officeCells = tableCells(in: officeOut)
+        let markdownCells = tableCells(in: markdownOut)
 
         XCTAssertEqual(officeCells.count, 4)
         XCTAssertEqual(officeCells.count, markdownCells.count)
-        func shape(_ cells: [TableGridCell]) -> [[Int]] {
+        func shape(_ cells: [PlacedCell]) -> [[Int]] {
             cells.map { [$0.row, $0.col] }
         }
         XCTAssertEqual(shape(officeCells), shape(markdownCells))
         XCTAssertEqual(officeCells.filter { $0.background != nil }.count, 2)
         XCTAssertEqual(officeCells.filter { $0.background != nil }.count,
                        markdownCells.filter { $0.background != nil }.count)
-        let officeBorders = Set(officeCells.map { $0.border.color })
-        let markdownBorders = Set(markdownCells.map { $0.border.color })
+        let officeBorders = Set(officeCells.map { $0.borderColor })
+        let markdownBorders = Set(markdownCells.map { $0.borderColor })
         XCTAssertEqual(officeBorders, markdownBorders)
         XCTAssertEqual(officeBorders, [Palette.tableBorder])
     }
@@ -428,7 +461,7 @@ final class OfficeTextBuilderTests: XCTestCase {
             [Cell(spans: [span("1")]), Cell(spans: [span("2")]), Cell(spans: [span("3")])],
         ]
         let out = build([.table(rows: rows, headerRows: 1)])
-        let cells = tableGridCells(in: out)
+        let cells = tableCells(in: out)
         XCTAssertEqual(cells.count, 6)
         XCTAssertTrue(cells.allSatisfy { $0.rowSpan == 1 && $0.colSpan == 1 })
         XCTAssertEqual(Set(cells.filter { $0.row == 0 }.map(\.col)), [0, 1, 2])
@@ -442,7 +475,7 @@ final class OfficeTextBuilderTests: XCTestCase {
             [Cell(spans: [span("wide")], colSpan: 2), Cell(spans: [span("narrow")])],
         ]
         let out = build([.table(rows: rows, headerRows: 0)])
-        let cells = tableGridCells(in: out)
+        let cells = tableCells(in: out)
         XCTAssertEqual(cells.count, 2)
         let wide = cells.first { $0.col == 0 }
         let narrow = cells.first { $0.col == 2 }
@@ -459,7 +492,7 @@ final class OfficeTextBuilderTests: XCTestCase {
             [Cell(spans: [span("bottom-right")])],
         ]
         let out = build([.table(rows: rows, headerRows: 0)])
-        let cells = tableGridCells(in: out)
+        let cells = tableCells(in: out)
         XCTAssertEqual(cells.count, 3)
         let tall = cells.first { $0.row == 0 && $0.col == 0 }
         XCTAssertEqual(tall?.rowSpan, 2)
@@ -469,7 +502,7 @@ final class OfficeTextBuilderTests: XCTestCase {
 
     /// A row can carry FEWER anchors than the grid is wide — exactly what a Word row looks like once
     /// its other cells are absorbed by a merge. Every column must still get a block, or the border
-    /// has a hole in it: an unoccupied position with no placed `TableGridCell` draws nothing at all,
+    /// has a hole in it: an unoccupied position with no placed cell block draws nothing at all,
     /// which reads as a broken table rather than an empty cell. Note this is a SHORT ARRAY, not an
     /// empty `Cell` — the distinction the padding pass exists for.
     func testRowWithFewerAnchorsThanTheGridStillDrawsEveryColumn() {
@@ -478,7 +511,7 @@ final class OfficeTextBuilderTests: XCTestCase {
             [Cell(spans: [span("1")])],
         ]
         let out = build([.table(rows: rows, headerRows: 0)])
-        let cells = tableGridCells(in: out)
+        let cells = tableCells(in: out)
         XCTAssertEqual(Set(cells.filter { $0.row == 1 }.map(\.col)), [0, 1, 2],
                        "the short row must still cover all three columns")
         XCTAssertEqual(cells.count, 6)
@@ -492,7 +525,7 @@ final class OfficeTextBuilderTests: XCTestCase {
             [Cell(spans: [span("bottom")])],
         ]
         let out = build([.table(rows: rows, headerRows: 0)])
-        let cells = tableGridCells(in: out)
+        let cells = tableCells(in: out)
         XCTAssertEqual(cells.count, 3, "no padding cell may be added under the vertical span")
         let row1 = cells.filter { $0.row == 1 }
         XCTAssertEqual(row1.count, 1)
@@ -506,7 +539,7 @@ final class OfficeTextBuilderTests: XCTestCase {
             [Cell(spans: [span("wide")], colSpan: 2)],
         ]
         let out = build([.table(rows: rows, headerRows: 0)])
-        let cells = tableGridCells(in: out)
+        let cells = tableCells(in: out)
         XCTAssertEqual(cells.count, 3)
         XCTAssertEqual(cells.filter { $0.row == 1 }.count, 1)
     }
@@ -519,7 +552,7 @@ final class OfficeTextBuilderTests: XCTestCase {
             [Cell(spans: [span("hostile")], rowSpan: 100_000, colSpan: 100_000)],
         ]
         let out = build([.table(rows: rows, headerRows: 0)])
-        let cells = tableGridCells(in: out)
+        let cells = tableCells(in: out)
         XCTAssertEqual(cells.count, 1)
         XCTAssertEqual(cells.first?.rowSpan, TableBlockBuilder.maxSpan)
         XCTAssertEqual(cells.first?.colSpan, TableBlockBuilder.maxSpan)
@@ -531,7 +564,7 @@ final class OfficeTextBuilderTests: XCTestCase {
             [Cell(spans: [span("A")], rowSpan: 0, colSpan: 0), Cell(spans: [span("B")])],
         ]
         let out = build([.table(rows: rows, headerRows: 0)])
-        let cells = tableGridCells(in: out)
+        let cells = tableCells(in: out)
         XCTAssertEqual(cells.count, 2)
         XCTAssertEqual(Set(cells.map(\.col)), [0, 1], "a zero span must still advance the cursor")
     }
@@ -544,7 +577,7 @@ final class OfficeTextBuilderTests: XCTestCase {
             [Cell(spans: [span("v1")]), Cell(spans: [span("v2")])],
         ]
         let out = build([.table(rows: rows, headerRows: 1)])
-        let cells = tableGridCells(in: out)
+        let cells = tableCells(in: out)
         let headerBgs = cells.filter { $0.row == 0 }.compactMap(\.background)
         XCTAssertEqual(headerBgs.count, 1)
         let bodyBgs = cells.filter { $0.row == 1 }.compactMap(\.background)
@@ -639,7 +672,7 @@ final class OfficeTextBuilderTests: XCTestCase {
 
     /// THE REGRESSION GUARD this sprint's brief demands: an LTR document's produced
     /// `NSAttributedString` is IDENTICAL — not just "close" — to what it was before `rtl` existed.
-    /// a table's `NSTextAttachment`/`TableAttachmentCell` (inside `.table`) is not itself value-equal
+    /// a table's `NSTextTable` cell content is real text (unlike other blocks, its structure is what matters, not raw `isEqual`)
     /// under `isEqual`, so this
     /// compares the STRING plus every base-writing-direction (the one thing this sprint could have
     /// disturbed) across two independently-built copies of the same non-trivial blocks — headings,
@@ -824,18 +857,18 @@ final class OfficeTextBuilderTests: XCTestCase {
 
     /// The regression guard the sprint brief calls out by name: a cell built the OLD way
     /// (`Cell(spans:)`) must render EXACTLY what the pre-sprint direct-spans path produced — the
-    /// span text/attributes. The cell content now lives inside the table's one `TableAttachmentCell`
-    /// (the string is a single attachment character plus the table's trailing separators), so the
-    /// byte-identity is asserted against the placed cell's own `content`, not the output string.
+    /// span text/attributes. The cell content is now REAL text in the top-level string (an
+    /// `NSTextTable` cell, not a drawn attachment), so the byte-identity is asserted against the
+    /// placed cell's own text run — plus the cell's own paragraph terminator the table adds.
     func testCellBuiltFromSpansRendersByteIdenticalToTheDirectSpansPath() {
         let spans = [span("Hello", bold: true)]
         let out = build([.table(rows: [[Cell(spans: spans)]], headerRows: 0)])
         let expectedRun = OfficeTextBuilder.spansAttributedString(spans, baseFont: theme.bodyFont,
                                                                    baseColor: theme.textColor, theme: theme)
-        let cell = try! XCTUnwrap(tableGridCells(in: out).first)
-        XCTAssertEqual(cell.content.string, expectedRun.string,
-                        "the placed cell's content is exactly the direct-spans path's text")
-        let font = cell.content.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+        let cell = try! XCTUnwrap(tableCells(in: out).first)
+        XCTAssertEqual(cell.text, expectedRun.string + "\n",
+                        "the placed cell's text is exactly the direct-spans path's text (plus its cell terminator)")
+        let font = out.attribute(.font, at: cell.range.location, effectiveRange: nil) as? NSFont
         XCTAssertEqual(font?.fontDescriptor.symbolicTraits.contains(.bold), true)
     }
 
@@ -846,7 +879,7 @@ final class OfficeTextBuilderTests: XCTestCase {
     func testCellContainingAListItemRendersItsMarker() {
         let cell = Cell(blocks: [.listItem(level: 0, ordered: true, spans: [span("first")])])
         let out = build([.table(rows: [[cell]], headerRows: 0)])
-        let content = try! XCTUnwrap(tableGridCells(in: out).first).content.string
+        let content = try! XCTUnwrap(tableCells(in: out).first).text
         XCTAssertTrue(content.contains("1.\tfirst"), "marker text must reach the cell: \(content)")
     }
 
@@ -857,11 +890,11 @@ final class OfficeTextBuilderTests: XCTestCase {
         let size = CGSize(width: 100, height: 50)
         let cell = Cell(blocks: [.image(id: "cell-img", size: size)])
         let out = build([.table(rows: [[cell]], headerRows: 0)])
-        // The image attachment lives inside the placed cell's content, not the top-level string
-        // (which now holds only the one table attachment).
-        let content = try XCTUnwrap(tableGridCells(in: out).first).content
+        // The image attachment is now real content in the top-level string, inside the placed cell's
+        // own range (an `NSTextTable` cell holds selectable text, not a drawn sub-attachment).
+        let cell0 = try XCTUnwrap(tableCells(in: out).first)
         var found: NSTextAttachment?
-        content.enumerateAttribute(.attachment, in: NSRange(location: 0, length: content.length)) { value, _, _ in
+        out.enumerateAttribute(.attachment, in: cell0.range) { value, _, _ in
             if let att = value as? NSTextAttachment { found = att }
         }
         let attachment = try XCTUnwrap(found, "an image block inside a cell must still produce an attachment")
@@ -871,23 +904,22 @@ final class OfficeTextBuilderTests: XCTestCase {
 
     /// The nested-table decision (flatten, never build a real grid) must hold even when a `.table`
     /// block reaches a cell directly, not only when a reader has already flattened one into spans
-    /// before `Cell` existed. There must be exactly ONE `TableAttachmentCell` (the outer table); the
-    /// nested table is flattened to TEXT inside the outer cell's content, never a second grid.
+    /// before `Cell` existed. There must be exactly ONE `GridTextTable` (the outer table); the nested
+    /// table is flattened to TEXT inside the outer cell's content, never a second grid.
     func testCellContainingANestedTableBlockFlattensToTextRatherThanBuildingARealNestedGrid() {
         let nested: OfficeBlock = .table(rows: [[Cell(spans: [span("Nested")])]], headerRows: 0)
         let outer = Cell(blocks: [.paragraph(spans: [span("Outer")]), nested])
         let out = build([.table(rows: [[outer]], headerRows: 0)])
         // The outer cell's content is the flattened text: "Outer" + separator + the nested table's
         // own flattened "Nested\n" — building a REAL nested grid instead (the mutation this guards
-        // against) would place a second `TableAttachmentCell` here rather than plain text.
-        let outerCell = try! XCTUnwrap(tableGridCells(in: out).first)
-        XCTAssertEqual(outerCell.content.string, "Outer\nNested\n")
-        var nestedTableCount = 0
-        outerCell.content.enumerateAttribute(.attachment, in: NSRange(location: 0, length: outerCell.content.length)) { value, _, _ in
-            if let att = value as? NSTextAttachment, att.attachmentCell is TableAttachmentCell { nestedTableCount += 1 }
-        }
-        XCTAssertEqual(nestedTableCount, 0, "the nested table must be flattened to text — no nested grid")
-        XCTAssertNotNil(tableAttachmentCell(in: out), "only the outer table's one attachment")
+        // against) would place a second `GridTextTable` here rather than plain text.
+        let cells = tableCells(in: out)
+        let outerCell = try! XCTUnwrap(cells.first)
+        XCTAssertEqual(outerCell.text, "Outer\nNested\n")
+        // Every placed cell must belong to the SAME table — the flattened nested table is plain text
+        // carrying the outer cell's own block, not a second grid.
+        let distinctTables = Set(cells.compactMap { ($0.block.table as? GridTextTable).map(ObjectIdentifier.init) })
+        XCTAssertEqual(distinctTables.count, 1, "the nested table must be flattened to text — no nested grid")
     }
 
     /// The anchor-cells-only merge contract must still hold for a cell built the NEW way
@@ -899,7 +931,7 @@ final class OfficeTextBuilderTests: XCTestCase {
             [Cell(spans: [span("bottom-right")])],
         ]
         let out = build([.table(rows: rows, headerRows: 0)])
-        let cells = tableGridCells(in: out)
+        let cells = tableCells(in: out)
         let tallCell = cells.first { $0.col == 0 }
         XCTAssertEqual(tallCell?.rowSpan, 2)
         XCTAssertEqual(cells.count, 3, "the tall cell's own row, no separate cell fabricated below it")
@@ -940,13 +972,12 @@ final class OfficeTextBuilderTests: XCTestCase {
     /// A formula block inside a table cell must still be captured as a web block — cells render
     /// through `cellContent`, a separate switch from the top-level `build` loop, and it is easy for
     /// a new `OfficeBlock` case to be wired into one and forgotten in the other. The web block now
-    /// lives inside the placed cell's own `content` (the table is one attachment), so it is found by
-    /// enumerating that content rather than the top-level string.
+    /// lives as REAL content in the top-level string (an `NSTextTable` cell), so the SAME whole-storage
+    /// `enumerateWebBlocks` the prerender/presize passes use reaches it natively — no cell descent.
     func testFormulaBlockInsideATableCellIsStillFoundByWebBlockEnumeration() {
         let out = build([.table(rows: [[Cell(blocks: [.formula(latex: "y=mx+b")])]], headerRows: 0)])
-        let cell = try! XCTUnwrap(tableGridCells(in: out).first)
         var found: [WebBlock] = []
-        cell.content.enumerateWebBlocks { block, _ in found.append(block) }
+        out.enumerateWebBlocks { block, _ in found.append(block) }
         XCTAssertEqual(found.count, 1)
         XCTAssertEqual(found.first?.code, "y=mx+b")
     }
@@ -958,7 +989,7 @@ final class OfficeTextBuilderTests: XCTestCase {
     /// (`NSAttributedString.isEqual(to:)`), never by eyeball. Built two ways (implicit defaults vs
     /// explicitly passing the same default values) precisely so a future accidental default change
     /// on ONE side would be caught by the other. `.table` is covered separately just below —
-    /// a table's `NSTextAttachment`/`TableAttachmentCell` is not itself value-equal under
+    /// a table's `NSTextTable` cell layout is not value-equal under
     /// `isEqual` even when every property matches (the same reason
     /// `testLTRDocumentProducesTheSameStringAndBaseWritingDirectionAcrossEveryBlockKind` above
     /// compares table STRUCTURE rather than raw `isEqual`), so it would fail this comparison for a
@@ -984,12 +1015,12 @@ final class OfficeTextBuilderTests: XCTestCase {
         let explicit = build([.table(rows: [[Cell(blocks: [.paragraph(spans: [span("A")])], backgroundColor: nil,
                                                    borderColor: nil, borderWidth: nil, width: nil)]], headerRows: 0)])
         XCTAssertEqual(implicit.string, explicit.string)
-        let a = try! XCTUnwrap(tableGridCells(in: implicit).first)
-        let b = try! XCTUnwrap(tableGridCells(in: explicit).first)
+        let a = try! XCTUnwrap(tableCells(in: implicit).first)
+        let b = try! XCTUnwrap(tableCells(in: explicit).first)
         XCTAssertNil(a.background)
         XCTAssertNil(b.background)
-        XCTAssertEqual(a.border.color, b.border.color)
-        XCTAssertEqual(a.border.width, b.border.width)
+        XCTAssertEqual(a.borderColor, b.borderColor)
+        XCTAssertEqual(a.borderWidth, b.borderWidth)
     }
 
     // MARK: S13 — run colour vs the reading theme
@@ -1377,7 +1408,7 @@ final class OfficeTextBuilderTests: XCTestCase {
     func testCellBackgroundColorOverridesTheThemeDefaultShading() {
         let out = build([.table(rows: [[Cell(blocks: [.paragraph(spans: [span("A")])], backgroundColor: .systemGreen)]],
                                 headerRows: 0)])
-        let cell = tableGridCells(in: out).first
+        let cell = tableCells(in: out).first
         XCTAssertEqual(cell?.background, .systemGreen)
     }
 
@@ -1386,69 +1417,68 @@ final class OfficeTextBuilderTests: XCTestCase {
     func testHeaderCellExplicitBackgroundColorOverridesThemeHeaderShading() {
         let out = build([.table(rows: [[Cell(blocks: [.paragraph(spans: [span("H")])], backgroundColor: .systemTeal)]],
                                 headerRows: 1)])
-        let cell = tableGridCells(in: out).first
+        let cell = tableCells(in: out).first
         XCTAssertEqual(cell?.background, .systemTeal)
     }
 
     /// The resolved border colour+width reaches the placed cell's own `TableBorder`, which the
-    /// custom `TableAttachmentCell` draws from (the document's own colour honoured verbatim).
+    /// collapsed-border `NSTextTable` draws (the document's own colour honoured verbatim).
     func testCellBorderColorAndWidthOverrideTheThemeDefault() {
         let out = build([.table(rows: [[Cell(blocks: [.paragraph(spans: [span("A")])],
                                              borderColor: .systemPurple, borderWidth: 3)]], headerRows: 0)])
-        let cell = try! XCTUnwrap(tableGridCells(in: out).first)
-        XCTAssertEqual(cell.border.color, .systemPurple)
-        XCTAssertEqual(cell.border.width, 3)
+        let cell = try! XCTUnwrap(tableCells(in: out).first)
+        XCTAssertEqual(cell.borderColor, .systemPurple)
+        XCTAssertEqual(cell.borderWidth, 3)
     }
 
     /// A cell's own absolute `.width` no longer sets an independent per-cell width: every column is a
-    /// FRACTION of the whole table (`TableAttachmentCell.columnRatios`), never an independent absolute
+    /// FRACTION of the whole table (`GridTextTable.columnProportions`), never an independent absolute
     /// value (mixing the two would reintroduce the row-to-row seam drift the custom engine removes). A
     /// single-column, no-grid table gets the whole column — ratio 1.0.
     func testCellWidthNoLongerSetsAnIndependentAbsoluteContentWidth() {
         let out = build([.table(rows: [[Cell(blocks: [.paragraph(spans: [span("A")])], width: 120)]], headerRows: 0)])
-        let att = try! XCTUnwrap(tableAttachmentCell(in: out))
-        XCTAssertEqual(att.columnRatios.count, 1)
-        XCTAssertEqual(att.columnRatios[0], 1, accuracy: 0.001)
+        let att = try! XCTUnwrap(firstGridTable(in: out))
+        XCTAssertEqual(att.columnProportions.count, 1)
+        XCTAssertEqual(att.columnProportions[0], 1, accuracy: 0.001)
     }
 
     // MARK: P3 — grid-ratio column widths (`OfficeBlock.table.columnWidths`)
 
     /// A table whose `columnWidths` matches the derived column count switches EVERY column to the
-    /// source's own grid ratios (20/20/60 for 100/100/300pt) — those ratios ARE the attachment's
-    /// `columnRatios`, the shared cumulative x-edge every row reads, which is what keeps a merged
+    /// source's own grid ratios (20/20/60 for 100/100/300pt) — those ratios ARE the table's `columnProportions`, the shared cumulative x-edge every row reads, which is what keeps a merged
     /// row's boundary landing at the same x as a single-cell row's.
     func testGridColumnWidthsBecomeRigidAbsoluteWidthsInTheGridsRatio() {
         let rows: [[Cell]] = [[
             Cell(spans: [span("A")]), Cell(spans: [span("B")]), Cell(spans: [span("C")]),
         ]]
         let out = build([.table(rows: rows, headerRows: 0, columnWidths: [100, 100, 300])])
-        let att = try! XCTUnwrap(tableAttachmentCell(in: out))
-        XCTAssertEqual(att.columnRatios.count, 3)
-        for (actual, expected) in zip(att.columnRatios, [CGFloat(0.2), 0.2, 0.6]) {
+        let att = try! XCTUnwrap(firstGridTable(in: out))
+        XCTAssertEqual(att.columnProportions.count, 3)
+        for (actual, expected) in zip(att.columnProportions, [CGFloat(0.2), 0.2, 0.6]) {
             XCTAssertEqual(actual, expected, accuracy: 0.001)
         }
     }
 
     /// A merged cell (`colSpan: 2`) covers the SUM of the two grid columns' ratios, not just the
-    /// first one — `columnRatios[0..<2]` sums to 0.2 + 0.2 = 0.4 for the wide cell, leaving 0.6 for
+    /// first one — `columnProportions[0..<2]` sums to 0.2 + 0.2 = 0.4 for the wide cell, leaving 0.6 for
     /// the lone remaining column.
     func testMergedCellGetsTheSumOfItsCoveredColumnsFractions() {
         let rows: [[Cell]] = [[
             Cell(spans: [span("Wide")], colSpan: 2), Cell(spans: [span("C")]),
         ]]
         let out = build([.table(rows: rows, headerRows: 0, columnWidths: [100, 100, 300])])
-        let att = try! XCTUnwrap(tableAttachmentCell(in: out))
-        XCTAssertEqual(att.columnRatios.count, 3)
-        for (actual, expected) in zip(att.columnRatios, [CGFloat(0.2), 0.2, 0.6]) {
+        let att = try! XCTUnwrap(firstGridTable(in: out))
+        XCTAssertEqual(att.columnProportions.count, 3)
+        for (actual, expected) in zip(att.columnProportions, [CGFloat(0.2), 0.2, 0.6]) {
             XCTAssertEqual(actual, expected, accuracy: 0.001)
         }
-        let cells = tableGridCells(in: out).sorted { $0.col < $1.col }
+        let cells = tableCells(in: out).sorted { $0.col < $1.col }
         XCTAssertEqual(cells.count, 2)
         let wide = cells[0]
         XCTAssertEqual(wide.colSpan, 2)
-        let wideFraction = att.columnRatios[wide.col ..< (wide.col + wide.colSpan)].reduce(0, +)
+        let wideFraction = att.columnProportions[wide.col ..< (wide.col + wide.colSpan)].reduce(0, +)
         XCTAssertEqual(wideFraction, 0.4, accuracy: 0.001, "the spanned cell covers the sum of its columns' ratios")
-        XCTAssertEqual(att.columnRatios[cells[1].col], 0.6, accuracy: 0.001)
+        XCTAssertEqual(att.columnProportions[cells[1].col], 0.6, accuracy: 0.001)
     }
 
     /// A no-grid table (no `columnWidths` — every markdown table, and an office table before its
@@ -1457,42 +1487,33 @@ final class OfficeTextBuilderTests: XCTestCase {
     func testNoGridTableGetsEqualColumnFractions() {
         let rows: [[Cell]] = [[Cell(spans: [span("A")]), Cell(spans: [span("B")]), Cell(spans: [span("C")])]]
         let out = build([.table(rows: rows, headerRows: 0)])
-        let att = try! XCTUnwrap(tableAttachmentCell(in: out))
-        XCTAssertEqual(att.columnRatios.count, 3)
-        for ratio in att.columnRatios { XCTAssertEqual(ratio, 1.0 / 3.0, accuracy: 0.001) }
+        let att = try! XCTUnwrap(firstGridTable(in: out))
+        XCTAssertEqual(att.columnProportions.count, 3)
+        for ratio in att.columnProportions { XCTAssertEqual(ratio, 1.0 / 3.0, accuracy: 0.001) }
     }
 
-    /// The shared edge grid: a 2×2 table's OUTER edges (left `vEdges[0]`, right `vEdges[ncol]`, top
-    /// `hEdges[0]`, bottom `hEdges[nrow]`) are all present, and every INTERIOR seam is stored ONCE
-    /// (one slot per boundary, so two adjacent cells' shared border is drawn a single time). Replaces
-    /// the old per-cell `drawsRightEdge`/`drawsBottomEdge` ownership model, which the shared edge grid
-    /// makes unnecessary — the geometry decides edges, not each cell.
-    func testOnlyTheGridsLastColumnAndRowDrawTheirOwnTrailingEdge() {
+    /// The `NSTextTable` equivalent of the old shared edge grid: every one of a 2×2 table's four
+    /// placed cells is bordered on ALL FOUR edges, and the table sets `collapsesBorders`, which is
+    /// what merges two adjacent cells' shared seam into a single drawn line — the property the old
+    /// engine's one-slot-per-boundary edge grid was hand-rolling.
+    func testEveryCellIsBorderedAndTheTableCollapsesSharedSeams() {
         let rows: [[Cell]] = [
             [Cell(spans: [span("A")]), Cell(spans: [span("B")])],
             [Cell(spans: [span("C")]), Cell(spans: [span("D")])],
         ]
         let out = build([.table(rows: rows, headerRows: 0)])
-        let att = try! XCTUnwrap(tableAttachmentCell(in: out))
-        let g = TableGeometry.solve(cells: att.cells, ncol: att.ncol, nrow: att.nrow,
-                                    columnRatios: att.columnRatios, width: 800, minRowHeight: 20,
-                                    measure: { _, _ in 10 })
-        XCTAssertEqual(att.ncol, 2)
-        XCTAssertEqual(att.nrow, 2)
-        // Outer vertical edges (left col 0, right col ncol) present for every row.
-        for r in 0..<att.nrow {
-            XCTAssertNotNil(g.vEdges[0][r], "left outer edge present")
-            XCTAssertNotNil(g.vEdges[att.ncol][r], "right outer edge present")
+        let cells = tableCells(in: out)
+        XCTAssertEqual(cells.count, 4)
+        XCTAssertEqual(tableRowCount(in: out), 2)
+        let table = try! XCTUnwrap(firstGridTable(in: out))
+        XCTAssertEqual(table.numberOfColumns, 2)
+        XCTAssertTrue(table.collapsesBorders, "adjacent cells' shared seam collapses to a single line")
+        for cell in cells {
+            for edge in [NSRectEdge.minX, .maxX, .minY, .maxY] {
+                XCTAssertGreaterThan(cell.block.width(for: .border, edge: edge), 0, "every cell edge is bordered")
+                XCTAssertNotNil(cell.block.borderColor(for: edge))
+            }
         }
-        // Outer horizontal edges (top row 0, bottom row nrow) present for every column.
-        for c in 0..<att.ncol {
-            XCTAssertNotNil(g.hEdges[0][c], "top outer edge present")
-            XCTAssertNotNil(g.hEdges[att.nrow][c], "bottom outer edge present")
-        }
-        // The single interior vertical seam (between col 0 and col 1) and interior horizontal seam
-        // exist as one slot each — shared, drawn once.
-        XCTAssertNotNil(g.vEdges[1][0], "interior vertical seam present once")
-        XCTAssertNotNil(g.hEdges[1][0], "interior horizontal seam present once")
     }
 
     /// `columnWidths` whose count doesn't match the table's own derived column count (a malformed
@@ -1500,9 +1521,9 @@ final class OfficeTextBuilderTests: XCTestCase {
     func testMismatchedColumnWidthsCountFallsBackToPerCellLayout() {
         let rows: [[Cell]] = [[Cell(spans: [span("A")]), Cell(spans: [span("B")])]]
         let out = build([.table(rows: rows, headerRows: 0, columnWidths: [100, 100, 300])])
-        let att = try! XCTUnwrap(tableAttachmentCell(in: out))
-        XCTAssertEqual(att.columnRatios.count, 2)
-        for ratio in att.columnRatios { XCTAssertEqual(ratio, 0.5, accuracy: 0.001) }
+        let att = try! XCTUnwrap(firstGridTable(in: out))
+        XCTAssertEqual(att.columnProportions.count, 2)
+        for ratio in att.columnProportions { XCTAssertEqual(ratio, 0.5, accuracy: 0.001) }
     }
 
     /// The pre-sprint construction path (`Cell(spans:)`) leaves all four fields `nil` — the theme's
@@ -1510,10 +1531,10 @@ final class OfficeTextBuilderTests: XCTestCase {
     /// no shading/border/width info renders as.
     func testCellWithNoShadingBorderOrWidthKeepsExactlyTheThemeDefaults() {
         let out = build([.table(rows: [[Cell(spans: [span("A")])]], headerRows: 0)])
-        let cell = try! XCTUnwrap(tableGridCells(in: out).first)
+        let cell = try! XCTUnwrap(tableCells(in: out).first)
         XCTAssertNil(cell.background)
-        XCTAssertEqual(cell.border.color, Palette.tableBorder)
-        XCTAssertEqual(cell.border.width, 1)
+        XCTAssertEqual(cell.borderColor, Palette.tableBorder)
+        XCTAssertEqual(cell.borderWidth, 1)
     }
 
     /// Merged cells (R1's `colSpan`) must still work once a cell can ALSO carry shading — the two
@@ -1521,7 +1542,7 @@ final class OfficeTextBuilderTests: XCTestCase {
     func testMergedCellWithShadingStillAppliesBothItsSpanAndItsShading() {
         let rows: [[Cell]] = [[Cell(blocks: [.paragraph(spans: [span("Wide")])], colSpan: 2, backgroundColor: .systemOrange)]]
         let out = build([.table(rows: rows, headerRows: 0)])
-        let cell = try! XCTUnwrap(tableGridCells(in: out).first)
+        let cell = try! XCTUnwrap(tableCells(in: out).first)
         XCTAssertEqual(cell.colSpan, 2)
         XCTAssertEqual(cell.background, .systemOrange)
     }
@@ -1535,9 +1556,9 @@ final class OfficeTextBuilderTests: XCTestCase {
         let rows: [[Cell]] = [[Cell(spans: [span("A")])]]
         let out = build([.table(rows: rows, headerRows: 0,
                                 format: TableFormat(defaultBorderColor: .systemPurple, defaultBorderWidth: 3))])
-        let cell = try! XCTUnwrap(tableGridCells(in: out).first)
-        XCTAssertEqual(cell.border.color, .systemPurple)
-        XCTAssertEqual(cell.border.width, 3)
+        let cell = try! XCTUnwrap(tableCells(in: out).first)
+        XCTAssertEqual(cell.borderColor, .systemPurple)
+        XCTAssertEqual(cell.borderWidth, 3)
     }
 
     /// A cell's OWN border still wins over a table-level default that exists alongside it.
@@ -1545,9 +1566,9 @@ final class OfficeTextBuilderTests: XCTestCase {
         let rows: [[Cell]] = [[Cell(blocks: [.paragraph(spans: [span("A")])], borderColor: .systemRed, borderWidth: 5)]]
         let out = build([.table(rows: rows, headerRows: 0,
                                 format: TableFormat(defaultBorderColor: .systemPurple, defaultBorderWidth: 3))])
-        let cell = try! XCTUnwrap(tableGridCells(in: out).first)
-        XCTAssertEqual(cell.border.color, .systemRed)
-        XCTAssertEqual(cell.border.width, 5)
+        let cell = try! XCTUnwrap(tableCells(in: out).first)
+        XCTAssertEqual(cell.borderColor, .systemRed)
+        XCTAssertEqual(cell.borderWidth, 5)
     }
 
     /// A table-level default shading applies to a cell with no shading of its own — including a
@@ -1556,7 +1577,7 @@ final class OfficeTextBuilderTests: XCTestCase {
     func testTableDefaultShadingAppliesToCellsWithNoShadingOfTheirOwnIncludingHeaderRows() {
         let rows: [[Cell]] = [[Cell(spans: [span("H")])]]
         let out = build([.table(rows: rows, headerRows: 1, format: TableFormat(defaultShading: .systemYellow))])
-        let cell = try! XCTUnwrap(tableGridCells(in: out).first)
+        let cell = try! XCTUnwrap(tableCells(in: out).first)
         XCTAssertEqual(cell.background, .systemYellow)
     }
 
@@ -1564,7 +1585,7 @@ final class OfficeTextBuilderTests: XCTestCase {
     func testCellOwnShadingWinsOverTheTableDefaultShading() {
         let rows: [[Cell]] = [[Cell(blocks: [.paragraph(spans: [span("A")])], backgroundColor: .systemGreen)]]
         let out = build([.table(rows: rows, headerRows: 0, format: TableFormat(defaultShading: .systemYellow))])
-        let cell = try! XCTUnwrap(tableGridCells(in: out).first)
+        let cell = try! XCTUnwrap(tableCells(in: out).first)
         XCTAssertEqual(cell.background, .systemGreen)
     }
 
@@ -1576,7 +1597,7 @@ final class OfficeTextBuilderTests: XCTestCase {
         var cell = Cell(blocks: [.paragraph(spans: [span("A")])], backgroundColor: .systemRed)
         cell.styleShading = .systemYellow
         let out = build([.table(rows: [[cell]], headerRows: 0)])
-        let placed = try! XCTUnwrap(tableGridCells(in: out).first)
+        let placed = try! XCTUnwrap(tableCells(in: out).first)
         XCTAssertEqual(placed.background, .systemRed)
     }
 
@@ -1584,16 +1605,16 @@ final class OfficeTextBuilderTests: XCTestCase {
     func testCellVerticalAlignmentCenterBecomesMiddleAlignment() {
         let rows: [[Cell]] = [[Cell(blocks: [.paragraph(spans: [span("A")])], verticalAlignment: .center)]]
         let out = build([.table(rows: rows, headerRows: 0)])
-        let cell = try! XCTUnwrap(tableGridCells(in: out).first)
-        XCTAssertEqual(cell.verticalAlignment, .center)
+        let cell = try! XCTUnwrap(tableCells(in: out).first)
+        XCTAssertEqual(cell.verticalAlignment, .middleAlignment)
     }
 
     /// `nil` (the pre-sprint default) leaves the placed cell at its `.top` vertical alignment.
     func testCellWithNoVerticalAlignmentKeepsTheDefaultTopAlignment() {
         let rows: [[Cell]] = [[Cell(spans: [span("A")])]]
         let out = build([.table(rows: rows, headerRows: 0)])
-        let cell = try! XCTUnwrap(tableGridCells(in: out).first)
-        XCTAssertEqual(cell.verticalAlignment, .top)
+        let cell = try! XCTUnwrap(tableCells(in: out).first)
+        XCTAssertEqual(cell.verticalAlignment, .topAlignment)
     }
 
     /// `Cell.padding` (already resolved by the reader against any table default) reaches the placed
@@ -1603,9 +1624,9 @@ final class OfficeTextBuilderTests: XCTestCase {
     func testCellPaddingReplacesTheHardcodedSevenPointDefault() {
         let rows: [[Cell]] = [[Cell(blocks: [.paragraph(spans: [span("A")])], padding: 12)]]
         let out = build([.table(rows: rows, headerRows: 0)])
-        let cell = try! XCTUnwrap(tableGridCells(in: out).first)
+        let cell = try! XCTUnwrap(tableCells(in: out).first)
         XCTAssertEqual(cell.padding, 12)
-        let ps = try! XCTUnwrap(cell.content.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle)
+        let ps = try! XCTUnwrap(out.attribute(.paragraphStyle, at: cell.range.location, effectiveRange: nil) as? NSParagraphStyle)
         XCTAssertEqual(ps.headIndent, 0, "no table indent added on top of the cell's own paragraph style")
         XCTAssertEqual(ps.tailIndent, 0)
         XCTAssertEqual(ps.minimumLineHeight, (theme.baseFontSize * theme.lineHeightRatio).rounded(),
@@ -1618,9 +1639,9 @@ final class OfficeTextBuilderTests: XCTestCase {
     func testCellWithNoPaddingKeepsTheHardcodedSevenPointDefault() {
         let rows: [[Cell]] = [[Cell(spans: [span("A")])]]
         let out = build([.table(rows: rows, headerRows: 0)])
-        let cell = try! XCTUnwrap(tableGridCells(in: out).first)
+        let cell = try! XCTUnwrap(tableCells(in: out).first)
         XCTAssertEqual(cell.padding, 7)
-        let ps = try! XCTUnwrap(cell.content.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle)
+        let ps = try! XCTUnwrap(out.attribute(.paragraphStyle, at: cell.range.location, effectiveRange: nil) as? NSParagraphStyle)
         XCTAssertEqual(ps.headIndent, 0, "no table indent added on top of the cell's own paragraph style")
     }
 

@@ -35,8 +35,8 @@ final class MarkdownFeatureAuditTests: XCTestCase {
 
     private func hasTableAttachment(_ s: NSAttributedString) -> Bool {
         var found = false
-        s.enumerateAttribute(.attachment, in: NSRange(location: 0, length: s.length)) { v, _, stop in
-            if let att = v as? NSTextAttachment, att.attachmentCell is TableAttachmentCell {
+        s.enumerateAttribute(.paragraphStyle, in: NSRange(location: 0, length: s.length)) { v, _, stop in
+            if let ps = v as? NSParagraphStyle, ps.textBlocks.first is NSTextTableBlock {
                 found = true; stop.pointee = true
             }
         }
@@ -122,10 +122,13 @@ final class MarkdownFeatureAuditTests: XCTestCase {
         XCTAssertTrue(s.string.contains("☑"), "a checked task must render a ticked checkbox ☑")
     }
 
-    func testTableRendersAsCustomTableAttachment() {
-        // Tables are drawn by us now (invariant 39): one `TableAttachmentCell`, not `NSTextTable`.
-        XCTAssertTrue(hasTableAttachment(render("| A | B |\n|---|---|\n| 1 | 2 |")),
-                      "a GFM table must render as one custom TableAttachmentCell")
+    func testTableRendersAsRealTextTable() {
+        // Tables are a real `NSTextTable` (invariant 39, revised): cell text is real document text —
+        // selectable, copyable, searchable — carried in `NSTextTableBlock` paragraphs, not a drawing.
+        let s = render("| A | B |\n|---|---|\n| 1 | 2 |")
+        XCTAssertTrue(hasTableAttachment(s), "a GFM table must render as a real NSTextTable")
+        XCTAssertTrue(s.string.contains("A") && s.string.contains("2"),
+                      "cell text must be real document text, not locked inside a drawn attachment")
     }
 
     func testHardLineBreakStaysInParagraph() {

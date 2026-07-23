@@ -34,7 +34,13 @@ enum ExternalEditor {
     /// S7-3: this app is a plausible default handler for these types once it registers them (S4),
     /// so offering it in "edit in another app" would be a loop that does nothing. Order preserved.
     static func filterCandidates(_ candidates: [AppCandidate], excluding ownBundleIdentifier: String) -> [AppCandidate] {
-        candidates.filter { $0.bundleIdentifier != ownBundleIdentifier }
+        // Exclude OUR app whichever variant is running or listed: a dev build's identifier ends in
+        // `.dev` while the installed release's does not, so a plain `!=` let the release "Fast Document
+        // Reader" show up in a dev build's own "Edit in…" list (and vice-versa). Compare on the base
+        // identifier (the `.dev` suffix stripped from both sides) so both variants are filtered out.
+        func base(_ id: String) -> String { id.hasSuffix(".dev") ? String(id.dropLast(4)) : id }
+        let own = base(ownBundleIdentifier)
+        return candidates.filter { base($0.bundleIdentifier) != own }
     }
 
     /// Reads the remembered app for a format. `resolve` re-checks that the bundle identifier still

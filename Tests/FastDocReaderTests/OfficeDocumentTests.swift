@@ -244,15 +244,16 @@ final class OfficeDocumentTests: XCTestCase {
     func testTableCellTextReachesTheRenderedDocumentThroughTheFullReadPath() throws {
         let (_, wc) = try openOffice(fixtureDocxWithTable())
         let storage = try XCTUnwrap(wc.textStorageRef)
-        // A table renders as ONE custom-drawn `TableAttachmentCell`, so its cell text lives inside
-        // that attachment's placed cells rather than the top-level storage string.
-        var cellTexts: [String] = []
-        storage.enumerateAttribute(.attachment, in: NSRange(location: 0, length: storage.length)) { value, _, _ in
-            if let att = value as? NSTextAttachment, let table = att.attachmentCell as? TableAttachmentCell {
-                cellTexts.append(contentsOf: table.cells.map { $0.content.string })
-            }
-        }
-        XCTAssertTrue(cellTexts.contains { $0.contains("Cell A") }, "cell text must reach the rendered document")
+        // A table now renders as a REAL `NSTextTable`, so its cell text is ordinary — selectable,
+        // copyable, searchable — text in the top-level storage string, not hidden inside a drawn
+        // attachment. It reaches the rendered document simply by being in that string.
+        XCTAssertTrue(storage.string.contains("Cell A"), "cell text must reach the rendered document")
+        // And it really is inside an NSTextTable cell (a paragraph carrying an `NSTextTableBlock`),
+        // not just loose text — proving the table structure survived the full read + render path.
+        let ns = storage.string as NSString
+        let cellLoc = ns.range(of: "Cell A").location
+        let ps = storage.attribute(.paragraphStyle, at: cellLoc, effectiveRange: nil) as? NSParagraphStyle
+        XCTAssertTrue(ps?.textBlocks.first is NSTextTableBlock, "the cell text sits in a real NSTextTable cell")
     }
 
     /// S8 invariant 29 (docx): an image inside a table cell must reach `doc.officeBlocks` through

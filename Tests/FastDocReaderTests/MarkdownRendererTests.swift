@@ -37,64 +37,54 @@ final class MarkdownRendererTests: XCTestCase {
 
     func testGFMTableRendersAllCells() {
         let s = render("| A | B |\n|---|---|\n| 1 | 2 |")
-        // Cell text now lives inside the table's one `TableAttachmentCell`, not the top-level string.
-        let texts = tableGridCells(in: s).map { $0.content.string }
+        // Cells are REAL document text now (an `NSTextTable`), so they live in the top-level string —
+        // which is exactly why they became selectable, copyable and searchable.
         for cell in ["A", "B", "1", "2"] {
-            XCTAssertTrue(texts.contains { $0.contains(cell) }, "missing \(cell)")
+            XCTAssertTrue(s.string.contains(cell), "missing \(cell)")
         }
     }
 
-    /// Every placed `TableGridCell` and the one `TableAttachmentCell` that `MarkdownRenderer.visitTable`
-    /// produces via `TableBlockBuilder` — office and markdown tables share the identical builder, so
-    /// they're inspected the same way (mirrors `OfficeTextBuilderTests`).
-    private func tableGridCells(in out: NSAttributedString) -> [TableGridCell] {
-        var found: [TableGridCell] = []
-        out.enumerateAttribute(.attachment, in: NSRange(location: 0, length: out.length)) { value, _, _ in
-            if let att = value as? NSTextAttachment, let cell = att.attachmentCell as? TableAttachmentCell {
-                found.append(contentsOf: cell.cells)
-            }
+    /// One `(block, cellText)` per table-cell paragraph — every cell is a paragraph whose style carries
+    /// its `NSTextTableBlock`. Office and markdown tables share the identical builder, so they're
+    /// inspected the same way.
+    private func tableBlocks(in out: NSAttributedString) -> [(block: NSTextTableBlock, text: String)] {
+        var found: [(NSTextTableBlock, String)] = []
+        let ns = out.string as NSString
+        out.enumerateAttribute(.paragraphStyle, in: NSRange(location: 0, length: out.length)) { value, range, _ in
+            guard let ps = value as? NSParagraphStyle, let block = ps.textBlocks.first as? NSTextTableBlock else { return }
+            found.append((block, ns.substring(with: range)))
         }
         return found
     }
-    private func tableAttachmentCell(in out: NSAttributedString) -> TableAttachmentCell? {
-        var result: TableAttachmentCell?
-        out.enumerateAttribute(.attachment, in: NSRange(location: 0, length: out.length)) { value, _, _ in
-            if let att = value as? NSTextAttachment, let cell = att.attachmentCell as? TableAttachmentCell { result = cell }
-        }
-        return result
+    private func firstGridTable(in out: NSAttributedString) -> GridTextTable? {
+        tableBlocks(in: out).compactMap { $0.block.table as? GridTextTable }.first
     }
 
-    /// Characterizes the bordered grid `MarkdownRenderer.visitTable` produces via `TableBlockBuilder`
-    /// (one custom-drawn `TableAttachmentCell`), so any drift in the extraction shows up here first.
+    /// Characterizes the real bordered `NSTextTable` grid `MarkdownRenderer.visitTable` produces via
+    /// `TableBlockBuilder` — office and markdown tables share the identical builder.
     func testGFMTableUsesRealTextTableWithBorderAndHeaderShading() {
         let s = render("| A | B |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |")
-        let cells = tableGridCells(in: s)
+        let blocks = tableBlocks(in: s)
         // 2 header cells + 2 body rows * 2 cells = 6 placed cells total.
-        XCTAssertEqual(cells.count, 6)
-        // The whole table is ONE attachment (real grid, not per-cell islands).
-        XCTAssertNotNil(tableAttachmentCell(in: s))
+        XCTAssertEqual(blocks.count, 6)
+        // They all belong to ONE table (a real grid, not per-cell islands).
+        XCTAssertEqual(Set(blocks.map { ObjectIdentifier($0.block.table) }).count, 1)
         // Exactly the 2 header cells (row 0) are shaded — headerRows defaults to 1 for markdown.
-        let headerBackgrounds = cells.filter { $0.row == 0 }.compactMap(\.background)
-        XCTAssertEqual(headerBackgrounds.count, 2)
-        let borderColors = Set(cells.map { $0.border.color })
-        XCTAssertEqual(borderColors, [Palette.tableBorder])
-        // Row/column placement is exact: header row occupies row 0, columns 0 and 1.
-        let headerCols = Set(cells.filter { $0.row == 0 }.map(\.col))
-        XCTAssertEqual(headerCols, [0, 1])
-        let bodyRows = Set(cells.filter { $0.row != 0 }.map(\.row))
-        XCTAssertEqual(bodyRows, [1, 2])
+        XCTAssertEqual(blocks.filter { $0.block.startingRow == 0 && $0.block.backgroundColor != nil }.count, 2)
+        // Every cell carries a border.
+        for (block, _) in blocks { XCTAssertGreaterThan(block.width(for: .border, edge: .minX), 0) }
+        // Row placement is exact: header at row 0, body at rows 1 and 2.
+        XCTAssertEqual(Set(blocks.filter { $0.block.startingRow == 0 }.map { $0.block.startingColumn }), [0, 1])
+        XCTAssertEqual(Set(blocks.filter { $0.block.startingRow != 0 }.map { $0.block.startingRow }), [1, 2])
     }
 
-    /// GFM tables have no `w:tblGrid`-equivalent concept, so `MarkdownRenderer` never constructs
-    /// an `OfficeBlock.table` at all — `visitTable` builds `TableBlockBuilder.CellContent` rows
-    /// directly and calls `TableBlockBuilder.build` with `columnWidths` at its default (`[]`).
-    /// This locks that in: a markdown table's columns are an EQUAL share (no source grid ratio),
-    /// so every entry in the attachment's `columnRatios` is `1 / ncol`.
-    func testGFMTableUsesNoPerColumnPercentageWidth() {
+    /// A markdown table has no source grid, so its columns are an EQUAL share — every entry in the
+    /// table's stored proportions is `1 / ncol` (fed as absolute integer widths, not percentages).
+    func testGFMTableColumnsAreEqualProportions() {
         let s = render("| A | B |\n|---|---|\n| 1 | 2 |")
-        let att = try! XCTUnwrap(tableAttachmentCell(in: s))
-        XCTAssertEqual(att.columnRatios.count, 2)
-        for ratio in att.columnRatios { XCTAssertEqual(ratio, 0.5, accuracy: 0.001) }
+        let table = try! XCTUnwrap(firstGridTable(in: s))
+        XCTAssertEqual(table.columnProportions.count, 2)
+        for p in table.columnProportions { XCTAssertEqual(p, 0.5, accuracy: 0.001) }
     }
 
     func testHeadingIsTaggedWithMDAttr() {

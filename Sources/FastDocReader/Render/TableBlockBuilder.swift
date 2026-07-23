@@ -1,5 +1,22 @@
 import AppKit
 
+/// An `NSTextTable` that remembers its columns' PROPORTIONS (summing to 1) so the table can be
+/// re-solved to ABSOLUTE integer point widths at whatever reading-column width the window currently
+/// has. Percentage column widths are the wrong tool: `NSTextTable` recomputes them per row, so a
+/// column boundary lands on a slightly different fractional pixel in a 4-cell row than in a
+/// span-merged one — the "열이 살짝 어긋남" drift. Absolute widths, computed once as a cumulative sum of
+/// rounded integer edges, put every row's column boundary at the SAME integer x by construction.
+final class GridTextTable: NSTextTable {
+    var columnProportions: [CGFloat] = []   // one per column, sums to 1
+    /// Integer cumulative x-edges (ncol+1) at `width` — the shared grid every cell reads.
+    func edges(forWidth width: CGFloat) -> [CGFloat] {
+        var out: [CGFloat] = [0]
+        var cum: CGFloat = 0
+        for p in columnProportions { cum += p; out.append((width * cum).rounded()) }
+        return out
+    }
+}
+
 /// The one place that builds a real bordered `NSTextTable` grid, shared by `MarkdownRenderer`
 /// (GFM tables) and `OfficeTextBuilder` (Word/office tables) — a table looks and behaves the same
 /// however the document reached it. Each caller renders its own cell content (markdown inline
@@ -153,20 +170,29 @@ enum TableBlockBuilder {
         // Reading order, so the laid-out cells follow the grid rather than the order they were found.
         placements.sort { ($0.row, $0.col) < ($1.row, $1.col) }
 
-        // Build the custom-drawn table: ONE attachment carrying every placed cell. `NSTextTable` is
-        // NOT used — `TableAttachmentCell` computes the column x-edges, row heights and border grid
-        // itself, so a merged row's seam lands at the exact same x as a single-cell row's (rhwp's
-        // shared cumulative-edge model), and the document's own border colour is honoured verbatim.
-        let ratios: [CGFloat] = columnPercentages.isEmpty
+        // Lay the cells into a REAL `NSTextTable` so their text is part of the document — selectable,
+        // copyable and searchable (a custom-drawn attachment, however crisply aligned, is a picture the
+        // reader can't select, copy or ⌘F). Columns are pinned by PERCENTAGE of the table (one shared
+        // proportion per column, spanned cells summing their columns'), so every row reads the same
+        // column edge and the table tracks the window width natively — no custom relayout. The old
+        // "per-row packing drifted a merged seam" was the reason for the earlier custom engine; giving
+        // every cell in a column the identical percentage removes the per-row freedom that drifted.
+        // Column PROPORTIONS (sum 1) — from the source's own grid, else equal. Kept on the table so a
+        // resize can re-solve absolute widths; the table is first built at the placeholder width and
+        // `resizeTables(in:toWidth:)` re-solves it to the real reading column on the next layout.
+        let proportions: [CGFloat] = columnPercentages.isEmpty
             ? Array(repeating: 1 / CGFloat(ncol), count: ncol)
             : columnPercentages.map { $0 / 100 }
-        var gridCells: [TableGridCell] = []
-        gridCells.reserveCapacity(placements.count)
+        let table = GridTextTable()
+        table.numberOfColumns = ncol
+        table.columnProportions = proportions
+        table.collapsesBorders = true
+        table.hidesEmptyCells = false
+        let edges = table.edges(forWidth: Self.initialColumnWidth)
+
         for placement in placements {
             let header = placement.row < headerRows
-            // cell-direct > table-direct > table-STYLE (P5) > theme default — the same chain the old
-            // NSTextTable path resolved, now feeding the custom cell (a covered/padding position has
-            // no cell value, so it collapses to the theme default border and no shading).
+            // cell-direct > table-direct > table-STYLE (P5) > theme default — unchanged resolution.
             let borderColor = placement.cell?.borderColor ?? tableBorderColor
                 ?? placement.cell?.styleBorderColor ?? Palette.tableBorder
             let borderWidth = placement.cell?.borderWidth ?? tableBorderWidth
@@ -177,24 +203,77 @@ enum TableBlockBuilder {
             else if let styleBg = placement.cell?.styleShading { background = styleBg }
             else if header { background = Palette.tableHeaderBg }
             else { background = nil }
-            // Padding floored to the reader's comfortable default (a `fo:padding="0cm"` cell reads
-            // with room, not cramped) — applied by the geometry as the cell's inner inset, so the
-            // NSTextTable-era horizontal-padding-vs-indent dance is gone entirely.
             let padding = max(placement.cell?.padding ?? Self.defaultCellPadding, Self.defaultCellPadding)
-            gridCells.append(TableGridCell(
-                content: placement.cell?.content ?? NSAttributedString(),
-                row: placement.row, col: placement.col,
-                rowSpan: placement.rowSpan, colSpan: placement.colSpan,
-                background: background, border: TableBorder(color: borderColor, width: borderWidth),
-                verticalAlignment: placement.cell?.verticalAlignment ?? .top, padding: padding))
+
+            let block = NSTextTableBlock(table: table,
+                                         startingRow: placement.row, rowSpan: placement.rowSpan,
+                                         startingColumn: placement.col, columnSpan: placement.colSpan)
+            block.setBorderColor(borderColor)
+            block.setWidth(borderWidth, type: .absoluteValueType, for: .border)
+            block.setWidth(padding, type: .absoluteValueType, for: .padding)
+            // ABSOLUTE integer content width: the cell's integer span width minus its own padding and
+            // borders, so every row's column boundary lands on the same integer x (no percentage drift).
+            let cellWidth = edges[min(placement.col + placement.colSpan, ncol)] - edges[placement.col]
+            block.setContentWidth(max(1, cellWidth - 2 * padding - 2 * borderWidth), type: .absoluteValueType)
+            if let background { block.backgroundColor = background }
+            switch placement.cell?.verticalAlignment ?? .top {
+            case .top: block.verticalAlignment = .topAlignment
+            case .center: block.verticalAlignment = .middleAlignment
+            case .bottom: block.verticalAlignment = .bottomAlignment
+            }
+
+            // Each cell is one or more paragraphs carrying this block. Preserve the cell content's own
+            // paragraph style (alignment/indent/spacing) and only graft the table block onto it.
+            let cellStr = NSMutableAttributedString(attributedString: placement.cell?.content ?? NSAttributedString())
+            if cellStr.length == 0 || !cellStr.string.hasSuffix("\n") {
+                cellStr.append(NSAttributedString(string: "\n"))
+            }
+            let whole = NSRange(location: 0, length: cellStr.length)
+            cellStr.enumerateAttribute(.paragraphStyle, in: whole) { value, range, _ in
+                let ps = (value as? NSParagraphStyle)?.mutableCopy() as? NSMutableParagraphStyle
+                    ?? NSMutableParagraphStyle()
+                ps.textBlocks = [block]
+                cellStr.addAttribute(.paragraphStyle, value: ps, range: range)
+            }
+            result.append(cellStr)
         }
-        let minRowHeight = (theme.baseFontSize * theme.codeLineHeightRatio).rounded() + 2 * Self.defaultCellPadding
-        let attachment = NSTextAttachment()
-        attachment.attachmentCell = TableAttachmentCell(
-            cells: gridCells, ncol: ncol, nrow: rows.count, columnRatios: ratios,
-            minRowHeight: minRowHeight, initialWidth: Self.initialColumnWidth)
-        let out = NSMutableAttributedString(attachment: attachment)
-        out.append(NSAttributedString(string: "\n"))
-        return out
+        // A trailing paragraph with NO table block closes the table (else the next document content
+        // would be pulled into the last cell). The caller's own following block usually does this, but
+        // a table that ends the document needs its own terminator.
+        result.append(NSAttributedString(string: "\n"))
+        return result
+    }
+
+    /// Re-solve every `GridTextTable`'s cells to ABSOLUTE integer widths for the current reading-column
+    /// `width`. Tables are built at a placeholder width (`initialColumnWidth`); this is the counterpart
+    /// of the old custom engine's `relayout`, but far smaller — it just rewrites each cell block's
+    /// content width from the table's stored proportions, then the layout manager reflows. Called from
+    /// the window controller on first layout and every reflow (resize / sidebar toggle).
+    static func resizeTables(in storage: NSTextStorage, toWidth width: CGFloat) {
+        guard width > 0, storage.length > 0 else { return }
+        let whole = NSRange(location: 0, length: storage.length)
+        var edgesByTable: [ObjectIdentifier: [CGFloat]] = [:]
+        var touched: [NSRange] = []
+        storage.enumerateAttribute(.paragraphStyle, in: whole) { value, range, _ in
+            guard let ps = value as? NSParagraphStyle,
+                  let block = ps.textBlocks.first as? NSTextTableBlock,
+                  let table = block.table as? GridTextTable, !table.columnProportions.isEmpty else { return }
+            let key = ObjectIdentifier(table)
+            let edges = edgesByTable[key] ?? {
+                let e = table.edges(forWidth: width); edgesByTable[key] = e; return e
+            }()
+            let ncol = table.numberOfColumns
+            let c0 = min(block.startingColumn, ncol)
+            let c1 = min(block.startingColumn + block.columnSpan, ncol)
+            guard c1 > c0, c1 < edges.count else { return }
+            let pad = block.width(for: .padding, edge: .minX)   // read back this cell's own padding
+            let border = block.width(for: .border, edge: .minX)
+            block.setContentWidth(max(1, edges[c1] - edges[c0] - 2 * pad - 2 * border), type: .absoluteValueType)
+            touched.append(range)
+        }
+        // Widths changed on the shared block objects; nudge layout to pick them up.
+        if !touched.isEmpty, let lm = storage.layoutManagers.first {
+            for r in touched { lm.invalidateLayout(forCharacterRange: r, actualCharacterRange: nil) }
+        }
     }
 }

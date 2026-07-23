@@ -33,10 +33,13 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
     private var commentsItem: NSSplitViewItem!
 
     // MARK: R5 — read-only badge + "Edit in <App>" (office documents only)
-    private let officeBadge = NSTextField(labelWithString: "Read-only")
+    private let officeBadge = NSTextField(labelWithString: "read only")
     private let editButton = NSButton(title: "", target: nil, action: nil)
-    private let editMenuButton = NSButton(title: "▾", target: nil, action: nil)
+    private let editMenuButton = NSButton(title: "", target: nil, action: nil)
     private var officeAccessoryHost: NSView!
+    /// The table-of-contents titlebar button's host — hidden for a document with no headings, where
+    /// the button would do nothing (the toggle just beeps).
+    private var sidebarButtonHost: NSView!
     private let externalEditorService = ExternalEditorService()
 
     convenience init() {
@@ -326,24 +329,20 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         }
     }
 
-    /// Re-lays every custom-drawn table (`TableAttachmentCell`) to THIS reading column's width — same
-    /// run cadence as `reanchorFillMarginTabs` above (display, resize, sidebar toggle, always from
-    /// `updateTextInset`). A table is built at a placeholder width (`TableBlockBuilder.initialColumn
-    /// Width`); this recomputes its column x-edges and row heights for the real column, so it fills
-    /// and tracks the window. The cell owns its own size (like `SizedAttachmentCell`), so the size
+    /// Re-solves every `NSTextTable` (`GridTextTable`) to THIS reading column's width via
+    /// `TableBlockBuilder.resizeTables` — same run cadence as `reanchorFillMarginTabs` above (display,
+    /// resize, sidebar toggle, always from `updateTextInset`). A table is built at a placeholder width
+    /// (`TableBlockBuilder.initialColumnWidth`); this rewrites each cell block's absolute width from
+    /// the stored column proportions for the real column, so it fills and tracks the window. The
     /// change is a display concern only — never the undo manager or `applySourceEdit`, so a read-only
     /// office document doesn't go dirty because its window was resized (office Viewers stay clean).
-    ///
-    /// Two passes: relayout every cell first, then invalidate their glyph layout so the layout
-    /// manager re-reads the new `cellSize()` and the document reflows around the new table heights —
-    /// invalidating while `enumerateAttribute` is still walking is what the split avoids.
     private func resizeTableColumns(toColumn column: CGFloat) {
         guard let storage = textView.textStorage, storage.length > 0 else { return }
-        // Synchronous, in time for the reflow's own anchor restore (invariant 24). This used to be too
-        // slow to run inline — re-measuring big cells cost hundreds of ms — but cell measurement is now
-        // O(n) through the reused `CellText` stack (a 13-table document re-solves in ~68ms, not ~750ms),
-        // so it fits inside the reflow again without freezing the resize.
-        (document as? MarkdownDocument)?.sizeTableCellMedia(in: self)
+        // Re-solve each NSTextTable's cells to ABSOLUTE integer widths for the usable column (container
+        // minus a lineFragmentPadding on each side), so columns fill the width and every row's boundary
+        // lands on the same integer x. Cheap — it rewrites cell block widths from stored proportions.
+        let pad = textView.textContainer?.lineFragmentPadding ?? 5
+        TableBlockBuilder.resizeTables(in: storage, toWidth: max(1, column - 2 * pad))
     }
 
     // MARK: - Table of contents (⌥⌘T)
@@ -376,6 +375,15 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
     func reloadOutline() {
         guard let storage = textView.textStorage else { return }
         outline.reload(from: storage)
+        // Hide the table-of-contents button entirely for a document with no headings — pressing it
+        // there does nothing but beep, so a visible-but-dead control is worse than none. If the panel
+        // happened to be open, collapse it too.
+        let hasHeadings = !outline.entries.isEmpty
+        sidebarButtonHost?.isHidden = !hasHeadings
+        if !hasHeadings, isOutlineVisible, !sidebarItem.isCollapsed {
+            sidebarItem.isCollapsed = true
+            isOutlineVisible = false
+        }
         if isOutlineVisible { outline.markCurrent(charIndex: textView.selectedRange().location) }
     }
 
@@ -460,53 +468,87 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
             button.widthAnchor.constraint(equalToConstant: 32),
             button.heightAnchor.constraint(equalToConstant: 22),
         ])
+        sidebarButtonHost = host
         return host
     }
 
     // MARK: R5 — read-only badge + edit-in-app button
 
     private func officeAccessoryView() -> NSView {
-        officeBadge.font = .systemFont(ofSize: 11, weight: .semibold)
+        // "read only" chip. The label sits in a CONTAINER that carries the background/rounding, with
+        // the text centred by centerX/centerY constraints — an NSTextField with its own layer
+        // background renders its text toward the TOP of a fixed-height box, which is the "위로 쏠림"
+        // skew; centring the label inside a plain container puts it dead centre regardless.
+        officeBadge.font = .systemFont(ofSize: 10, weight: .semibold)
         officeBadge.textColor = .white
         officeBadge.alignment = .center
-        officeBadge.wantsLayer = true
-        officeBadge.layer?.backgroundColor = NSColor.systemRed.cgColor
-        officeBadge.layer?.cornerRadius = 6
         officeBadge.translatesAutoresizingMaskIntoConstraints = false
+        let chip = NSView()
+        chip.wantsLayer = true
+        chip.layer?.backgroundColor = NSColor.systemRed.cgColor
+        chip.layer?.cornerRadius = 8.5              // pill: half the chip height (round style)
+        chip.translatesAutoresizingMaskIntoConstraints = false
+        chip.addSubview(officeBadge)
 
+        // "Edit" button: the target editor's own icon + a short "Edit" (full "Edit in <App>" is the
+        // tooltip). Icon + label set in `updateOfficeAccessory`, which knows the current document.
         editButton.bezelStyle = .texturedRounded
+        editButton.imagePosition = .imageLeading
+        editButton.imageScaling = .scaleProportionallyDown
         editButton.target = self
         editButton.action = #selector(editButtonClicked(_:))
         editButton.translatesAutoresizingMaskIntoConstraints = false
 
+        // The "more editors" button is an ellipsis (…), not a downward chevron.
         editMenuButton.bezelStyle = .texturedRounded
+        editMenuButton.image = NSImage(systemSymbolName: "ellipsis", accessibilityDescription: "More editors")
+        editMenuButton.imagePosition = .imageOnly
         editMenuButton.target = self
         editMenuButton.action = #selector(showEditMenu(_:))
         editMenuButton.translatesAutoresizingMaskIntoConstraints = false
 
-        let host = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 28))
+        // Chip hugs the title (leading inset 2, the smallest gap that still clears the title glyphs);
+        // the Edit button hugs its short "Edit" label (no wide fixed width now that "Edit in <App>"
+        // moved to the tooltip); the whole host width is driven by the content, not a fixed 220 that
+        // left a trailing gap.
+        let host = NSView(frame: NSRect(x: 0, y: 0, width: 170, height: 28))
         host.isHidden = true   // shown only once `updateOfficeAccessory` sees an office document
-        host.addSubview(officeBadge)
+        host.addSubview(chip)
         host.addSubview(editButton)
         host.addSubview(editMenuButton)
+        editButton.setContentHuggingPriority(.required, for: .horizontal)
+        editButton.setContentCompressionResistancePriority(.required, for: .horizontal)
         NSLayoutConstraint.activate([
-            officeBadge.leadingAnchor.constraint(equalTo: host.leadingAnchor, constant: 6),
-            officeBadge.centerYAnchor.constraint(equalTo: host.centerYAnchor),
-            officeBadge.widthAnchor.constraint(greaterThanOrEqualToConstant: 62),
-            officeBadge.heightAnchor.constraint(equalToConstant: 18),
+            officeBadge.leadingAnchor.constraint(equalTo: chip.leadingAnchor, constant: 8),
+            officeBadge.trailingAnchor.constraint(equalTo: chip.trailingAnchor, constant: -8),
+            officeBadge.centerYAnchor.constraint(equalTo: chip.centerYAnchor),
 
-            editButton.leadingAnchor.constraint(equalTo: officeBadge.trailingAnchor, constant: 8),
+            chip.leadingAnchor.constraint(equalTo: host.leadingAnchor, constant: 2),
+            chip.centerYAnchor.constraint(equalTo: host.centerYAnchor),
+            chip.heightAnchor.constraint(equalToConstant: 17),
+
+            editButton.leadingAnchor.constraint(equalTo: chip.trailingAnchor, constant: 8),
             editButton.centerYAnchor.constraint(equalTo: host.centerYAnchor),
             editButton.heightAnchor.constraint(equalToConstant: 22),
 
             editMenuButton.leadingAnchor.constraint(equalTo: editButton.trailingAnchor, constant: 2),
             editMenuButton.centerYAnchor.constraint(equalTo: host.centerYAnchor),
-            editMenuButton.widthAnchor.constraint(equalToConstant: 20),
+            editMenuButton.widthAnchor.constraint(equalToConstant: 26),
             editMenuButton.heightAnchor.constraint(equalToConstant: 22),
             editMenuButton.trailingAnchor.constraint(equalTo: host.trailingAnchor, constant: -6),
         ])
         officeAccessoryHost = host
         return host
+    }
+
+    /// The target editor's icon at button size, or a generic pencil when no app is remembered yet.
+    private func editButtonIcon(for app: ExternalEditor.AppCandidate?) -> NSImage? {
+        let img: NSImage
+        if let app { img = NSWorkspace.shared.icon(forFile: app.url.path) }
+        else if let pencil = NSImage(systemSymbolName: "square.and.pencil", accessibilityDescription: "Edit") { img = pencil }
+        else { return nil }
+        img.size = NSSize(width: 15, height: 15)
+        return img
     }
 
     /// Called from every render pass (`display(_:)`), same as `reloadOutline()` — the badge/button
@@ -518,7 +560,14 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         }
         officeAccessoryHost.isHidden = false
         let ext = doc.fileURL?.pathExtension.lowercased() ?? ""
-        editButton.title = ExternalEditor.editLabel(for: externalEditorService.rememberedCandidate(forExtension: ext))
+        applyEditButton(externalEditorService.rememberedCandidate(forExtension: ext))
+    }
+
+    /// Short "Edit" title + the target editor's icon; the full "Edit in <App>" rides in the tooltip.
+    private func applyEditButton(_ app: ExternalEditor.AppCandidate?) {
+        editButton.title = "Edit"
+        editButton.image = editButtonIcon(for: app)
+        editButton.toolTip = ExternalEditor.editLabel(for: app)
     }
 
     /// Body click (S7-6/S7-7): open directly if an app is remembered; otherwise there is nothing to
@@ -568,7 +617,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         guard let app = sender.representedObject as? ExternalEditor.AppCandidate,
               let (doc, ext) = officeDocumentContext() else { return }
         externalEditorService.remember(app, forExtension: ext)
-        editButton.title = ExternalEditor.editLabel(for: app)
+        applyEditButton(app)
         openExternally(doc, with: app)
     }
 
@@ -585,7 +634,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         guard panel.runModal() == .OK, let appURL = panel.url,
               let app = externalEditorService.appCandidate(from: appURL) else { return }
         externalEditorService.remember(app, forExtension: ext)
-        editButton.title = ExternalEditor.editLabel(for: app)
+        applyEditButton(app)
         openExternally(doc, with: app)
     }
 

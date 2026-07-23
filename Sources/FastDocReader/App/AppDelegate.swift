@@ -18,12 +18,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // by the time media resolve (sandboxed build only; a no-op otherwise).
         FolderAccess.restoreGrants()
         buildMenu()
+        // A regular macOS app MUST present an interactive window on launch — App Store review rejects
+        // a launch that shows only the menu bar (2.1 App Completeness: "No interactive window
+        // displayed upon launch"). A reader has no "new document" concept, so — like shipping App
+        // Store markdown readers — launched with NO document we pop the Open panel; cancelling returns
+        // to the menu-bar-only state (fine, and what those apps do). Deferred one run-loop turn so a
+        // file passed AT launch opens its own window first and suppresses the panel.
+        DispatchQueue.main.async { [weak self] in
+            guard NSDocumentController.shared.documents.isEmpty,
+                  !NSApp.windows.contains(where: { $0.isVisible }) else { return }
+            self?.openDocumentPanel(nil)
+        }
     }
 
-    // Launching WITHOUT a document must NOT auto-pop an Open panel — start empty and let the
-    // user pick via the File menu (Open… / Open Recent). Returning false here suppresses the
-    // untitled-file path entirely; launching WITH a document still opens it normally (AppKit
-    // never calls the untitled hooks in that case).
+    // No untitled ("new blank") documents — this is a read-only viewer, there is nothing to create.
+    // The launch Open panel above (not this hook) is what satisfies "show a window on launch".
     func applicationShouldOpenUntitledFile(_ sender: NSApplication) -> Bool { false }
 
     // A SwiftPM executable has no MainMenu.nib, so build the menu bar in code. Without it,
