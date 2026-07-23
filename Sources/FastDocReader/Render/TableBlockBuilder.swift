@@ -11,6 +11,20 @@ enum TableBlockBuilder {
     /// loop iterations and set insertions. No real table comes near it.
     static let maxSpan = 512
 
+    /// A guess for the reading column's width at BUILD time, when no real one exists yet — a
+    /// table is built once at parse time, long before `DocumentWindowController` knows the actual
+    /// window width. Matches the `NSTextContainer`'s own initial 600pt (`DocumentWindowController`'s
+    /// `init`), so the FIRST paint (before `updateTextInset` runs its own
+    /// `resizeTableColumns(toColumn:)`) is already close, not zero-width. Purely cosmetic: the real
+    /// width always arrives on the very next layout pass, same as invariant 2's "measure everything,
+    /// then lay out once" — this is that pass's harmless placeholder, not a second source of truth.
+    static let initialColumnWidth: CGFloat = 600
+
+    /// The reader's comfortable in-cell inset, and the FLOOR every cell's padding is held to (see the
+    /// per-cell `cellPadding` below): markdown declares none and gets exactly this; docx/odt declare
+    /// their own but never render below it, so a `fo:padding="0cm"` cell reads with room, not cramped.
+    static let defaultCellPadding: CGFloat = 7
+
     /// One already-styled cell, plus how many rows/columns its `NSTextTableBlock` covers.
     /// `rowSpan`/`columnSpan` default to 1, so a caller with no merges (every markdown table, and
     /// an office table before its parser learns `w:gridSpan`/`w:vMerge`) builds these without ever
@@ -139,72 +153,48 @@ enum TableBlockBuilder {
         // Reading order, so the laid-out cells follow the grid rather than the order they were found.
         placements.sort { ($0.row, $0.col) < ($1.row, $1.col) }
 
-        let textTable = NSTextTable()
-        textTable.numberOfColumns = ncol
-        textTable.setContentWidth(100, type: .percentageValueType)
-        let cellLH = (theme.baseFontSize * theme.codeLineHeightRatio).rounded()
-
+        // Build the custom-drawn table: ONE attachment carrying every placed cell. `NSTextTable` is
+        // NOT used — `TableAttachmentCell` computes the column x-edges, row heights and border grid
+        // itself, so a merged row's seam lands at the exact same x as a single-cell row's (rhwp's
+        // shared cumulative-edge model), and the document's own border colour is honoured verbatim.
+        let ratios: [CGFloat] = columnPercentages.isEmpty
+            ? Array(repeating: 1 / CGFloat(ncol), count: ncol)
+            : columnPercentages.map { $0 / 100 }
+        var gridCells: [TableGridCell] = []
+        gridCells.reserveCapacity(placements.count)
         for placement in placements {
             let header = placement.row < headerRows
-            let block = NSTextTableBlock(table: textTable, startingRow: placement.row, rowSpan: placement.rowSpan,
-                                         startingColumn: placement.col, columnSpan: placement.colSpan)
-            // An authored border/width/background on the ANCHOR cell wins over the table's own
-            // default, which in turn wins over the theme default — a covered position
-            // (`placement.cell == nil`, padding the grid) never has a cell OR table value to win
-            // with, so it always gets the plain theme look. (`tableBorderColor`/`tableBorderWidth`/
-            // `tableShading` are `nil` for every markdown table and any docx table with no
-            // `w:tblPr` default, so this chain collapses to exactly the old two-step lookup then.)
-            // Full chain, most to least specific: cell-direct > table-direct > table-STYLE
-            // (`styleBorderColor`/`styleShading` — P5) > theme default.
-            block.setBorderColor(placement.cell?.borderColor ?? tableBorderColor
-                                  ?? placement.cell?.styleBorderColor ?? Palette.tableBorder)
-            block.setWidth(placement.cell?.borderWidth ?? tableBorderWidth
-                            ?? placement.cell?.styleBorderWidth ?? 1, type: .absoluteValueType, for: .border)
-            block.setWidth(placement.cell?.padding ?? 7, type: .absoluteValueType, for: .padding)
-            if let bg = placement.cell?.backgroundColor {
-                block.backgroundColor = bg
-            } else if let tableShading {
-                block.backgroundColor = tableShading
-            } else if let styleBg = placement.cell?.styleShading {
-                block.backgroundColor = styleBg
-            } else if header {
-                block.backgroundColor = Palette.tableHeaderBg
-            }
-            // `nil` leaves AppKit's own already-`.top` default untouched — see
-            // `Cell.verticalAlignment`'s doc comment for why there's no table-level default to fall
-            // through to here (only a per-cell `w:vAlign` exists in the source spec).
-            switch placement.cell?.verticalAlignment {
-            case .top: block.verticalAlignment = .topAlignment
-            case .center: block.verticalAlignment = .middleAlignment
-            case .bottom: block.verticalAlignment = .bottomAlignment
-            case nil: break
-            }
-            if !columnPercentages.isEmpty {
-                // A spanned cell gets the SUM of every grid column it covers — that is what keeps
-                // a merged cell's width faithful to the columns underneath it (see
-                // `OfficeBlock.table`'s doc comment: `rows[row].count` is not the column count once
-                // a span is wider than 1, so this must sum `placement.colSpan` columns, not just
-                // read one). This REPLACES the absolute per-cell width below, not adds to it — a
-                // table can't be sized by both an absolute width and a percentage at once.
-                let coveredCols = min(placement.col + placement.colSpan, columnPercentages.count)
-                let pct = (placement.col..<max(placement.col, coveredCols))
-                    .reduce(CGFloat(0)) { $0 + columnPercentages[$1] }
-                block.setContentWidth(pct, type: .percentageValueType)
-            } else if let width = placement.cell?.width {
-                block.setContentWidth(width, type: .absoluteValueType)
-            }
-            let ps = NSMutableParagraphStyle()
-            ps.textBlocks = [block]
-            ps.minimumLineHeight = cellLH
-            ps.maximumLineHeight = cellLH
-            let content = NSMutableAttributedString()
-            if let cell = placement.cell { content.append(cell.content) }
-            let font = header ? NSFont.systemFont(ofSize: theme.baseFontSize, weight: .semibold) : theme.bodyFont
-            content.append(NSAttributedString(string: "\n", attributes: [.font: font]))
-            content.addAttribute(.paragraphStyle, value: ps,
-                                 range: NSRange(location: 0, length: content.length))
-            result.append(content)
+            // cell-direct > table-direct > table-STYLE (P5) > theme default — the same chain the old
+            // NSTextTable path resolved, now feeding the custom cell (a covered/padding position has
+            // no cell value, so it collapses to the theme default border and no shading).
+            let borderColor = placement.cell?.borderColor ?? tableBorderColor
+                ?? placement.cell?.styleBorderColor ?? Palette.tableBorder
+            let borderWidth = placement.cell?.borderWidth ?? tableBorderWidth
+                ?? placement.cell?.styleBorderWidth ?? 1
+            let background: NSColor?
+            if let bg = placement.cell?.backgroundColor { background = bg }
+            else if let tableShading { background = tableShading }
+            else if let styleBg = placement.cell?.styleShading { background = styleBg }
+            else if header { background = Palette.tableHeaderBg }
+            else { background = nil }
+            // Padding floored to the reader's comfortable default (a `fo:padding="0cm"` cell reads
+            // with room, not cramped) — applied by the geometry as the cell's inner inset, so the
+            // NSTextTable-era horizontal-padding-vs-indent dance is gone entirely.
+            let padding = max(placement.cell?.padding ?? Self.defaultCellPadding, Self.defaultCellPadding)
+            gridCells.append(TableGridCell(
+                content: placement.cell?.content ?? NSAttributedString(),
+                row: placement.row, col: placement.col,
+                rowSpan: placement.rowSpan, colSpan: placement.colSpan,
+                background: background, border: TableBorder(color: borderColor, width: borderWidth),
+                verticalAlignment: placement.cell?.verticalAlignment ?? .top, padding: padding))
         }
-        return result
+        let minRowHeight = (theme.baseFontSize * theme.codeLineHeightRatio).rounded() + 2 * Self.defaultCellPadding
+        let attachment = NSTextAttachment()
+        attachment.attachmentCell = TableAttachmentCell(
+            cells: gridCells, ncol: ncol, nrow: rows.count, columnRatios: ratios,
+            minRowHeight: minRowHeight, initialWidth: Self.initialColumnWidth)
+        let out = NSMutableAttributedString(attachment: attachment)
+        out.append(NSAttributedString(string: "\n"))
+        return out
     }
 }

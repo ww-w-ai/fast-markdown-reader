@@ -286,6 +286,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
         textView.textContainer?.containerSize = NSSize(width: column, height: CGFloat.greatestFiniteMagnitude)
         var f = textView.frame; f.size.width = clipWidth; textView.frame = f
         reanchorFillMarginTabs(toColumn: column)
+        resizeTableColumns(toColumn: column)
     }
 
     /// Office-only (markdown/plain never carry `MDAttr.fillMarginTab`): re-anchors a paragraph's
@@ -323,6 +324,28 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
             p.tabStops = OfficeTextBuilder.fillMarginTabStops(info, width: width)
             storage.addAttribute(.paragraphStyle, value: p.copy() as! NSParagraphStyle, range: range)
         }
+    }
+
+    /// Re-lays every custom-drawn table (`TableAttachmentCell`) to THIS reading column's width — same
+    /// run cadence as `reanchorFillMarginTabs` above (display, resize, sidebar toggle, always from
+    /// `updateTextInset`). A table is built at a placeholder width (`TableBlockBuilder.initialColumn
+    /// Width`); this recomputes its column x-edges and row heights for the real column, so it fills
+    /// and tracks the window. The cell owns its own size (like `SizedAttachmentCell`), so the size
+    /// change is a display concern only — never the undo manager or `applySourceEdit`, so a read-only
+    /// office document doesn't go dirty because its window was resized (office Viewers stay clean).
+    ///
+    /// Two passes: relayout every cell first, then invalidate their glyph layout so the layout
+    /// manager re-reads the new `cellSize()` and the document reflows around the new table heights —
+    /// invalidating while `enumerateAttribute` is still walking is what the split avoids.
+    private func resizeTableColumns(toColumn column: CGFloat) {
+        guard let storage = textView.textStorage, storage.length > 0 else { return }
+        // `sizeTableCellMedia` re-fits each table's cell-internal media to THIS column's cell widths
+        // (a cell image narrows with its cell as the window shrinks), then relayouts every table to
+        // the usable width (container minus `lineFragmentPadding` on each side — a table sized to the
+        // raw column would overflow by `2 * padding` and clip on the right) and invalidates their
+        // layout so the manager re-reads each `cellSize()`. It is the superset of the plain relayout
+        // this method used to do, and also covers a media-free table (nothing to size → just relayout).
+        (document as? MarkdownDocument)?.sizeTableCellMedia(in: self)
     }
 
     // MARK: - Table of contents (⌥⌘T)

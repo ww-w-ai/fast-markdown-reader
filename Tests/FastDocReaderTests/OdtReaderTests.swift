@@ -1337,6 +1337,92 @@ final class OdtReaderTests: XCTestCase {
         XCTAssertNotNil(cell.borderColor)
     }
 
+    /// ODF `style:vertical-align` (`middle` → `.center`) and `fo:padding` reach `Cell` — docx parity.
+    /// Before this, an odt cell rendered top-aligned with the default 7pt inset no matter what its
+    /// style declared, while the docx twin honoured both.
+    func testTableCellVerticalAlignAndPaddingApplyFromCellStyle() throws {
+        let blocks = try read(
+            body: """
+            <table:table><table:table-row>
+              <table:table-cell table:style-name="Mid"><text:p>A</text:p></table:table-cell>
+            </table:table-row></table:table>
+            """,
+            automaticStyles: """
+            <style:style style:name="Mid" style:family="table-cell">
+              <style:table-cell-properties style:vertical-align="middle" fo:padding="3pt"/>
+            </style:style>
+            """)
+        guard case .table(let rows, _, _, _) = blocks[0], let cell = rows.first?.first else { return XCTFail("expected a table cell") }
+        XCTAssertEqual(cell.verticalAlignment, .center)
+        XCTAssertEqual(cell.padding, 3)
+    }
+
+    /// ODF `style:contextual-spacing` (docx's `w:contextualSpacing`) reaches the paragraph's format,
+    /// so the builder can drop the space between adjacent same-style paragraphs. Absent → false.
+    func testParagraphContextualSpacingReadsFromStyle() throws {
+        let on = try read(
+            body: "<text:p text:style-name=\"CS\">A</text:p>",
+            automaticStyles: """
+            <style:style style:name="CS" style:family="paragraph">
+              <style:paragraph-properties style:contextual-spacing="true"/>
+            </style:style>
+            """)
+        guard case .paragraph(_, _, _, _, let f) = on[0] else { return XCTFail("expected a paragraph") }
+        XCTAssertTrue(f.contextualSpacing)
+
+        let off = try read(body: "<text:p>A</text:p>")
+        guard case .paragraph(_, _, _, _, let f2) = off[0] else { return XCTFail("expected a paragraph") }
+        XCTAssertFalse(f2.contextualSpacing)
+    }
+
+    /// A cell with no `table:style-name` inherits its column's `table:default-cell-style-name` —
+    /// ODF's own spelling of a table-wide default cell look. Before this, such a cell fell straight
+    /// to the theme default and ignored the column default the document declared.
+    func testTableCellInheritsColumnDefaultCellStyle() throws {
+        let blocks = try read(
+            body: """
+            <table:table>
+              <table:table-column table:default-cell-style-name="Bord"/>
+              <table:table-row>
+                <table:table-cell><text:p>A</text:p></table:table-cell>
+              </table:table-row>
+            </table:table>
+            """,
+            automaticStyles: """
+            <style:style style:name="Bord" style:family="table-cell">
+              <style:table-cell-properties fo:border="2pt solid #ff0000"/>
+            </style:style>
+            """)
+        guard case .table(let rows, _, _, _) = blocks[0], let cell = rows.first?.first else { return XCTFail("expected a table cell") }
+        XCTAssertEqual(cell.borderWidth, 2)
+        XCTAssertNotNil(cell.borderColor)
+    }
+
+    /// ODF `style:tab-stop`'s `style:type` (`right`) and leader (`style:leader-text="."`) reach
+    /// `TabStop` — docx parity, so a TOC entry's right-aligned page number and dotted leader are no
+    /// longer flattened to a plain left tab with no fill.
+    func testTabStopAlignmentAndLeaderApplyFromParagraphStyle() throws {
+        let blocks = try read(
+            body: """
+            <text:p text:style-name="TocEntry">Title\t3</text:p>
+            """,
+            automaticStyles: """
+            <style:style style:name="TocEntry" style:family="paragraph">
+              <style:paragraph-properties>
+                <style:tab-stops>
+                  <style:tab-stop style:position="288pt" style:type="right" style:leader-text="."/>
+                </style:tab-stops>
+              </style:paragraph-properties>
+            </style:style>
+            """)
+        guard case .paragraph(_, _, _, let tabs, _) = blocks[0], let tab = tabs.first else {
+            return XCTFail("expected a paragraph carrying a tab stop")
+        }
+        XCTAssertEqual(tab.alignment, .right)
+        XCTAssertEqual(tab.leader, .dot)
+        XCTAssertEqual(tab.position, 288)
+    }
+
     func testTableCellStyleInheritsBackgroundFromParent() throws {
         let blocks = try read(
             body: """

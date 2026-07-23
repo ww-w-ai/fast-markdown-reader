@@ -121,11 +121,21 @@ final class RenderThemeParityTests: XCTestCase {
     }
 
     func testMarkdownTableCellLineHeight() throws {
+        // A table now builds ONE custom-drawn `TableAttachmentCell`; the shared cell line-height token
+        // no longer stamps a paragraph style onto the cell content (it isn't in the top-level string
+        // at all) — it governs the geometry's MINIMUM ROW HEIGHT instead. round(16 * 1.4) == 22 is the
+        // same token TableBlockBuilder shares with office tables, plus its two vertical cell paddings.
         let s = markdownRender()
-        let ps = try paragraphStyle(s, containing: "Uno")
-        // round(16 * 1.4) == round(22.4) == 22 — same token TableBlockBuilder shares with office tables
-        XCTAssertEqual(ps.minimumLineHeight, 22, accuracy: 0.001)
-        XCTAssertEqual(ps.maximumLineHeight, 22, accuracy: 0.001)
+        var att: TableAttachmentCell?
+        s.enumerateAttribute(.attachment, in: NSRange(location: 0, length: s.length)) { value, _, _ in
+            if let a = value as? NSTextAttachment, let cell = a.attachmentCell as? TableAttachmentCell { att = cell }
+        }
+        let table = try XCTUnwrap(att)
+        // Sanity: the cell text really is "Uno"/"Dos" inside the attachment.
+        XCTAssertTrue(table.cells.contains { $0.content.string.contains("Uno") })
+        XCTAssertEqual(table.minRowHeight,
+                       (theme.baseFontSize * theme.codeLineHeightRatio).rounded() + 2 * TableBlockBuilder.defaultCellPadding,
+                       accuracy: 0.001)
     }
 
     // MARK: - Office (direct builder entry point — same shape as `OfficeTextBuilderTests`)

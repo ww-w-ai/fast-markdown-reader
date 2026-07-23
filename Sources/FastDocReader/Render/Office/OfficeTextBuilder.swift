@@ -426,7 +426,14 @@ enum OfficeTextBuilder {
         if rtl { p.baseWritingDirection = .rightToLeft }
         if let alignment { p.alignment = alignment }
         if !tabStops.isEmpty { p.tabStops = resolvedTabStops(tabStops, columnWidth: columnWidth) }
-        applyParagraphFormat(format, fontSizeScale: fontSizeScale, to: p)
+        // Body only: a `.multiple` line rule never renders below the readability floor (see
+        // `OfficeStyle.bodyMinLineHeightRatio`). Headings pass none — they are effectively single-line
+        // and carry their own comfortable `headingLineHeightRatio`.
+        let officeStyle = OfficeStyle(theme: theme)
+        applyParagraphFormat(format, fontSizeScale: fontSizeScale,
+                             minLineHeight: theme.baseFontSize * officeStyle.bodyMinLineHeightRatio,
+                             minParagraphSpacing: theme.baseFontSize * officeStyle.bodyMinParagraphSpacingRatio,
+                             to: p)
         return p.copy() as! NSParagraphStyle
     }
 
@@ -477,7 +484,13 @@ enum OfficeTextBuilder {
     /// column's own right edge — small enough the number still reads flush-right, not crowded
     /// against the very edge. Shared with `DocumentWindowController.updateTextInset`, which
     /// re-anchors this tab to the CURRENT column on every reflow (see `MDAttr.fillMarginTab`).
-    static let fillMarginTrailingInset: CGFloat = 6
+    // Must clear the text container's default lineFragmentPadding (5pt) plus the right-tab rounding
+    // slack, or a right-aligned tab placed a hair OUTSIDE the wrap boundary pushes its number onto a
+    // second line — the "number on an extra line" regression. The wrap threshold was MEASURED at ~9pt
+    // (8pt wraps, 10pt holds, `lineFragmentPadding` 5); 12pt sits comfortably above it while reading
+    // flush-right — the page number lands ~16pt in from the edge, not the 28pt a larger safety margin
+    // once cost. Larger is safe but visibly not flush; smaller risks the wrap.
+    static let fillMarginTrailingInset: CGFloat = 12
 
     /// The rightmost tab in `tabStops`, when it is right- or decimal-aligned, marks the paragraph
     /// as "fill to margin": a right tab exists to push text — a TOC page number, a right-aligned
@@ -547,14 +560,34 @@ enum OfficeTextBuilder {
     /// `lineHeightMultiple` is NOT scaled — `LineHeight.multiple` is already a unitless ratio
     /// (`w:lineRule="auto"`'s `line/240`), not a point value.
     private static func applyParagraphFormat(_ format: ParagraphFormat?, fontSizeScale: CGFloat,
+                                              minLineHeight: CGFloat = 0, minParagraphSpacing: CGFloat = 0,
                                               to p: NSMutableParagraphStyle) {
         guard let format else { return }
         if let before = format.spacingBefore { p.paragraphSpacingBefore = before * fontSizeScale }
-        if let after = format.spacingAfter { p.paragraphSpacing = after * fontSizeScale }
+        if let after = format.spacingAfter {
+            // A POSITIVE author gap never drops below the readability floor (see
+            // `OfficeStyle.bodyMinParagraphSpacingRatio`); an EXACTLY-zero gap (a deliberate
+            // "no space", incl. `contextualSpacing`'s zeroing) stays zero, the floor not applied.
+            let scaled = after * fontSizeScale
+            p.paragraphSpacing = scaled > 0 ? max(scaled, minParagraphSpacing) : scaled
+        }
         if let lineHeight = format.lineHeight {
             switch lineHeight {
             case .multiple(let ratio):
                 p.lineHeightMultiple = ratio
+                // Clear the caller's token min/max the SAME way `.atLeast` does below: the token
+                // default set `minimumLineHeight == maximumLineHeight == lh` (a FIXED line height),
+                // and a live `maximumLineHeight` cap clamps `naturalHeight * ratio` back down to
+                // `lh` — silently squeezing a document that asked for e.g. `w:line="260"` (1.083×)
+                // into the app's own tighter fixed rhythm. That was the "줄간격이 너무 타이트" bug:
+                // the multiple was set but never allowed to take effect. A multiple is a ratio of the
+                // line's own natural height, so it governs upward freely — the maximum is cleared so
+                // a document that asks for MORE than the floor gets exactly that. The minimum is the
+                // readability FLOOR (`OfficeStyle.bodyMinLineHeightRatio`, 0 for callers that pass
+                // none): a near-single rule measured against the substituted body font renders far
+                // tighter than the same reader's markdown body, so office body never drops below it.
+                p.minimumLineHeight = minLineHeight
+                p.maximumLineHeight = 0
             case .exact(let pt):
                 let v = pt * fontSizeScale
                 p.minimumLineHeight = v
@@ -755,13 +788,24 @@ enum OfficeTextBuilder {
             // shared builder (out of this sprint's file scope). A cell's RUN-level styling
             // (`Span.rtl`, `Span.textColor`, …) still applies, unaffected — it's carried entirely
             // inside `spansAttributedString`.
-            case let .heading(level, spans, _, _, _, _):
-                result.append(spansAttributedString(spans, baseFont: theme.headingFont(level: level),
-                                                     baseColor: theme.textColor, theme: theme,
-                                                     fontSizeScale: fontSizeScale))
-            case let .paragraph(spans, _, _, _, _):
-                result.append(spansAttributedString(spans, baseFont: baseFont, baseColor: theme.textColor,
-                                                     theme: theme, fontSizeScale: fontSizeScale))
+            case let .heading(level, spans, rtl, alignment, tabStops, format):
+                let str = NSMutableAttributedString(attributedString:
+                    spansAttributedString(spans, baseFont: theme.headingFont(level: level),
+                                          baseColor: theme.textColor, theme: theme, fontSizeScale: fontSizeScale))
+                str.addAttribute(.paragraphStyle,
+                    value: headingParagraphStyle(level: level, theme: theme, rtl: rtl, alignment: alignment,
+                                                 tabStops: tabStops, format: format, fontSizeScale: fontSizeScale),
+                    range: NSRange(location: 0, length: str.length))
+                result.append(str)
+            case let .paragraph(spans, rtl, alignment, tabStops, format):
+                let str = NSMutableAttributedString(attributedString:
+                    spansAttributedString(spans, baseFont: baseFont, baseColor: theme.textColor,
+                                          theme: theme, fontSizeScale: fontSizeScale))
+                str.addAttribute(.paragraphStyle,
+                    value: bodyParagraphStyle(theme: theme, rtl: rtl, alignment: alignment,
+                                              tabStops: tabStops, format: format, fontSizeScale: fontSizeScale),
+                    range: NSRange(location: 0, length: str.length))
+                result.append(str)
             case let .listItem(level, ordered, spans, marker, _, _, _, _):
                 // Cell-local numbering state — a list embedded in one cell doesn't continue a
                 // count begun in a sibling cell or at top level.
@@ -792,6 +836,26 @@ enum OfficeTextBuilder {
             if index < blocks.count - 1 {
                 result.append(NSAttributedString(string: "\n", attributes: [.font: baseFont]))
             }
+        }
+        // A block's paragraph style was applied to its spans but NOT to the "\n" separators appended
+        // between blocks — and TextKit reads a paragraph's spacing/line-height from its TERMINATOR.
+        // Unify each paragraph's style across its terminating newline (using the style at its start),
+        // then TRIM the cell's own edges: the first paragraph's leading gap and the last paragraph's
+        // trailing gap would pad the cell's inner top/bottom (a single-paragraph data cell would grow
+        // by a whole paragraph gap) — that breathing is the cell's own vertical padding's job.
+        let ns = result.string as NSString
+        var paragraphs: [NSRange] = []
+        ns.enumerateSubstrings(in: NSRange(location: 0, length: result.length), options: .byParagraphs) {
+            _, _, enclosing, _ in
+            if enclosing.length > 0 { paragraphs.append(enclosing) }
+        }
+        for (i, range) in paragraphs.enumerated() {
+            guard let base = result.attribute(.paragraphStyle, at: range.location,
+                                              effectiveRange: nil) as? NSParagraphStyle else { continue }
+            let m = base.mutableCopy() as! NSMutableParagraphStyle
+            if i == 0 { m.paragraphSpacingBefore = 0 }
+            if i == paragraphs.count - 1 { m.paragraphSpacing = 0 }
+            result.addAttribute(.paragraphStyle, value: m.copy() as! NSParagraphStyle, range: range)
         }
         return result
     }
