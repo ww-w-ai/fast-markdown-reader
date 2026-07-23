@@ -53,6 +53,7 @@ them in.
 | Editing long docs | Only the edited block is re-rendered — **9 ms on 64k characters, 29 ms on 1.2 MB** |
 | Plain text | `.txt` · `.csv` · `.log` shown **verbatim**, one block per line — nothing reinterpreted as Markdown |
 | Word / OpenDocument | `.docx`/`.docm`/`.dotx`/`.dotm`/`.odt` — **read-only**, formatting, tables, equations, charts and RTL text shown as authored |
+| Extract for an AI | `--extract` turns a `.docx`/`.odt` into **clean Markdown on stdout** — headless, so an AI reads it without spending tokens parsing the zip |
 | Encodings | CP949 · UTF-16 · Latin-1 detected, not assumed — **saved back in the same encoding**, CRLF kept |
 | Diagrams | **mermaid bundled** — renders offline, cached as vector PDF, never re-rendered |
 | Math | **KaTeX bundled** — `$$…$$` and ```` ```math ```` render offline, vector, cached the same way |
@@ -60,6 +61,24 @@ them in.
 | Code | **34 languages** highlighted natively — one-pass scanner, no JS, per-block **Copy** and **Wrap** |
 | Editing | Reader first — **E** edit · **I** add below · **U/J** move · **D** delete, saved on ⌘S |
 | Navigation | **T** opens a table of contents built from the document's own headings — click to jump |
+
+## Hand a Word file to an AI, as clean Markdown
+
+Point an AI at a `.docx` or `.odt` and it burns tokens unzipping and parsing the XML itself. Run the
+same engine headless instead — no window, no Dock icon — and it prints clean Markdown to stdout:
+
+```sh
+FastDocReader.app/Contents/MacOS/FastDocReader --extract report.docx
+```
+
+Because it reuses the reader's **own** office parser, the Markdown mirrors what you'd see on screen:
+headings, lists with the document's real numbering, bold/italic/strikethrough/links, simple tables as
+pipe tables, standalone formulas as `$$…$$`, images and charts as honest placeholders. Mapping stays
+conservative on purpose — anything a Markdown table can't hold safely (merged cells, block content in
+a cell) is dumped as literal text inside a `<raw>…</raw>` marker rather than a fabricated grid that
+would read as correct, and a one-line note at the top explains the marker. It reads the Word family
+(`.docx` `.docm` `.dotx` `.dotm`) and `.odt` (converted), plus `.md`/`.txt` verbatim, and exits
+non-zero on anything it can't read so a script can trust the output.
 
 ## Diagrams render offline, once
 
