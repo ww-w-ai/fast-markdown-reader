@@ -90,8 +90,7 @@ type (`yml`, `golang`, `c++`, `c#`, `sh`, `postgres`, `tsx`, `patch`…):
 The highlighter is a single left-to-right scanner, not a stack of regexes painting over each other
 ([`CodeHighlighter.swift`](Sources/FastMDReader/Render/CodeHighlighter.swift)). That's what keeps a
 URL's `//` inside a string from turning the rest of the line into a comment — the bug you've seen in
-every editor that gets it wrong. Tables, task lists, footnotes and strikethrough come from
-CommonMark + GFM.
+every editor that gets it wrong. Tables, task lists and strikethrough come from CommonMark + GFM.
 
 ## Try it on real documents
 

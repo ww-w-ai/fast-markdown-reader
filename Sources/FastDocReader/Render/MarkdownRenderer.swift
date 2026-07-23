@@ -325,6 +325,14 @@ private struct AttributedBuilder: MarkupWalker {
         case is SoftBreak:
             // Soft break (a plain source newline) → a space, so the paragraph reflows.
             return NSAttributedString(string: " ", attributes: [.font: font, .foregroundColor: color])
+        case let st as Strikethrough:
+            // GFM `~~text~~`. Render the inner span first (so nested bold/italic/code/links keep
+            // their own styling), then lay a single strikethrough line over the whole run. Without
+            // this case it fell through to `default` and shipped as unstruck text (invariant 30/34).
+            let m = NSMutableAttributedString(attributedString: inlineString(st, font: font, color: color))
+            m.addAttribute(.strikethroughStyle, value: NSUnderlineStyle.single.rawValue,
+                           range: NSRange(location: 0, length: m.length))
+            return m
         default:
             return inlineString(markup, font: font, color: color)
         }
@@ -520,7 +528,15 @@ private struct AttributedBuilder: MarkupWalker {
         var i = 1
         for item in items {
             let s = result.length
-            let marker = ordered ? "\(i).\t" : bullet(depth) + "\t"
+            // A GFM task-list item (`- [ ]` / `- [x]`) carries a `checkbox`; show it as a box glyph
+            // in place of the bullet/number, so the checked state is visible. swift-markdown consumes
+            // the `[ ]`/`[x]` into `item.checkbox`, so without this the ticks vanished entirely.
+            let marker: String
+            if let box = item.checkbox {
+                marker = (box == .checked ? "☑" : "☐") + "\t"
+            } else {
+                marker = ordered ? "\(i).\t" : bullet(depth) + "\t"
+            }
             result.append(NSAttributedString(string: marker,
                 attributes: [.font: theme.bodyFont, .foregroundColor: theme.textColor]))
             // The item's own paragraph text (skip nested lists — handled after, at depth+1).
