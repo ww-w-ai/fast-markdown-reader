@@ -22,7 +22,7 @@ enum HeadlessExtract {
         let ext = url.pathExtension.lowercased()
 
         guard DocumentTypes.opensInApp(ext) else {
-            err("unsupported file type \".\(ext)\": Fast Doc Reader reads .docx/.docm/.dotx/.dotm, " +
+            err("unsupported file type \".\(ext)\": Fast Document Reader reads .docx/.docm/.dotx/.dotm, " +
                 ".odt, and plain text/Markdown. Legacy binary .doc and .rtf are not supported.")
             return 1
         }
@@ -56,7 +56,7 @@ enum HeadlessExtract {
     /// agent reading the raw text) — the "note at the front" the owner asked for. The `<raw>` line is
     /// added only when the body actually used the marker.
     private static func header(for filename: String, body: String) -> String {
-        var note = "<!-- Extracted from \(filename) by Fast Doc Reader. Best-effort Markdown. -->\n"
+        var note = "<!-- Extracted from \(filename) by Fast Document Reader. Best-effort Markdown. -->\n"
         if body.contains(OfficeMarkdownSerializer.rawOpen) {
             note += "<!-- \(OfficeMarkdownSerializer.rawOpen)…\(OfficeMarkdownSerializer.rawClose)" +
                     " marks content whose original structure (e.g. merged-cell tables) could not be " +
