@@ -178,18 +178,21 @@ sandboxed shape locally.
 
 ## Keyboard and mouse
 
-The reading cursor moves in whole units — line, sentence, paragraph, heading — and the modifier's
-position sets the jump size: farther left is bigger (**fn › ⌥ › ⌘**). Hold **⇧** and the same move
-becomes a selection, so ⌘C grabs exactly what you just crossed.
+The reading cursor moves in whole units — line, sentence, paragraph and heading. Down the page
+**fn** steps the coarse `#` outline (top-level headings only) and **⌘** steps every heading, **⌥**
+pages, and **fn⌘** jumps to the very top or bottom; across a line **⌘** is the whole line, **⌥** a
+sentence, **fn** a paragraph. Hold **⇧** and the same move becomes a selection, so ⌘C grabs exactly
+what you just crossed.
 
 | Key | Moves the cursor to… |
 |---|---|
 | **⌘← / ⌘→** | Start / end of the line |
 | **⌥← / ⌥→** | Previous / next sentence |
 | **fn← / fn→** | Previous / next paragraph (a heading, list, code block or table is one stop) |
-| **⌘↑ / ⌘↓** | Previous / next heading |
+| **fn↑ / fn↓** | Previous / next top-level `#` heading (the document's coarse outline) |
+| **⌘↑ / ⌘↓** | Previous / next heading (any level) |
 | **⌥↑ / ⌥↓** | Page up / down (a few lines overlap so you keep your place) |
-| **fn↑ / fn↓** | Start / end of the document |
+| **fn⌘↑ / fn⌘↓** | Start / end of the document |
 | **⇧ + any of the above** | The same move, selecting everything it crosses |
 | **Space / ⇧Space** | Page down / up |
 | **⌘F** | Find in document |
@@ -207,9 +210,10 @@ Mouse:
 The page holds still and the cursor moves inside it — the view scrolls only when the cursor would
 leave the screen, and then by the least it can.
 
-**Fix a typo without leaving:** right-click a block → **Edit** opens just that block's Markdown
-source; **⌘↵** writes it back to the file, **esc** discards. That is the only action that ever
-writes to your document.
+**Fix a typo without leaving:** right-click a block → **Edit** (or press **E**) opens just that
+block's Markdown source; select across several blocks first and they open **merged as one**. **⌘↵**
+writes it back to the file, **esc** discards. That is the only action that ever writes to your
+document.
 
 ## License
 
