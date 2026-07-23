@@ -107,11 +107,12 @@ final class ReaderTextView: NSTextView {
 
     // Keep Space / ⇧Space page scrolling (a plain text view lacks it); all caret movement and
     // selection is native.
-    // Directional reading navigation. The modifier's position on the keyboard sets the JUMP SIZE —
-    // farther left = bigger jump — and it reads the same on both axes:
-    //   down the document:  fn (whole document) › ⌥ (page)      › ⌘ (heading)
-    //   across the line:    fn (paragraph)      › ⌥ (sentence)  › ⌘ (line)
-    // Shift keeps the movement identical and selects what it crosses.
+    // Directional reading navigation, grouped by axis:
+    //   down the document:  fn+⌘ (start / end) › fn (top-level `#` heading) › ⌘ (any heading) › ⌥ (page)
+    //   across the line:    fn (paragraph)     › ⌥ (sentence)               › ⌘ (line)
+    // Vertically fn steps the COARSE outline (only the document's shallowest heading rank) and ⌘
+    // steps EVERY heading, so a long document has both a coarse and a fine outline key; fn+⌘ jumps
+    // to the very top / bottom. Shift keeps the movement identical and selects what it crosses.
     // (⌃↑/↓ is deliberately NOT used — it collides with macOS Mission Control / App Exposé.)
     // Arrow keys always carry .function, so we compare against only the "real" modifiers.
     override func keyDown(with event: NSEvent) {
@@ -120,23 +121,27 @@ final class ReaderTextView: NSTextView {
             (window?.windowController as? DocumentWindowController)?.showShortcutGuide(nil)
             return
         }
-        // Single-letter block actions on the block under the READING CURSOR. Plain letters are free
-        // here because the view accepts no typing (`shouldChangeTextIn` rejects everything), which
-        // is the same reason "?" opens the guide — and it keeps the common edits one key away
-        // instead of a right-click and a menu.
+        // Single-letter block actions on the block under the READING CURSOR, matched by PHYSICAL KEY
+        // POSITION (keyCode), not by the character produced. Under a non-Latin input source (Korean,
+        // Japanese, …) the `e` key yields `ㄷ`, so matching `charactersIgnoringModifiers` silently
+        // broke every bare-letter shortcut; the keyCode is layout-independent, so the same key at
+        // the same spot works in any input language. (⌘-modified equivalents already fall back to
+        // the Latin layout, so only these bare keys needed it.) Plain letters are free here because
+        // the view accepts no typing (`shouldChangeTextIn` rejects everything) — the same reason "?"
+        // opens the guide — and it keeps the common edits one key away instead of a menu.
+        // keyCodes: e=14 · i=34 · d=2 · u=32 · j=38 · t=17 (kVK_ANSI_*, position-based).
         if event.modifierFlags.intersection([.command, .option, .control]).isEmpty,
-           let wc = window?.windowController as? DocumentWindowController,
-           let key = event.charactersIgnoringModifiers?.lowercased(), key.count == 1 {
+           let wc = window?.windowController as? DocumentWindowController {
             let caret = selectedRange().location
-            switch key {
+            switch event.keyCode {
             // No editable source on an office document — see `isOfficeDocument`. The context-menu
             // gate alone would be cosmetic: these bare keys reach the same actions without it.
-            case "e" where !isOfficeDocument: wc.editSelectedSource(atChar: caret); return
-            case "i" where !isOfficeDocument: wc.addBlockBelow(atChar: caret); return
-            case "d" where !isOfficeDocument: wc.deleteBlock(atChar: caret); return
-            case "u" where !isOfficeDocument: wc.moveBlockUnderCaret(by: -1); return
-            case "j" where !isOfficeDocument: wc.moveBlockUnderCaret(by: 1); return
-            case "t": wc.toggleTableOfContents(nil); return
+            case 14 where !isOfficeDocument: wc.editSelectedSource(atChar: caret); return   // e
+            case 34 where !isOfficeDocument: wc.addBlockBelow(atChar: caret); return        // i
+            case 2  where !isOfficeDocument: wc.deleteBlock(atChar: caret); return          // d
+            case 32 where !isOfficeDocument: wc.moveBlockUnderCaret(by: -1); return         // u
+            case 38 where !isOfficeDocument: wc.moveBlockUnderCaret(by: 1); return          // j
+            case 17: wc.toggleTableOfContents(nil); return                                 // t
             default: break
             }
         }
@@ -162,12 +167,17 @@ final class ReaderTextView: NSTextView {
         case (115, _):  applyNav(to: prevBlock(behind), down: false, extend: extend)   // fn← (Home)  paragraph
         case (119, _):  applyNav(to: nextBlock(ahead), down: true, extend: extend)     // fn→ (End)   paragraph
         // Down the document.
-        case (126, [.command]):   headingNav(down: false, extend: extend)             // ⌘↑  heading
+        case (126, [.command]):   headingNav(down: false, extend: extend)             // ⌘↑  any heading
         case (125, [.command]):   headingNav(down: true, extend: extend)              // ⌘↓
         case (126, [.option]):    page(down: false, extend: extend)                   // ⌥↑  page (⇧ selects)
         case (125, [.option]):    page(down: true, extend: extend)                    // ⌥↓  page
-        case (116, _):            applyNav(to: 0, down: false, extend: extend)        // fn↑ doc start
-        case (121, _):            applyNav(to: length, down: true, extend: extend)    // fn↓ doc end
+        // fn+arrow arrives as PageUp / PageDown (116 / 121). fn+⌘ keeps that keyCode and adds
+        // .command → document start / end; bare fn steps the top-level (`#`) headings. The
+        // `[.command]` cases MUST precede the catch-all `_` ones so fn+⌘ isn't swallowed by fn.
+        case (116, [.command]):   applyNav(to: 0, down: false, extend: extend)        // fn+⌘↑ doc start
+        case (121, [.command]):   applyNav(to: length, down: true, extend: extend)    // fn+⌘↓ doc end
+        case (116, _):            topHeadingNav(down: false, extend: extend)          // fn↑  top-level heading
+        case (121, _):            topHeadingNav(down: true, extend: extend)           // fn↓
         default:                  super.keyDown(with: event)
         }
     }
@@ -209,6 +219,24 @@ final class ReaderTextView: NSTextView {
         let sel = selectedRange()
         let from = down ? sel.location + sel.length : sel.location
         let offsets = headingOffsets
+        let target = down ? (offsets.first { $0 > from } ?? length)
+                          : (offsets.last { $0 < from } ?? 0)
+        applyNav(to: target, down: down, extend: extend)
+    }
+
+    /// Navigate between TOP-LEVEL headings only — the SHALLOWEST heading rank present in the
+    /// document (its `#` level, or `##` if it has no `#`), so fn↑↓ steps the coarse `#` outline
+    /// while ⌘↑↓ (`headingNav`) steps every heading. Reading the shallowest rank rather than a
+    /// literal level 1 keeps the key useful in a document whose top heading is `##`; a document
+    /// with no headings at all falls back to the document extremes so the key still does something.
+    private func topHeadingNav(down: Bool, extend: Bool) {
+        recomputeHeadingOffsets()   // offsets move as diagrams and formulas land; never cache them
+        guard let top = headingRuns.map(\.level).min() else {
+            applyNav(to: down ? length : 0, down: down, extend: extend); return
+        }
+        let offsets = headingRuns.filter { $0.level == top }.map(\.offset)
+        let sel = selectedRange()
+        let from = down ? sel.location + sel.length : sel.location
         let target = down ? (offsets.first { $0 > from } ?? length)
                           : (offsets.last { $0 < from } ?? 0)
         applyNav(to: target, down: down, extend: extend)
