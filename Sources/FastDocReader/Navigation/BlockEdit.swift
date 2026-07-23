@@ -28,11 +28,20 @@ enum BlockEdit {
     }
 
     /// The index of the block containing (or, failing that, nearest above) a source offset.
+    ///
+    /// `spans` is ascending by location and non-overlapping (see `spans` above), so the block that
+    /// contains `offset` — or, when `offset` falls in the gap between two blocks, the one starting at
+    /// or before it — is simply the LAST span whose `location <= offset`. Binary-search it. The old
+    /// linear scan was called once per selected block by `blockRunToDelete`, making a Select-All then
+    /// Delete O(blocks²); this makes it O(blocks · log blocks).
     static func indexOfBlock(containing offset: Int, in spans: [NSRange]) -> Int? {
-        for (i, s) in spans.enumerated() where offset >= s.location && offset <= s.location + s.length {
-            return i
+        var lo = 0, hi = spans.count - 1, cand = -1
+        while lo <= hi {
+            let mid = (lo + hi) / 2
+            if spans[mid].location <= offset { cand = mid; lo = mid + 1 }
+            else { hi = mid - 1 }
         }
-        return spans.lastIndex { $0.location <= offset }
+        return cand >= 0 ? cand : nil
     }
 
     /// The separator to reuse when inserting next to block `i` — literally the gap that already

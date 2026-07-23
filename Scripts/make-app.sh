@@ -19,6 +19,19 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/FastDocReader"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
 
+# Stamp the exact build into the bundle so the About panel can tell an installed build apart from any
+# rebuild — the marketing version (1.0) and build number (5) are identical across every build, which is
+# why "is this the build I just made?" was unanswerable. `FMDBuildInfo` = git short hash + a -dirty flag
+# for uncommitted changes + the build date; `AppDelegate.showAboutPanel` shows it in the version line.
+# Runs for BOTH tracks (dev and distribution) — CFBundleVersion stays numeric for the App Store; this is
+# a separate, non-numeric key, so it's safe on the release too.
+GIT_HASH="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+git diff --quiet 2>/dev/null && git diff --cached --quiet 2>/dev/null || GIT_HASH="${GIT_HASH}-dirty"
+BUILD_INFO="${GIT_HASH} · $(date -u '+%Y-%m-%d')"
+/usr/libexec/PlistBuddy -c "Add :FMDBuildInfo string ${BUILD_INFO}" "$APP/Contents/Info.plist" 2>/dev/null \
+  || /usr/libexec/PlistBuddy -c "Set :FMDBuildInfo ${BUILD_INFO}" "$APP/Contents/Info.plist"
+echo "    build:      ${BUILD_INFO}"
+
 # A local build gets its OWN bundle identifier, so it cannot touch the installed app's state.
 #
 # macOS keys per-app state — the recent-documents list above all — to the bundle identifier. A build

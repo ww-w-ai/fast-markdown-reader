@@ -1,5 +1,51 @@
 import AppKit
 
+/// ONE reused TextKit stack for measuring AND drawing table-cell content, shared by every cell of
+/// every table. Both operations went through `NSAttributedString.boundingRect`/`.draw`, each of which
+/// spins up and throws away a fresh layout per call and measured ~O(n²) in character count on rich
+/// CJK cell content (a 1000-char cell: 53ms; its first 100 chars: 0.8ms). Reusing one NSLayoutManager
+/// — set the string, lay out ONCE, read `usedRect` or `drawGlyphs` — is O(n) and 11× faster on that
+/// same cell, which is what makes a big-table document reflow and repaint in tens of ms instead of
+/// hundreds. Main-thread only: TextKit is not thread-safe, and every cell measure/draw already runs on
+/// the main thread (reflow + view drawing). The stack holds one cell's content at a time; callers use
+/// the result immediately, so there is no aliasing across cells.
+enum CellText {
+    private static let storage = NSTextStorage()
+    private static let layout = NSLayoutManager()
+    private static let container = NSTextContainer(size: NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude))
+    private static let setup: Void = {
+        container.lineFragmentPadding = 0
+        layout.usesFontLeading = true
+        layout.addTextContainer(container)
+        storage.addLayoutManager(layout)
+    }()
+
+    /// Load one cell's content at a given inner width and lay it out once. Returns the laid-out glyph
+    /// range so a caller can draw it without re-laying-out.
+    @discardableResult
+    private static func loadLaidOut(_ s: NSAttributedString, width: CGFloat) -> NSRange {
+        _ = setup
+        container.size = NSSize(width: max(1, width), height: CGFloat.greatestFiniteMagnitude)
+        storage.setAttributedString(s)
+        layout.ensureLayout(for: container)
+        return layout.glyphRange(for: container)
+    }
+
+    /// Content height at a known inner width — the row-height input the table geometry needs.
+    static func height(_ s: NSAttributedString, width: CGFloat) -> CGFloat {
+        loadLaidOut(s, width: width)
+        return ceil(layout.usedRect(for: container).height)
+    }
+
+    /// Draw one cell's content at `origin` (top-left, in the current — flipped — context), reusing the
+    /// same O(n) layout the measurement used instead of `NSAttributedString.draw`'s per-call layout.
+    static func draw(_ s: NSAttributedString, at origin: NSPoint, width: CGFloat) {
+        let gr = loadLaidOut(s, width: width)
+        layout.drawBackground(forGlyphRange: gr, at: origin)
+        layout.drawGlyphs(forGlyphRange: gr, at: origin)
+    }
+}
+
 /// One resolved border edge — colour + width. `nil` in an edge grid slot means "no line here".
 struct TableBorder: Equatable {
     var color: NSColor
@@ -117,6 +163,14 @@ final class TableAttachmentCell: NSTextAttachmentCell {
     let minRowHeight: CGFloat
     private(set) var width: CGFloat = 0
     private var geometry: TableGeometry
+    /// The width the current `geometry` was solved at. `relayout` at this same width is a no-op —
+    /// re-solving re-measures every cell's whole content (hundreds of ms on a big-table document) for
+    /// an identical answer. Reset to force a re-solve only when a cell's media size actually changed.
+    private var solvedWidth: CGFloat = -1
+    /// The grid rendered ONCE to an image at the current geometry, blitted on every redraw instead of
+    /// re-laying-out each cell's content per frame (what made big-table docs crawl on scroll). Dropped
+    /// whenever geometry changes (`relayout`).
+    private var renderCache: NSImage?
 
     init(cells: [TableGridCell], ncol: Int, nrow: Int, columnRatios: [CGFloat],
          minRowHeight: CGFloat, initialWidth: CGFloat) {
@@ -128,23 +182,40 @@ final class TableAttachmentCell: NSTextAttachmentCell {
         self.geometry = TableGeometry(columnEdges: [0], rowEdges: [0], contentHeights: [],
                                       hEdges: [[]], vEdges: [[]])
         super.init()
-        relayout(width: initialWidth)
+        // A CHEAP placeholder geometry: real column edges + borders, but rows at `minRowHeight` with
+        // NO content measured (measure returns 0). `cellSize()` is sane before the first real relayout,
+        // yet the expensive per-cell layout is not paid here — it would be thrown away, because
+        // `presizeKnownMedia` always re-solves at the true column width right after (measured: the
+        // placeholder-width solve and the real-width solve were TWO full measurements per open). Leave
+        // `solvedWidth` unset so that first real relayout actually measures.
+        geometry = TableGeometry.solve(cells: cells, ncol: self.ncol, nrow: self.nrow,
+                                       columnRatios: columnRatios, width: initialWidth,
+                                       minRowHeight: minRowHeight, measure: { _, _ in 0 })
     }
     required init(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    /// A cell's content height at a known inner width. `boundingRect` on the string alone is exactly
-    /// the measurement we want — the cell's own content, no table geometry involved.
+    /// A cell's content height at a known inner width, via the shared reused TextKit stack.
+    /// `NSAttributedString.boundingRect` measured ~O(n²) in character count on rich CJK cell content
+    /// (a 1000-char legal paragraph: 53ms, vs 0.8ms for its first 100 chars — a 10× length for a 67×
+    /// time), because it builds and tears down a throwaway layout every call. One reused NSLayoutManager
+    /// laid out once is O(n): the SAME cell measured 4.6ms (11×), turning a 13-table document's reflow
+    /// from ~750ms to ~60ms. See `CellText`.
     private func measuredHeight(_ cell: TableGridCell, innerWidth: CGFloat) -> CGFloat {
-        ceil(cell.content.boundingRect(
-            with: NSSize(width: max(1, innerWidth), height: .greatestFiniteMagnitude),
-            options: [.usesLineFragmentOrigin, .usesFontLeading]).height)
+        CellText.height(cell.content, width: innerWidth)
     }
 
     /// Recompute geometry for a new reading-column width. Called on first layout and every reflow
     /// (resize / sidebar toggle), the same cadence the old `resizeTableColumns` ran on.
-    func relayout(width: CGFloat) {
+    func relayout(width: CGFloat, force: Bool = false) {
         guard width > 0 else { return }
+        // Already solved at this width → reuse it. The per-cell content measurement `solve` does is
+        // the whole cost here, and it depends only on the width, so re-solving the same width is pure
+        // waste (measured: a redundant relayout cost as much as the first). `force` is for the one
+        // caller that changes an input other than width — a cell's media size settling after load.
+        if !force && width == solvedWidth { return }
         self.width = width
+        solvedWidth = width
+        renderCache = nil                          // geometry is moving → the cached render is stale
         geometry = TableGeometry.solve(
             cells: cells, ncol: ncol, nrow: nrow, columnRatios: columnRatios,
             width: width, minRowHeight: minRowHeight,
@@ -174,6 +245,12 @@ final class TableAttachmentCell: NSTextAttachmentCell {
         return max(1, geometry.columnEdges[ec] - geometry.columnEdges[cell.col] - 2 * cell.padding)
     }
 
+    /// Drop the cached grid image so the next `draw` re-renders it. Called when a cell's media pixels
+    /// change (loaded or purged by `reconcileMedia`) — the cache was rendered BEFORE those pixels
+    /// existed, so without this the loaded image/diagram inside a cell would never appear (the blit
+    /// keeps showing the pixel-less render). Paint-only: it touches no size/geometry (invariant 1).
+    func invalidateRenderCache() { renderCache = nil }
+
     override func cellSize() -> NSSize { geometry.size }
     override func cellBaselineOffset() -> NSPoint { .zero }
     override func cellFrame(for textContainer: NSTextContainer, proposedLineFragment lineFrag: NSRect,
@@ -182,9 +259,62 @@ final class TableAttachmentCell: NSTextAttachmentCell {
     }
 
     override func draw(withFrame cellFrame: NSRect, in controlView: NSView?) {
+        // Re-laying out every cell's whole content on each redraw is what made big-table documents
+        // crawl — ~750ms per redraw for a doc of 13 large cells, paid again on every scroll frame.
+        // Render the grid ONCE into an image at the current geometry and blit that thereafter;
+        // `relayout` drops the cache when the geometry moves. Falls back to live drawing if the
+        // offscreen bitmap can't be made (e.g. a degenerate size).
+        let scale = controlView?.window?.backingScaleFactor ?? 2
+        if renderCache == nil { renderCache = renderGridImage(scale: scale) }
+        if let img = renderCache {
+            img.draw(in: cellFrame, from: .zero, operation: .sourceOver, fraction: 1,
+                     respectFlipped: true, hints: nil)
+        } else {
+            drawGrid(ox: cellFrame.minX, oy: cellFrame.minY, scale: scale)
+        }
+    }
+
+    /// Render the whole grid once into an offscreen bitmap at `geometry.size`. Two things must BOTH
+    /// hold, and the first was the bug: the drawing context must be y-DOWN (top-left origin, what
+    /// `drawGrid` expects) AND must REPORT `isFlipped == true`. The rectangles (backgrounds, borders)
+    /// only need the y-down CTM; but the cell CONTENT is drawn with
+    /// `NSAttributedString.draw(…usesLineFragmentOrigin)`, which orients glyphs by the context's own
+    /// `isFlipped` — so a y-down CTM over an `isFlipped == false` context (the previous version) drew
+    /// the boxes right and the TEXT upside-down. The rects-only orientation test never saw it.
+    /// `NSGraphicsContext(cgContext:flipped:)` lets us claim the flip WITHOUT lock-focus, which crashes
+    /// headless (no window server) — so this stays unit-testable while matching the live flipped view.
+    /// `respectFlipped: true` at blit time then places the upright raster correctly. `scale` draws in
+    /// points and snaps border seams to the device grid.
+    func renderGridImage(scale: CGFloat) -> NSImage? {
+        let size = geometry.size
+        guard size.width >= 1, size.height >= 1,
+              let rep = NSBitmapImageRep(
+                bitmapDataPlanes: nil, pixelsWide: Int(ceil(size.width * scale)),
+                pixelsHigh: Int(ceil(size.height * scale)), bitsPerSample: 8, samplesPerPixel: 4,
+                hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB,
+                bytesPerRow: 0, bitsPerPixel: 0),
+              let base = NSGraphicsContext(bitmapImageRep: rep) else { return nil }
+        rep.size = size
+        let cg = base.cgContext
+        cg.scaleBy(x: scale, y: scale)                                 // draw in points
+        cg.translateBy(x: 0, y: size.height); cg.scaleBy(x: 1, y: -1)  // top-left origin, y-down
+        // Wrap the SAME transformed CGContext in one that reports flipped, so text lays out upright.
+        let flipped = NSGraphicsContext(cgContext: cg, flipped: true)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = flipped
+        drawGrid(ox: 0, oy: 0, scale: scale)
+        NSGraphicsContext.restoreGraphicsState()
+        let img = NSImage(size: size)
+        img.addRepresentation(rep)
+        return img
+    }
+
+    /// The grid drawing itself — backgrounds, cell content, borders — at origin (`ox`,`oy`) in a
+    /// top-down coordinate space. Pulled out of `draw(withFrame:)` so it renders into the cached
+    /// image (and stays available as a live fallback).
+    func drawGrid(ox: CGFloat, oy: CGFloat, scale: CGFloat) {
         let colX = geometry.columnEdges, rowY = geometry.rowEdges, heights = geometry.contentHeights
         guard colX.count == ncol + 1, rowY.count == nrow + 1 else { return }
-        let ox = cellFrame.minX, oy = cellFrame.minY   // flipped view: minY is the TOP edge
 
         // Backgrounds + content, so a shaded header's fill sits under its glyphs.
         for (i, cell) in cells.enumerated() {
@@ -203,13 +333,11 @@ final class TableAttachmentCell: NSTextAttachmentCell {
             case .center: dy = max(0, availH - contentH) / 2
             case .bottom: dy = max(0, availH - contentH)
             }
-            cell.content.draw(with: NSRect(x: x + cell.padding, y: y + cell.padding + dy,
-                                           width: innerW, height: max(1, contentH)),
-                              options: [.usesLineFragmentOrigin, .usesFontLeading])
+            CellText.draw(cell.content, at: NSPoint(x: x + cell.padding, y: y + cell.padding + dy),
+                          width: innerW)
         }
 
         // Borders: each shared seam once, snapped to the device pixel grid so a thin line is crisp.
-        let scale = controlView?.window?.backingScaleFactor ?? 2
         func snap(_ v: CGFloat) -> CGFloat { (v * scale).rounded() / scale }
         for row in 0...nrow {
             for col in 0..<ncol {

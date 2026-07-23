@@ -29,7 +29,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // A SwiftPM executable has no MainMenu.nib, so build the menu bar in code. Without it,
     // standard shortcuts (⌘Q/⌘O/⌘W/⌘C/⌘F/⌘±) and the native Window/tabs menu don't work.
     private func buildMenu() {
-        let appName = "fast-md-reader"
+        // The user-facing name comes from the bundle (so a dev build reads "Fast Document Reader
+        // (Dev)"), NOT a hardcoded literal — the literal here was the pre-rename "fast-md-reader",
+        // showing the retired name in the very first menu item.
+        let appName = (Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
+            ?? (Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String)
+            ?? "Fast Document Reader"
         let mainMenu = NSMenu()
 
         // App menu
@@ -37,7 +42,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         mainMenu.addItem(appItem)
         let appMenu = NSMenu()
         appItem.submenu = appMenu
-        appMenu.addItem(withTitle: "About \(appName)", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        // Custom About action so the panel can show the exact BUILD (git commit + date) this bundle was
+        // made from — the marketing version alone (1.0) can't tell a dev rebuild from the release.
+        let about = appMenu.addItem(withTitle: "About \(appName)", action: #selector(showAboutPanel(_:)), keyEquivalent: "")
+        about.target = self
         appMenu.addItem(.separator())
         // Offered, never taken. An app that makes itself the default handler on its own — at first
         // launch or otherwise — is hijacking a system-wide setting the user didn't touch, which the
@@ -187,6 +195,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ("Tab-separated values  (.tsv)", "public.tab-separated-values-text", false),
         ("Log files  (.log)", "com.apple.log", false),
     ]
+
+    /// The standard About panel, but with the build's git provenance in the version line. Marketing
+    /// version (`CFBundleShortVersionString` = 1.0) and build number (`CFBundleVersion` = 5) are the
+    /// same across a release and every local rebuild, so they can't answer "is the installed app the
+    /// build I just made?". `FMDBuildInfo` — stamped by `make-app.sh` with the git short hash, a
+    /// `-dirty` flag for uncommitted changes, and the build date — can. Absent (e.g. a raw `swift run`),
+    /// the panel just falls back to the standard version line.
+    @objc func showAboutPanel(_ sender: Any?) {
+        var options: [NSApplication.AboutPanelOptionKey: Any] = [:]
+        if let build = Bundle.main.object(forInfoDictionaryKey: "FMDBuildInfo") as? String, !build.isEmpty {
+            // Put the build stamp on its OWN line below "Version 1.0", not in the version line's
+            // parentheses: `.version = ""` drops the auto "(build number)", and the git hash · date
+            // rides in `.credits`, which the panel lays out as a separate line under the version.
+            options[.version] = ""
+            options[.credits] = NSAttributedString(
+                string: build,
+                attributes: [.font: NSFont.systemFont(ofSize: 11),
+                             .foregroundColor: NSColor.secondaryLabelColor])
+        }
+        NSApp.orderFrontStandardAboutPanel(options: options)
+    }
 
     @objc func offerToBecomeDefault(_ sender: Any?) {
         // A checkbox per kind, so the choice is the user's rather than a take-it-or-leave-it lump.

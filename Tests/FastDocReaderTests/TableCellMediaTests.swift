@@ -26,11 +26,15 @@ final class TableCellMediaTests: XCTestCase {
     /// A cell holding an image that reserves 200×120 must make a table at least 120 + 2*padding tall.
     /// This is the whole point: the reserved size (owned by `SizedAttachmentCell`, present even when
     /// `image == nil`) flows through the table's own `measuredHeight` into the row height, so the
-    /// table is the right size before its cell pixels ever load.
+    /// table is the right size before its cell pixels ever load. `init` is a cheap placeholder (the
+    /// per-cell measurement it once did at a throwaway width was re-paid immediately by
+    /// `presizeKnownMedia`'s relayout — two full measurements per open); the real height is the first
+    /// relayout, which is exactly the step that runs before any pixel loads.
     func testCellImageReservedSizeDrivesRowHeight() {
         let (grid, _) = imageCell(reserved: NSSize(width: 200, height: 120), padding: 7)
         let table = TableAttachmentCell(cells: [grid], ncol: 1, nrow: 1, columnRatios: [1],
                                         minRowHeight: 20, initialWidth: 400)
+        table.relayout(width: 400)   // the measurement pass presizeKnownMedia always runs
         XCTAssertGreaterThanOrEqual(table.cellSize().height, 120 + 2 * 7)
     }
 

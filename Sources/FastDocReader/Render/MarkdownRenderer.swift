@@ -412,8 +412,20 @@ private struct AttributedBuilder: MarkupWalker {
     /// overlap: the Document (and any list/quote wrapping a formula) merely overlaps, so it keeps
     /// descending until it reaches the nodes the formula itself produced.
     private func mathSpan(containing r: NSRange) -> (range: NSRange, tex: String)? {
-        mathSpans.first { $0.range.location <= r.location &&
-                          r.location + r.length <= $0.range.location + $0.range.length }
+        // `visit` runs this for EVERY markup node, so a linear `.first` scan is O(nodes × spans) on a
+        // formula-heavy document (paid again on every zoom re-render). `mathSpans` is ascending by
+        // location and non-overlapping (`scanMathSpans` walks the source in order), so binary-search the
+        // last span starting at or before `r`, then test containment — O(log spans) per node.
+        guard !mathSpans.isEmpty else { return nil }
+        var lo = 0, hi = mathSpans.count - 1, cand = -1
+        while lo <= hi {
+            let mid = (lo + hi) / 2
+            if mathSpans[mid].range.location <= r.location { cand = mid; lo = mid + 1 }
+            else { hi = mid - 1 }
+        }
+        guard cand >= 0 else { return nil }
+        let s = mathSpans[cand]
+        return r.location + r.length <= s.range.location + s.range.length ? s : nil
     }
 
     /// Every block goes through here, so a formula is caught wherever the parser put its pieces —

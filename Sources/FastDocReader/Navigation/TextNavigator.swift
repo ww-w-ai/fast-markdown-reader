@@ -54,7 +54,7 @@ struct TextNavigator {
                 i = j
             } else { i += 1 }
         }
-        return starts.sorted()
+        return starts   // built left-to-right, already strictly ascending — no sort needed
     }
 
     func sentenceStart(_ s: String, from: Int) -> Int {
@@ -81,7 +81,7 @@ struct TextNavigator {
                 i = j
             } else { i += 1 }
         }
-        return starts.sorted()
+        return starts   // built left-to-right, already strictly ascending — no sort needed
     }
 
     func paragraphStart(_ s: String, from: Int) -> Int {

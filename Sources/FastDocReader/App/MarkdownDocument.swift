@@ -767,7 +767,9 @@ final class MarkdownDocument: NSDocument {
                     reserve(sz, r)
                 }
             }
-            if changed { table.relayout(width: usable) }
+            // A cell's media size settled after loading → force a re-solve even at the same width
+            // (the width-cache in `relayout` would otherwise skip it, keeping stale row heights).
+            if changed { table.relayout(width: usable, force: true) }
             tableRanges.append(tr)
         }
         guard !tableRanges.isEmpty, let lm = wc.textView.layoutManager else { return }
@@ -928,9 +930,16 @@ final class MarkdownDocument: NSDocument {
         // attachment; when it's on screen fill its cell media's pixels and redraw the table, when off
         // drop them. PAINT ONLY — sizes were reserved up front by `sizeTableCellMedia`, so this never
         // touches reservedSize/bounds/layout (invariant 1), it only sets `att.image` and repaints.
+        func tableCell(at r: NSRange) -> TableAttachmentCell? {
+            (storage.attribute(.attachment, at: r.location, effectiveRange: nil)
+                as? NSTextAttachment)?.attachmentCell as? TableAttachmentCell
+        }
         func paintCell(_ img: NSImage?, _ att: NSTextAttachment, _ tableRange: NSRange) {
             guard gen == self.renderGeneration else { return }
             att.image = img ?? MarkdownDocument.brokenImage()
+            // The table caches its grid as one image; that render happened before this cell's pixels
+            // existed, so drop it or the loaded medium never shows (invariant 39's lazy cell paint).
+            tableCell(at: tableRange)?.invalidateRenderCache()
             wc.redrawGlyphs(tableRange)
             wc.refreshAfterImageFill()
         }
@@ -963,7 +972,7 @@ final class MarkdownDocument: NSDocument {
                 }
             }
         }
-        for (att, tr) in cellPurge { att.image = nil; wc.redrawGlyphs(tr) }
+        for (att, tr) in cellPurge { att.image = nil; tableCell(at: tr)?.invalidateRenderCache(); wc.redrawGlyphs(tr) }
         for (src, att, tr) in cellImg {
             if src.hasPrefix("data:") {
                 paintCell(MarkdownDocument.decodeDataURI(src), att, tr)

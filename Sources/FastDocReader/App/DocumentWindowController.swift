@@ -339,12 +339,10 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate, NSTe
     /// invalidating while `enumerateAttribute` is still walking is what the split avoids.
     private func resizeTableColumns(toColumn column: CGFloat) {
         guard let storage = textView.textStorage, storage.length > 0 else { return }
-        // `sizeTableCellMedia` re-fits each table's cell-internal media to THIS column's cell widths
-        // (a cell image narrows with its cell as the window shrinks), then relayouts every table to
-        // the usable width (container minus `lineFragmentPadding` on each side — a table sized to the
-        // raw column would overflow by `2 * padding` and clip on the right) and invalidates their
-        // layout so the manager re-reads each `cellSize()`. It is the superset of the plain relayout
-        // this method used to do, and also covers a media-free table (nothing to size → just relayout).
+        // Synchronous, in time for the reflow's own anchor restore (invariant 24). This used to be too
+        // slow to run inline — re-measuring big cells cost hundreds of ms — but cell measurement is now
+        // O(n) through the reused `CellText` stack (a 13-table document re-solves in ~68ms, not ~750ms),
+        // so it fits inside the reflow again without freezing the resize.
         (document as? MarkdownDocument)?.sizeTableCellMedia(in: self)
     }
 
